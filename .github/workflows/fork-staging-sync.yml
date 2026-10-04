@@ -1,0 +1,94 @@
+name: Fork staging sync
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC/GMT; GitHub may delay scheduled starts.
+  workflow_dispatch:
+
+concurrency:
+  group: fork-staging-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'palinalif/Marinara-Engine'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TARGET_BRANCH: feat/connection-custom-voice-upload
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feat/connection-custom-voice-upload
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream staging without overwriting fork work
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/Pasta-Devs/Marinara-Engine.git
+          git fetch --no-tags upstream staging
+          git merge --no-edit upstream/staging
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - name: Run focused server regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filter in active-character-reference character-id-macro-modes custom-voice tts; do
+            node scripts/run-regressions.mjs --filter "$filter"
+          done
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Smoke and fork browser regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm smoke:ui
+          pnpm exec playwright test e2e/narrator-macro-avatars.e2e.ts e2e/custom-voices.e2e.ts e2e/tts-card-connections.e2e.ts --project=desktop-chromium --project=mobile-chromium --workers=1
+
+      - name: Push only the tested commit (never force)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Credentials are supplied only here, not persisted for install/tests.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          mkdir -p sync-result
+          git rev-parse HEAD > sync-result/commit.txt
+          echo "Validated and pushed $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish tested SHA for the local build watcher
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-sync-result
+          path: sync-result/commit.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-sync-browser-failure
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
