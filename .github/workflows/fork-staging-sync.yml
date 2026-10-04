@@ -29,6 +29,7 @@ jobs:
           persist-credentials: false
 
       - name: Merge upstream staging without overwriting fork work
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
@@ -36,7 +37,28 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream https://github.com/Pasta-Devs/Marinara-Engine.git
           git fetch --no-tags upstream staging
-          git merge --no-edit upstream/staging
+          fork_sha=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse upstream/staging)
+          if ! git merge --no-edit upstream/staging; then
+            if [[ -n $(git ls-files -u) ]]; then
+              mkdir -p sync-conflict
+              printf '%s\n' "$fork_sha" > sync-conflict/fork.txt
+              printf '%s\n' "$upstream_sha" > sync-conflict/upstream.txt
+              printf '%s\n' "$GITHUB_RUN_ATTEMPT" > sync-conflict/attempt.txt
+              git diff --name-only --diff-filter=U > sync-conflict/conflicts.txt
+              echo 'conflict=true' >> "$GITHUB_OUTPUT"
+            fi
+            exit 1
+          fi
+
+      - name: Publish merge-conflict evidence for local review
+        if: failure() && steps.merge.outputs.conflict == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-sync-conflict
+          path: sync-conflict/
+          if-no-files-found: error
+          retention-days: 14
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:

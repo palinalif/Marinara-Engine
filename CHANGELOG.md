@@ -4,7 +4,7 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
-- The voice fork can sync upstream `staging` daily at 07:00 GMT, pushing only after code, server and browser checks pass. A local watcher builds successful syncs in a separate checkout without restarting or changing the live app; conflicts and failing checks stop automatic pushes.
+- The voice fork can sync upstream `staging` daily at 07:00 GMT, pushing only after code, server and browser checks pass. A local watcher builds successful syncs in a separate checkout without restarting or changing the live app; conflicts and failing checks stop automatic pushes. Recorded merge conflicts trigger a bounded, read-only HyperQwen investigation in an isolated local checkout, saving a diagnosis and suggested resolution without editing or pushing fixes.
 
 - Custom voice recording previews now use the replacement file without cancelling a voice's **Test** playback, and uploading under a deleted voice's name no longer reports a successful upload as uncertain. Character voice lists follow the selected Audio connection as its configuration loads; configuration responses keep voice IDs and backend settings from the same connection during a concurrent default change. Upload permission text clarifies provider-dependent recording retention, and failed deletion confirmation asks for a refresh rather than claiming the provider kept the voice.
 

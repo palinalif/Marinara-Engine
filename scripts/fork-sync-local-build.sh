@@ -10,6 +10,12 @@ mkdir -p "$STATE"
 exec 9>"$STATE/build.lock"
 flock -n 9 || exit 0
 
+# Review conflicts independently of successful builds; a provider outage must not
+# prevent an already validated application commit from being built.
+if ! bash "$(dirname -- "${BASH_SOURCE[0]}")/fork-sync-conflict-review.sh"; then
+  echo 'Conflict review failed; will retry on the next watcher tick' >&2
+fi
+
 run_id=$(gh api "repos/$REPOSITORY/actions/workflows/fork-staging-sync.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
 [[ -n "$run_id" ]] || exit 0
 [[ "$run_id" =~ ^[0-9]+$ ]] || { echo 'Invalid workflow run ID' >&2; exit 1; }

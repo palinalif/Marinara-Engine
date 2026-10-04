@@ -8,11 +8,15 @@ export MARINARA_SYNC_STATE="$TMP/state"
 export PROOF_LOG="$TMP/calls"
 export PROOF_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export PROOF_RUN=123
-export PROOF_FAIL=0
+export PROOF_FAIL=0 PROOF_REVIEW_FAIL=0
 mkdir -p "$MARINARA_SYNC_STATE/source/.git"
 
 gh() {
   if [[ "$1" == api ]]; then
+    if [[ "$2" == *status=failure* ]]; then
+      [[ "$PROOF_REVIEW_FAIL" == 0 ]] && return 0
+      return 1
+    fi
     printf '%s\n' "$PROOF_RUN"
   else
     local destination=${!#}
@@ -54,7 +58,8 @@ run
 [[ $(grep -c '^pnpm build$' "$PROOF_LOG") == 1 ]]
 PROOF_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 PROOF_RUN=125
+PROOF_REVIEW_FAIL=1
 run
 [[ $(<"$MARINARA_SYNC_STATE/last-built") == "$PROOF_SHA" ]]
 [[ $(grep -c '^pnpm build$' "$PROOF_LOG") == 2 ]]
-echo 'PASS: invalid SHA, failure retry, successful build, idempotence, unchanged SHA, newer SHA'
+echo 'PASS: invalid SHA, failure retry, successful build, idempotence, unchanged SHA, newer SHA despite review outage'

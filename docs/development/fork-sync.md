@@ -10,6 +10,20 @@ The job checks out `feat/connection-custom-voice-upload`, merges `Pasta-Devs/Mar
 
 Successful jobs publish a `fork-sync-result` artifact containing the exact tested SHA. Browser failures publish evidence. Review failures under **Actions → Fork staging sync**; enable GitHub Actions failure notifications in your GitHub notification settings. Scheduled workflows in public repositories may be disabled after 60 days without repository activity; check that Actions remains enabled.
 
+## Automatic conflict investigation
+
+When the merge step leaves unmerged files, GitHub publishes a `fork-sync-conflict` artifact with the exact fork/upstream SHAs, conflict paths and run attempt. The local watcher checks the latest 20 failed sync runs, ignores ordinary test failures, and reproduces the recorded merge in a separate private checkout before launching a **HyperQwen (`hyperqwen/qwen3.8-27b`) read-only subagent**.
+
+The reviewer has **no tools**: conflict diffs and all three merge stages are supplied as input (capped at 100 KB, with an explicit truncation notice). This prevents model access to host credentials or other files. Shell, edits, extensions, project instructions and project resources are disabled. Each review is capped at ten minutes, with at most one review per watcher invocation. Successful reviews are deduplicated by run ID and attempt; failed reviews retry after a one-hour per-run cooldown, allowing other failures to be reviewed in the meantime. Invalid SHA evidence and nonreproducing merges are marked skipped so they cannot block later runs. A conflict-review failure does not block a successful sync's build.
+
+Reports, evidence, three-way merge stages and inspectable Pi sessions are saved under `~/.local/state/marinara-fork-sync/reviews/<run-id>-<attempt>/`; read `report.md` for the diagnosis and suggested resolution. The watcher logs the report path in `build.log`. This is **investigation only**: no automated conflict edits, commits, pushes, deployments or external notifications. The host must be online and its Pi HyperQwen credentials working. Expired artifacts and failures outside the latest 20 failed runs are not reviewed automatically.
+
+The helper is installed beside the build script as `~/.local/lib/marinara-fork-sync/fork-sync-conflict-review.sh`. Its Pi executable defaults to the globally installed `/usr/local/bin/pi`; `MARINARA_SYNC_PI` can override that path. Disable reviews without disabling builds by removing the helper (the build watcher will log a warning). Offline proof:
+
+```bash
+bash scripts/regressions/fork-sync-conflict-review.regression.sh
+```
+
 ## Local build watcher
 
 `scripts/fork-sync-local-build.sh` reads only successful workflow runs and their tested-SHA artifact. It builds in its own checkout under `~/.local/state/marinara-fork-sync/source`; it never edits the interactive checkout, copies files into the live app, restarts services, or modifies app data. It requires authenticated `gh`, Git, Node 24, pnpm, and `flock`. This host uses `/opt/node24/bin`.
