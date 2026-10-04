@@ -313,18 +313,25 @@ test.describe("TTS card selected backend (fully mocked)", () => {
   });
 
   test("pending shared-setting debounce survives an immediate connection voice PATCH", async ({ page }) => {
+    await page.clock.install();
     const f = await openCard(page, true, { allowConfigPut: true });
     await expect(f.voice).toContainText("B saved");
     const rowsBefore = structuredClone(f.rows);
     const dialogues = f.card.getByRole("checkbox", { name: "Only read dialogues", exact: true });
     await expect(dialogues).not.toBeChecked();
 
-    // Schedule the legacy PUT, then patch the connection without waiting for the
-    // debounce: connection invalidation must not erase the pending shared draft.
+    // Freeze before scheduling the 600 ms shared-setting debounce so browser
+    // action latency cannot let the PUT overtake the immediate connection PATCH.
+    await page.clock.pauseAt(new Date(await page.evaluate(() => Date.now() + 1_000)));
     await dialogues.check();
     await f.voice.click();
     await page.getByRole("option", { name: "B choice 1 (b-choice-1)", exact: true }).click();
     await expect.poll(() => f.patches.length).toBe(1);
+    expect(f.mutations).toEqual(["PATCH tts-scope-b"]);
+    await page.clock.runFor(599);
+    expect(f.configPuts).toEqual([]);
+    await page.clock.runFor(1);
+    await page.clock.resume();
     await expect.poll(() => f.configPuts.length).toBe(1);
     await expect
       .poll(() => ({ voice: f.configReads.at(-1)?.voice, dialogueOnly: f.configReads.at(-1)?.dialogueOnly }))
