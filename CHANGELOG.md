@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- The voice fork can sync upstream `staging` daily at 07:00 GMT, pushing only after code, server and browser checks pass. A local watcher builds successful syncs in a separate checkout without restarting or changing the live app; conflicts and failing checks stop automatic pushes.
+
 - Custom voice recording previews now use the replacement file without cancelling a voice's **Test** playback, and uploading under a deleted voice's name no longer reports a successful upload as uncertain. Character voice lists follow the selected Audio connection as its configuration loads; configuration responses keep voice IDs and backend settings from the same connection during a concurrent default change. Upload permission text clarifies provider-dependent recording retention, and failed deletion confirmation asks for a refresh rather than claiming the provider kept the voice.
 
 - Audio connections use the **OpenAI-compatible** source label for both OpenAI and compatible backends such as VoxCPM2. Their local/custom endpoint help now explains that local TTS access separately requires `TTS_LOCAL_URLS_ENABLED=true` in the server's runtime `.env`; the connection switch and local-model permission do not grant it.
