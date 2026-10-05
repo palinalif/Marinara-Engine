@@ -199,6 +199,22 @@ class Regression(unittest.TestCase):
             self.assertEqual(self.restarts, 0)
             p.write_text(old)
 
+    def test_compatibility_ignores_canonical_runtime_state_only(self):
+        records = ('packages/server/data/storage/tables/app_settings/storage-migration-notice.json',
+                   'packages/server/data/capability-packages/availability-migration-v1.json',
+                   'packages/server/data/capability-packages/example/package.json')
+        for name in records:
+            put(self.live, name, 'persistent runtime state')
+        # Nested dependency manifests outside runtime state still block changes.
+        put(self.source, 'packages/shared/runtime/package.json', 'candidate dependency')
+        put(self.live, 'packages/shared/runtime/package.json', 'live dependency')
+        self.assertEqual(self.run_deploy(), 1)
+        self.unchanged_live()
+        put(self.source, 'packages/shared/runtime/package.json', 'live dependency')
+        self.assertEqual(self.run_deploy(), 0)
+        for name in records:
+            self.assertEqual((self.live / name).read_text(), 'persistent runtime state')
+
     def test_health_assets_and_index_failures_exact_rollback(self):
         for failure in ("health", "assets", "index"):
             self.failure = failure

@@ -227,7 +227,10 @@ def compatibility(source, live):
             if not base.exists():
                 continue
             for directory, dirs, files in os.walk(base, followlinks=False):
-                dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", ".git")]
+                # Canonical ignored runtime state is not dependency/migration
+                # source, even when its records contain "migration" or manifests.
+                dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", ".git")
+                           and Path(directory) / d != root / "packages/server/data"]
                 for d in dirs:
                     require(not (Path(directory) / d).is_symlink(), "unsafe compatibility directory")
                 for f in files:

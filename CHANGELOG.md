@@ -4,7 +4,7 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
-- The personal voice fork's local sync watcher can now opt in to exact-CI-revision deployment, with compatibility gates, verified health/assets, rollback snapshots, and deduplicated local status chats. Incompatible updates stop for operator review; installations without host configuration remain build-only.
+- The personal voice fork's local sync watcher can now opt in to exact-CI-revision deployment, with compatibility gates, verified health/assets, rollback snapshots, and deduplicated local status chats. Incompatible updates stop for operator review; installations without host configuration remain build-only. Compatibility checks exclude runtime state records without ignoring migration source or nested dependency manifests.
 
 - The **Character Schedule Manager**, and the schedule editor it opens, now show each character's portrait the way you cropped it in the character editor instead of the uncropped image. In the manager's list the portrait stays in its small round slot (#7100).
 
