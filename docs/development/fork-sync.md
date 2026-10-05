@@ -4,7 +4,7 @@ This automation is specific to `palinalif/Marinara-Engine`; it does not write up
 
 ## GitHub schedule
 
-`.github/workflows/fork-staging-sync.yml` runs at **07:00 UTC/GMT** every day and can also be dispatched manually. GitHub schedules are best-effort and may start late. The workflow must also exist on the fork's default branch (`main`) for the schedule to run; installing that workflow file alone does not promote application changes to `main`.
+`.github/workflows/fork-staging-sync.yml` runs at **07:17 UTC/GMT** every day and can also be dispatched manually. The off-hour minute reduces exposure to GitHub’s documented top-of-hour congestion; schedules remain best-effort and may start late or be dropped. The workflow must also exist on the fork's default branch (`main`) for the schedule to run; installing that workflow file alone does not promote application changes to `main`.
 
 The job checks out `feat/connection-custom-voice-upload`, merges `Pasta-Devs/Marinara-Engine:staging`, runs `pnpm check`, focused voice/TTS/narrator server regressions, Chromium smoke tests and desktop/mobile Chromium voice/narrator tests, then pushes normally. Conflicts or failed checks leave the remote feature branch unchanged. A concurrent divergent branch update rejects the push; there is no force-push or automated conflict resolution.
 
