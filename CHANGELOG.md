@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- The personal voice fork's local sync watcher can now opt in to exact-CI-revision deployment, with compatibility gates, verified health/assets, rollback snapshots, and deduplicated local status chats. Incompatible updates stop for operator review; installations without host configuration remain build-only.
+
 - The **Character Schedule Manager**, and the schedule editor it opens, now show each character's portrait the way you cropped it in the character editor instead of the uncropped image. In the manager's list the portrait stays in its small round slot (#7100).
 
 - Character cards and personas have a new **Image Appearance Override** switch under **Appearance**. Turn it on to write a separate, image-prompt-ready description of that character, and **Attach Card Appearance** sends that instead of the full **Appearance** text, so clothing and other scene-specific detail from the card no longer leaks into illustrations. While the switch is off, or its box is empty, image prompts keep using **Appearance** as before, and the narrator always uses the full **Appearance** text. This covers chat illustrations, conversation selfies, and Game mode, and applies to custom image agents as well as the built-in Illustrator, including retries, characters used as the user identity, and characters left out of native image captions (#7053).

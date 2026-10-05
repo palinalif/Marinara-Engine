@@ -94,6 +94,9 @@ jobs:
           done
           bash scripts/regressions/fork-sync-conflict-review.regression.sh
           bash scripts/regressions/fork-sync-pinned-main.regression.sh
+          bash scripts/regressions/fork-sync-local-build.regression.sh
+          python3 scripts/regressions/fork-sync-deploy.regression.py
+          python3 scripts/regressions/fork-sync-notify.regression.py
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
       - name: Smoke and fork browser regressions
