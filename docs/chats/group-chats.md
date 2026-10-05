@@ -40,9 +40,9 @@ You can also click the **Random** row (labeled **Dice pick**) to add one random 
 
 ## Managing members after creation
 
-You add, remove, and reorder characters from the **Chat Settings** drawer. Open it with the gear icon in the chat header. The gear tooltip reads **Chat Settings**.
+You add, remove, and reorder characters in **Chat Settings**. Open it with the **Chat Settings** button in the chat.
 
-Inside the drawer, find the **Characters** section. It shows a member count and the help text "Characters in this chat. Each character has their own personality that the AI roleplays as." Each member row has an avatar, the character name, a drag handle, an eye icon, and a trash icon.
+Inside Chat Settings, find the **Characters** section. It shows a member count and the help text "Characters in this chat. Each character has their own personality that the AI roleplays as." Each member row has an avatar, the character name, a drag handle, an eye icon, and a trash icon.
 
 - To add one more character, click **Add Character** and search for them.
 - To add a whole Folder, click **Add from Folder** and pick one.
@@ -87,9 +87,15 @@ When **Mode** is **Individual**, a **Response Order** setting appears. It is a t
 
 - **Sequential** is the default. Every character replies in turn, in the order they appear in the **Characters** list. Reorder the members to change the turn order.
 - **Smart** uses a short hidden AI call to decide which character or characters should reply next. It reads the recent messages and each character's details, and usually picks one speaker. If you write an at-mention like `@Alice` in your message, that overrides its choice.
+
+  If you have chosen a **Decision model** (see [Decision Models](../connections/decision-models.md)), you can turn on **Also use it to pick who speaks in Smart response order** under it. Smart order then asks for a separate yes/no score for each candidate. The questions share the last five messages and a roster with candidates' names, status, activity, talkativeness and a short personality or description excerpt. A hosted provider receives that roster too; see [What the model sees](../connections/decision-models.md#what-the-model-sees).
+
+  These scores can be quicker to obtain than a full AI reply, but speed and cost depend on the model and candidate count. In Roleplay Marinara picks the most likely speaker. In Conversation everyone with a reason replies, most likely first. The character who just spoke waits their turn if someone else has a reason to answer. If the Decision model does not answer, Smart order makes its usual AI call instead.
 - **Manual** stops any automatic reply. You choose exactly who replies using the **Trigger Response** picker in the message bar.
 
 With **Smart** order, the AI can line up more than one character. Only the first one replies right away. To pick who speaks next, use the **Trigger Response** picker in the message bar. You can also send an empty message to generate the next queued character.
+
+In Roleplay **Individual** mode with **Smart** or **Manual** order, the picker's first option is **Smart**, marked by a people icon in your accent color. It asks the model to choose the next speaker for that response, using the Decision model when its Smart-order option is enabled. Your saved response order stays unchanged, and the named character options still let you choose directly.
 
 Two more toggles appear in **Individual** mode:
 
@@ -141,6 +147,8 @@ The button tooltip reads "Trigger character response".
 Turn on **Character Exchanges** to let characters talk to each other on their own. It is off by default. The description reads "Characters chat with each other in group chats."
 
 When it is on, the characters can reply to each other while you are away, not only to you. This runs only while Marinara is open in your browser. If you close the app, the exchanges stop. It also shares the same daily message limit that autonomous messages use.
+
+Exchanges work whether or not character schedules are on. In a group set to **Individual**, exchanges and @mention replies between characters never use the group's last check-in of the day, so a later check-in can still use it.
 
 ## Turn handling at a glance
 

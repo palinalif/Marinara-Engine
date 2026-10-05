@@ -76,7 +76,8 @@ export function useChatComposerFocused(): boolean {
 /**
  * Preserve the user's bottom anchor when a mobile software keyboard changes
  * the visual viewport. Readers who intentionally scrolled upward are left
- * exactly where they were.
+ * exactly where they were. A message being edited is scrolled into the space
+ * left above the keyboard.
  */
 export function useKeepLatestChatMessageVisible(
   scrollRef: RefObject<HTMLElement | null>,
@@ -87,6 +88,7 @@ export function useKeepLatestChatMessageVisible(
     let restoreFrame = 0;
     let settleFrame = 0;
     let pendingAnchor: { scrollTop: number; pinnedToBottom: boolean } | null = null;
+    let revealedEditor: Element | null = null;
 
     const captureAnchor = () => {
       const scrollElement = scrollRef.current;
@@ -121,11 +123,38 @@ export function useKeepLatestChatMessageVisible(
       if (!detail?.keyboardOpen) {
         const wasKeyboardOpen = keyboardOpen;
         keyboardOpen = false;
+        revealedEditor = null;
         if (wasKeyboardOpen || !focusedChatComposerAcceptsText()) pendingAnchor = null;
         if (restoreFrame) cancelAnimationFrame(restoreFrame);
         if (settleFrame) cancelAnimationFrame(settleFrame);
         restoreFrame = 0;
         settleFrame = 0;
+        return;
+      }
+      const editor = document.activeElement;
+      if (editor && editor !== revealedEditor && editor.matches("[data-chat-message-editor]")) {
+        revealedEditor = editor;
+        // Phones line the editor up when editing starts, but a taller tablet
+        // transcript can still shrink past it. If its first lines are out of
+        // view, scroll only the transcript (never the app shell) back to them,
+        // below the floating top controls (its scroll padding), as phones do.
+        const reveal = () => {
+          const scrollElement = scrollRef.current;
+          if (!scrollElement?.contains(editor) || document.activeElement !== editor) return;
+          const offset = editor.getBoundingClientRect().top - scrollElement.getBoundingClientRect().top;
+          const topInset = Number.parseFloat(getComputedStyle(scrollElement).scrollPaddingTop) || 8;
+          // Under the top controls counts as out of view, not just above the transcript.
+          if (offset < topInset || offset + 48 > scrollElement.clientHeight)
+            scrollElement.scrollTop += offset - topInset;
+        };
+        restoreFrame = requestAnimationFrame(() => {
+          restoreFrame = 0;
+          reveal();
+          settleFrame = requestAnimationFrame(() => {
+            settleFrame = 0;
+            reveal();
+          });
+        });
         return;
       }
       if (keyboardOpen || !focusedChatComposerAcceptsText()) return;

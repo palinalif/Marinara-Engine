@@ -48,6 +48,12 @@ import {
   RAINBOW_GRADIENT_PRESET,
 } from "./lib/css-colors";
 import { normalizeThemeCss } from "./lib/theme-css";
+import {
+  CHAT_WIDGET_COLOR_PROPERTIES,
+  getChatWidgetColorRoles,
+  getChatWidgetColorStyle,
+} from "./lib/chat-widget-colors";
+import { getChatWidgetFontFamily, stripFontFamilyQuotes, toCssFontFamilyValue } from "./lib/font-family";
 import { useLegacyThemeMigration, useThemes } from "./hooks/use-themes";
 import { useSettingsSync } from "./hooks/use-settings-sync";
 import { useStorageMigrationNotice } from "./hooks/use-storage-migration-notice";
@@ -212,23 +218,6 @@ export class AppRecoveryBoundary extends Component<{ children: ReactNode }, { er
       </Translation>
     );
   }
-}
-
-function stripFontFamilyQuotes(family: string): string {
-  const trimmed = family.trim();
-  if (trimmed.length < 2) return trimmed;
-
-  const quote = trimmed[0];
-  if ((quote !== `"` && quote !== `'`) || trimmed[trimmed.length - 1] !== quote) {
-    return trimmed;
-  }
-
-  return trimmed.slice(1, -1).trim();
-}
-
-function toCssFontFamilyValue(family: string): string {
-  const cleanFamily = stripFontFamilyQuotes(family);
-  return `"${cleanFamily.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 function customFontFaceKey(family: string, font: CustomFontFace): string {
@@ -492,6 +481,16 @@ export function App() {
   const language = useUIStore((s) => s.language);
   const visualTheme = useUIStore((s) => s.visualTheme);
   const fontFamily = useUIStore((s) => s.fontFamily);
+  const chatWidgetPreset = useUIStore((s) => s.chatWidgetPreset);
+  const chatWidgetFont = useUIStore((s) => s.chatWidgetFont);
+  const chatWidgetShape = useUIStore((s) => s.chatWidgetShape);
+  const chatWidgetButtonSize = useUIStore((s) => s.chatWidgetButtonSize);
+  const chatWidgetBorderColor = useUIStore((s) => s.chatWidgetBorderColor);
+  const chatWidgetBackgroundColor = useUIStore((s) => s.chatWidgetBackgroundColor);
+  const chatWidgetTextColor = useUIStore((s) => s.chatWidgetTextColor);
+  const chatWidgetApplyFont = useUIStore((s) => s.chatWidgetApplyFont);
+  const chatWidgetApplyShape = useUIStore((s) => s.chatWidgetApplyShape);
+  const chatWidgetApplyColors = useUIStore((s) => s.chatWidgetApplyColors);
   const appBackgroundColor = useUIStore((s) => s.appBackgroundColor);
   const appAccentColor = useUIStore((s) => s.appAccentColor);
   const appAccentPulseMode = useUIStore((s) => s.appAccentPulseMode);
@@ -519,6 +518,10 @@ export function App() {
   const hasAppDialogOpen = useDialogStore((s) => s.dialog !== null);
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [whatsNewResolved, setWhatsNewResolved] = useState(false);
+  const [agentUpdateOpen, setAgentUpdateOpen] = useState(false);
+  const [agentUpdatesResolved, setAgentUpdatesResolved] = useState(false);
+  const handleAgentUpdatesResolved = useCallback(() => setAgentUpdatesResolved(true), []);
+  const [chatWindowIntroOpen, setChatWindowIntroOpen] = useState(false);
   const handleWhatsNewResolved = useCallback(() => setWhatsNewResolved(true), []);
   // Shares the modal's query via the cache; gating the prompter on the QUERY
   // (pending or a notice still waiting) instead of the modal's open state
@@ -640,10 +643,35 @@ export function App() {
       // background-color, not from resolved custom properties (see index.html).
       // Read the rendered variable so visual themes and injected custom theme
       // CSS are reflected instead of falling back to the stock scheme.
-      const computedBackground = getComputedStyle(root).getPropertyValue("--background").trim();
-      const literalBackground = getCssColorFallback(computedBackground, resolvedBackground);
+      const computedStyle = getComputedStyle(root);
+      const computedBackground = computedStyle.getPropertyValue("--background").trim();
+      let literalBackground = getCssColorFallback(computedBackground, resolvedBackground);
+      // Flatten translucent shell surfaces over the app background. Browser
+      // chrome needs an opaque color, and sidebars retain the Home menu surface.
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.fillStyle = defaultBackground;
+        context.fillRect(0, 0, 1, 1);
+        context.fillStyle = literalBackground;
+        context.fillRect(0, 0, 1, 1);
+        const backgroundPixels = context.getImageData(0, 0, 1, 1);
+        context.fillStyle = computedStyle.getPropertyValue("--card").trim();
+        context.fillRect(0, 0, 1, 1);
+        const [red, green, blue] = context.getImageData(0, 0, 1, 1).data;
+        const shellSurface = `rgb(${red}, ${green}, ${blue})`;
+        root.style.setProperty("--marinara-shell-surface", shellSurface);
+        context.putImageData(backgroundPixels, 0, 0);
+        context.fillStyle = computedStyle.getPropertyValue("--marinara-topbar-surface").trim();
+        context.fillRect(0, 0, 1, 1);
+        const [topbarRed, topbarGreen, topbarBlue] = context.getImageData(0, 0, 1, 1).data;
+        literalBackground = `rgb(${topbarRed}, ${topbarGreen}, ${topbarBlue})`;
+      }
+      root.style.setProperty("--marinara-page-backing", literalBackground);
       root.style.setProperty("background-color", literalBackground, "important");
       document.body.style.setProperty("background-color", literalBackground, "important");
+      document.querySelector('meta[name="theme-color"]')?.setAttribute("content", literalBackground);
     };
 
     syncLiteralBackground();
@@ -1022,6 +1050,64 @@ export function App() {
     }
   }, [fontFamily]);
 
+  useEffect(() => {
+    const root = document.documentElement;
+    if (chatWidgetPreset === "default") delete root.dataset.chatWidgetPreset;
+    else root.dataset.chatWidgetPreset = chatWidgetPreset;
+    const shape =
+      chatWidgetShape !== "preset"
+        ? chatWidgetShape
+        : chatWidgetPreset === "dottore"
+          ? "cut-corner"
+          : chatWidgetPreset === "mari"
+            ? "arched"
+            : null;
+    if (shape) root.dataset.chatWidgetShape = shape;
+    else delete root.dataset.chatWidgetShape;
+    const font = getChatWidgetFontFamily(chatWidgetFont);
+    if (font) root.style.setProperty("--mari-widget-font-override", font);
+    else root.style.removeProperty("--mari-widget-font-override");
+  }, [chatWidgetPreset, chatWidgetFont, chatWidgetShape]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (chatWidgetButtonSize === null) {
+      delete root.dataset.chatWidgetButtonSize;
+      root.style.removeProperty("--mari-window-bubble-size");
+    } else {
+      root.dataset.chatWidgetButtonSize = String(chatWidgetButtonSize);
+      root.style.setProperty("--mari-window-bubble-size", `${chatWidgetButtonSize}px`);
+    }
+  }, [chatWidgetButtonSize]);
+
+  useEffect(() => {
+    const colors = getChatWidgetColorStyle({
+      border: chatWidgetBorderColor,
+      background: chatWidgetBackgroundColor,
+      text: chatWidgetTextColor,
+    });
+    const roles = getChatWidgetColorRoles(colors);
+    if (roles) document.documentElement.dataset.chatWidgetColors = roles;
+    else delete document.documentElement.dataset.chatWidgetColors;
+    for (const property of CHAT_WIDGET_COLOR_PROPERTIES) {
+      const value = colors[property];
+      if (value) document.documentElement.style.setProperty(property, value);
+      else document.documentElement.style.removeProperty(property);
+    }
+  }, [chatWidgetBorderColor, chatWidgetBackgroundColor, chatWidgetTextColor]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    for (const [attribute, enabled] of [
+      ["data-chat-widget-apply-font", chatWidgetApplyFont],
+      ["data-chat-widget-apply-shape", chatWidgetApplyShape],
+      ["data-chat-widget-apply-colors", chatWidgetApplyColors],
+    ] as const) {
+      if (enabled) root.setAttribute(attribute, "true");
+      else root.removeAttribute(attribute);
+    }
+  }, [chatWidgetApplyFont, chatWidgetApplyShape, chatWidgetApplyColors]);
+
   // Register custom font faces without forcing every shard to load at startup.
   const { data: customFonts } = useQuery<CustomFontFace[]>({
     queryKey: ["custom-fonts"],
@@ -1074,7 +1160,20 @@ export function App() {
       <PersonalExtensionInjector />
       <ChibiProfessorMariEasterEgg />
       <Suspense fallback={null}>
-        <LazyAppShell />
+        <LazyAppShell
+          chatWindowIntroAllowed={
+            whatsNewResolved &&
+            !hasModalOpen &&
+            !hasAppDialogOpen &&
+            !whatsNewOpen &&
+            !migrationNoticePending &&
+            !migrationNotice &&
+            agentUpdatesResolved &&
+            !agentUpdateOpen &&
+            (isLite || !showDownloadModal)
+          }
+          onChatWindowIntroOpenChange={setChatWindowIntroOpen}
+        />
       </Suspense>
       <WhatsNewModal
         presentationAllowed={!hasModalOpen && !hasAppDialogOpen && (isLite || !showDownloadModal)}
@@ -1087,6 +1186,8 @@ export function App() {
         }
       />
       <AgentUpdatePrompter
+        onOpenChange={setAgentUpdateOpen}
+        onResolved={handleAgentUpdatesResolved}
         presentationAllowed={
           whatsNewResolved &&
           !hasModalOpen &&
@@ -1094,6 +1195,7 @@ export function App() {
           !whatsNewOpen &&
           !migrationNoticePending &&
           !migrationNotice &&
+          !chatWindowIntroOpen &&
           (isLite || !showDownloadModal)
         }
       />

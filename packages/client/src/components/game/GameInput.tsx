@@ -406,7 +406,8 @@ export function GameInput({
   const forceInterruptStyle = forceInterrupt
     ? {
         boxShadow: "0 0 18px -6px rgba(32, 194, 14, 0.6)",
-        backgroundColor: "rgba(32, 194, 14, 0.04)",
+        backgroundColor: "var(--mari-chat-surface-paint, rgba(32, 194, 14, 0.04))",
+        ["--mari-chat-existing-bg" as never]: "rgba(32, 194, 14, 0.04)",
         ["--tw-ring-color" as never]: "rgba(32, 194, 14, 0.45)",
       }
     : undefined;
@@ -414,6 +415,7 @@ export function GameInput({
   return (
     <div
       data-chat-resource-drop-exclude
+      data-chat-input-container
       className={cn(inline ? "" : "px-3 pt-2 pb-3")}
       style={inline ? undefined : { minHeight: 61 }}
     >
@@ -534,7 +536,8 @@ export function GameInput({
         ref={inputBarRef}
         className={getChatInputShellClass({
           className: cn(
-            riskyInterrupt && "ring-1 ring-red-500/40 bg-red-500/5 shadow-[0_0_18px_-6px_rgba(248,113,113,0.55)]",
+            riskyInterrupt &&
+              "[--mari-chat-owner-bg:color-mix(in_oklab,var(--color-red-500)_5%,transparent)] ring-1 ring-red-500/40 bg-red-500/5 shadow-[0_0_18px_-6px_rgba(248,113,113,0.55)]",
             forceInterrupt && "ring-1",
           ),
           hasContent:
@@ -639,6 +642,7 @@ export function GameInput({
         </div>
 
         <textarea
+          data-chat-composer
           ref={inputRef}
           value={text}
           onChange={(e) => {

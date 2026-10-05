@@ -19,7 +19,11 @@ import {
   resolveProviderTopK,
 } from "../../routes/generate/generate-route-utils.js";
 import { mergeModelContextLimit, resolveStoredModelContextLimit } from "./model-access-policy.js";
-import { normalizeChatTopP, supportsAssistantReasoningPrefill } from "./generation-parameters.js";
+import {
+  keepsCodexDefaultEffort,
+  normalizeChatTopP,
+  supportsAssistantReasoningPrefill,
+} from "./generation-parameters.js";
 import { clampGenerationMaxOutputTokens } from "./output-token-limits.js";
 import {
   isFallbackConnectionUsable,
@@ -49,6 +53,7 @@ type GenerationProviderRuntimeArgs = {
   fallbackBaseUrl?: string;
   onFallback?: GenerationFallbackNotifier;
   onProviderUsed?: (origin: GenerationProviderOrigin) => void;
+  wrapProvider?: (provider: BaseLLMProvider) => BaseLLMProvider;
   chatMode: string;
   isSceneChat: boolean;
   chatParameters: unknown;
@@ -146,7 +151,6 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     if (runtime.effectiveMaxContext !== previousContext) parameterSources.effectiveMaxContext = source;
   };
 
-  const isLocalGemma = (args.connection.model ?? "").toLowerCase().includes("gemma");
   applyParameterOverrides(connectionParams, "connection");
   applyParameterOverrides(chatParams, "chat");
   runtime.customParameters = mergeCustomParameters(
@@ -162,22 +166,7 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     forceParameters("scene", { maxTokens: 8192, reasoningEffort: "maximum", verbosity: "high" });
   }
 
-  if (args.chatMode === "game" && !isLocalGemma) {
-    forceParameters("game", {
-      temperature: 1,
-      maxTokens: 16_384,
-      topP: 1,
-      topK: 0,
-      minP: 0,
-      frequencyPenalty: 0,
-      presencePenalty: 0,
-      reasoningEffort: "maximum",
-      verbosity: null,
-    });
-  }
-
   if (args.chatMode === "game") {
-    if (runtime.maxTokens < 16_384) forceParameters("game", { maxTokens: 16_384 });
     const capped = clampGenerationMaxOutputTokens({
       provider: args.connection.provider,
       model: args.connection.model,
@@ -189,6 +178,10 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
 
   const modelLower = (args.connection.model ?? "").toLowerCase();
   const providerLower = (args.connection.provider ?? "").toLowerCase();
+  const isCodex = providerLower === "openai_chatgpt";
+  if (runtime.reasoningEffort !== null && keepsCodexDefaultEffort(providerLower, connectionParams, chatParams)) {
+    forceParameters("defaults", { reasoningEffort: null });
+  }
   let resolvedEffort = resolveProviderReasoningEffort({
     provider: providerLower,
     model: modelLower,
@@ -204,7 +197,9 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     runtime.enabledParameters?.reasoningEffort === false
       ? undefined
       : runtime.reasoningEffort === null
-        ? "none"
+        ? isCodex
+          ? undefined
+          : "none"
         : (resolvedEffort ?? undefined);
   const isClaudeNoSampling = isClaudeAdaptiveOnlyNoSamplingModel(modelLower);
   if (isClaudeNoSampling) {
@@ -250,6 +245,7 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
   );
   const provider = withConnectionFallbackProvider({
     primary: primaryProvider,
+    wrapProvider: args.wrapProvider,
     primaryConnectionId: args.connectionId,
     fallbackConnection: args.fallbackConnection,
     fallbackBaseUrl: args.fallbackBaseUrl ?? "",

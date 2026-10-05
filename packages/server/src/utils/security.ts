@@ -3,10 +3,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { basename, extname, relative, resolve, sep, win32 } from "node:path";
 import { brotliDecompressSync, gunzipSync, zstdDecompressSync } from "node:zlib";
 import { Agent } from "undici";
-import { isLoopbackIp, isPrivateNetworkIp } from "../middleware/ip-allowlist.js";
+import { isLoopbackIp, isNonRoutableNetworkIp, isPrivateNetworkIp } from "../middleware/ip-allowlist.js";
 import { logger } from "../lib/logger.js";
 import { CSRF_HEADER, CSRF_HEADER_VALUE } from "@marinara-engine/shared";
 import { requestHeadersWithOpenRouterAttribution } from "./openrouter-attribution.js";
+import { getOpenCodeSessionId, isOpenCodeApiUrl, requestHeadersWithOpenCodeSession } from "./opencode-session.js";
 
 export { CSRF_HEADER, CSRF_HEADER_VALUE };
 
@@ -238,6 +239,15 @@ function isLoopbackHostname(hostname: string): boolean {
 
 function isMdnsHostname(hostname: string): boolean {
   return normalizeHostnameForAddress(hostname).replace(/\.$/, "").toLowerCase().endsWith(".local");
+}
+
+/**
+ * `localhost`, or a loopback or private-network IP literal. Other local-looking names
+ * (`.local`, `.internal`) are excluded: DNS decides where they go, and it could be public.
+ */
+export function isLocalAddressHostname(hostname: string): boolean {
+  const address = normalizeHostnameForAddress(hostname).replace(/\.$/, "").toLowerCase();
+  return LOCALHOST_NAMES.has(address) || isLoopbackIp(address) || isNonRoutableNetworkIp(address);
 }
 
 export function normalizeLoopbackUrl(url: string | URL): string {
@@ -601,6 +611,7 @@ const CROSS_ORIGIN_REDIRECT_STRIPPED_HEADERS = [
   "xi-api-key",
   "x-api-key",
   "api-key",
+  "x-opencode-session",
   "content-type",
   "content-length",
 ];
@@ -648,12 +659,17 @@ export async function safeFetch(url: string | URL, options: SafeFetchOptions = {
     dispatcher ? undefined : keepAliveInitialDelayMs,
   );
   const redirects = policy?.maxRedirects ?? MAX_REDIRECTS;
+  const sessionId = getOpenCodeSessionId();
   let currentHeaders = headers;
   let currentInit = { ...init };
 
   for (let i = 0; i <= redirects; i += 1) {
     const internalDispatcher = dispatcher ? undefined : current.dispatcher;
-    const attributedHeaders = requestHeadersWithOpenRouterAttribution(current.url, currentHeaders);
+    const attributedHeaders = requestHeadersWithOpenCodeSession(
+      current.url,
+      requestHeadersWithOpenRouterAttribution(current.url, currentHeaders),
+      sessionId,
+    );
     const requestHeaders = decodeCompressedResponse
       ? requestHeadersWithIdentityEncoding(attributedHeaders)
       : attributedHeaders;
@@ -672,6 +688,9 @@ export async function safeFetch(url: string | URL, options: SafeFetchOptions = {
         currentHeaders = stripCrossOriginRedirectHeaders(currentHeaders);
         currentInit = { ...currentInit };
         delete (currentInit as { body?: unknown }).body;
+      } else if (isOpenCodeApiUrl(previousUrl) && !isOpenCodeApiUrl(nextUrl)) {
+        currentHeaders = new Headers(currentHeaders);
+        currentHeaders.delete("x-opencode-session");
       }
       current = await validateOutboundUrlForFetch(nextUrl, policy, agentOptions, keepAliveInitialDelayMs);
       continue;

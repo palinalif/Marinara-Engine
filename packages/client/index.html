@@ -4,10 +4,10 @@
     <meta charset="UTF-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <meta name="description" content="Marinara Engine — RPG chat and roleplay engine" />
-    <meta name="theme-color" content="#0a0a0f" />
+    <meta name="theme-color" content="#0f0f13" />
     <meta name="color-scheme" content="dark light" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
@@ -17,10 +17,13 @@
       /* Sets WKWebView native backing color for iOS safe-area zones.
          Literal opaque value required — CSS vars not resolved for backing.
          !important guards against any external stylesheet override winning cascade. */
-      html, body { background-color: #050312 !important; }
+      html,
+      body {
+        background-color: #0f0f13 !important;
+      }
     </style>
     <link rel="icon" type="image/png" href="/favicon.png" />
-    <link rel="manifest" href="/manifest.json" />
+    <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
   </head>
   <body>

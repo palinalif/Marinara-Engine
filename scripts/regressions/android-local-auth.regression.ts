@@ -435,7 +435,7 @@ try {
   );
   assert.match(
     wrapperProperties,
-    /distributionSha256Sum=acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a/u,
+    /distributionSha256Sum=bafd5ce9cfaea0fbccfdc8439a1ac42fbd4cd9c89dc9a988228d8a2639a58e6c/u,
   );
 
   console.info("Android local authentication regressions passed.");

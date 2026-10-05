@@ -27,7 +27,10 @@ import {
   Loader2,
   PhoneIncoming,
   CalendarClock,
+  TextSearch,
+  Activity,
 } from "lucide-react";
+import { openActivityOverview, openGlobalSearch } from "../../lib/chat-insights";
 import { useBulkExportChats, useChats, useCreateChat, useDeleteChat, useDeleteChatGroup } from "../../hooks/use-chats";
 import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
 import { useConnections } from "../../hooks/use-connections";
@@ -43,13 +46,17 @@ import { useCharacterSummaries } from "../../hooks/use-characters";
 import { handleFolderRenameKeyDown, useFolderRenameGesture } from "../../hooks/use-folder-rename-gesture";
 import { useChatStore } from "../../stores/chat.store";
 import { confirmNonEmptyFolderDelete, showConfirmDialog } from "../../lib/app-dialogs";
-import { useUIStore, type UserStatus } from "../../stores/ui.store";
+import { isMobileShellViewport, useUIStore, type UserStatus } from "../../stores/ui.store";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
 import { chatBackgroundMetadataToUrl } from "../../lib/backgrounds";
 import { formatRelativeContact } from "../../lib/relative-time";
 import { ChatRowPeek } from "./ChatRowPeek";
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { useTouchFolderDrag } from "../../hooks/use-touch-folder-drag";
+import { TouchDragHandle } from "../ui/TouchDragHandle";
 import { usePresenceClock } from "../../hooks/use-presence-clock";
+import { usePanelKeyboardFocus } from "./use-panel-keyboard-focus";
+import { PanelErrorState, PanelListSkeleton } from "../ui/PanelStates";
 import { toast } from "sonner";
 import {
   BACKGROUND_THUMBNAIL_WIDTH,
@@ -70,18 +77,21 @@ import {
   compareChatsByActivityDesc,
   compareChatsByCreatedAtAsc,
   compareChatsByCreatedAtDesc,
+  getChatActivityTime,
 } from "../../lib/chat-recency";
+import { sortPanelFolders } from "../../lib/panel-sort";
 import { getCurrentGameGroupRepresentative } from "../../lib/game-session-resolution";
 import { api } from "../../lib/api-client";
 import { SelectionActionBar } from "../ui/SelectionActionBar";
 import { SmoothFolderContent } from "../ui/SmoothFolderContent";
+import { HelpTooltip } from "../ui/HelpTooltip";
 import { useTranslation, useTranslation as useUiTranslation } from "react-i18next";
 import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
 import { PersonalExtensionContributionSlot } from "../extensions/PersonalExtensionContributionSlot";
 import { ChatModeIcon } from "../chat/ChatModeIcon";
 import { CharacterScheduleManagerModal } from "../chat/CharacterScheduleManagerModal";
 
-type ChatSortOption = "recent" | "newest" | "oldest" | "name-asc" | "name-desc";
+type ChatSortOption = "custom" | "recent" | "newest" | "oldest" | "name-asc" | "name-desc";
 const CHAT_LIST_PAGE_SIZE = 100;
 
 const CONVERSATION_STATUS_PRIORITY: Record<ConversationPresenceStatus, number> = {
@@ -188,21 +198,21 @@ const MODE_CONFIG: Record<
   }
 > = {
   conversation: {
-    icon: <ChatModeIcon mode="conversation" size="0.875rem" />,
+    icon: <ChatModeIcon mode="conversation" size="0.875rem" className="mari-rgb-static-icon" />,
     label: "Conversation",
     shortLabel: "CONVO",
     description: "A straightforward AI conversation — no roleplay elements.",
     logoModeClass: "mari-chat-logo-mode--conversation",
   },
   roleplay: {
-    icon: <ChatModeIcon mode="roleplay" size="0.875rem" />,
+    icon: <ChatModeIcon mode="roleplay" size="0.875rem" className="mari-rgb-static-icon" />,
     label: "Roleplay",
     shortLabel: "RP",
     description: "Immersive roleplay with characters, game state tracking, and world simulation.",
     logoModeClass: "mari-chat-logo-mode--roleplay",
   },
   game: {
-    icon: <ChatModeIcon mode="game" size="0.875rem" />,
+    icon: <ChatModeIcon mode="game" size="0.875rem" className="mari-rgb-static-icon" />,
     label: "Game",
     shortLabel: "GM",
     description: "AI-managed singleplayer RPG with a Game Master, party, dice, maps, and quests.",
@@ -255,6 +265,15 @@ export function ChatSidebar() {
   const editorDirty = useUIStore((s) => s.editorDirty);
   const closeAllDetails = useUIStore((s) => s.closeAllDetails);
   const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
+  const sidebarIsOpen = useUIStore((s) => s.sidebarOpen);
+  const sidebarNavRef = useRef<HTMLElement>(null);
+  const closeSidebarFromKeyboard = useCallback(() => setSidebarOpen(false), [setSidebarOpen]);
+  const sidebarKeyboard = usePanelKeyboardFocus({
+    open: sidebarIsOpen,
+    containerRef: sidebarNavRef,
+    toggleSelector: '[data-component="TopBar"] [data-tour="sidebar-toggle"]',
+    onClose: closeSidebarFromKeyboard,
+  });
   const chatModeShortcutRequest = useUIStore((s) => s.chatModeShortcutRequest);
   const setPendingNewChatMode = useChatStore((s) => s.setPendingNewChatMode);
 
@@ -285,13 +304,6 @@ export function ChatSidebar() {
   const [draggedChatId, setDraggedChatId] = useState<string | null>(null);
   const [isRootDropTarget, setIsRootDropTarget] = useState(false);
   const chatImportInputRef = useRef<HTMLInputElement>(null);
-  const touchDragRef = useRef<{
-    chatId: string;
-    timer: number | null;
-    active: boolean;
-    lastX: number;
-    lastY: number;
-  } | null>(null);
   const suppressTouchDragClickRef = useRef(false);
 
   // Multi-select state
@@ -475,9 +487,18 @@ export function ChatSidebar() {
 
   // ── Folder grouping ──
   const modeFolders = useMemo(() => {
-    if (!folders) return [] as ChatFolder[];
-    return folders.filter((f) => f.mode === activeTab).sort((a, b) => a.sortOrder - b.sortOrder);
-  }, [folders, activeTab]);
+    const list = sortPanelFolders(
+      (folders ?? []).filter((f) => f.mode === activeTab),
+      sort === "recent" ? "name-asc" : sort,
+    );
+    if (sort !== "recent") return list;
+    const activity = new Map(list.map((folder) => [folder.id, getChatActivityTime(folder)]));
+    for (const chat of modeChats) {
+      if (chat.folderId)
+        activity.set(chat.folderId, Math.max(activity.get(chat.folderId) ?? 0, getChatActivityTime(chat)));
+    }
+    return list.sort((a, b) => activity.get(b.id)! - activity.get(a.id)!);
+  }, [folders, activeTab, sort, modeChats]);
 
   const { unfiledChats, folderChatsMap } = useMemo(() => {
     if (!visibleDisplayChats.length)
@@ -511,9 +532,14 @@ export function ChatSidebar() {
 
   const [localFolderOrder, setLocalFolderOrder] = useState<string[]>([]);
   useEffect(() => {
-    if (!folders) return;
-    setLocalFolderOrder(modeFolders.map((f) => f.id));
-  }, [folders, modeFolders]);
+    setLocalFolderOrder(
+      sortPanelFolders(
+        (folders ?? []).filter((f) => f.mode === activeTab),
+        "custom",
+      ).map((f) => f.id),
+    );
+  }, [folders, activeTab]);
+  const folderOrder = sort === "custom" ? localFolderOrder : modeFolders.map((folder) => folder.id);
 
   useEffect(() => {
     const allChats = chats ?? [];
@@ -642,7 +668,7 @@ export function ChatSidebar() {
       const connectionRows = ((connections ?? []) as Array<{ id: string }>).filter((connection) => !!connection.id);
       if (connectionRows.length === 0) {
         setPendingNewChatMode(mode, "sidebar");
-        if (typeof window !== "undefined" && window.innerWidth < 768) setSidebarOpen(false);
+        if (isMobileShellViewport()) setSidebarOpen(false);
         return;
       }
 
@@ -667,7 +693,7 @@ export function ChatSidebar() {
         {
           onSuccess: (chat) => {
             setActiveChatId(chat.id);
-            if (typeof window !== "undefined" && window.innerWidth < 768) setSidebarOpen(false);
+            if (isMobileShellViewport()) setSidebarOpen(false);
             useChatStore.getState().setShouldOpenSettings(true);
             useChatStore.getState().setShouldOpenWizard(true);
             if (starred) {
@@ -780,6 +806,7 @@ export function ChatSidebar() {
 
   const handleFolderReorder = useCallback(
     (newOrder: string[]) => {
+      setSort("custom");
       setLocalFolderOrder(newOrder);
       reorderFoldersMut.mutate(newOrder);
     },
@@ -803,58 +830,32 @@ export function ChatSidebar() {
     [moveChatMut],
   );
 
-  const startTouchDrag = useCallback((chatId: string, event: React.PointerEvent<HTMLElement>) => {
-    if (event.pointerType === "mouse") return;
-    const drag = {
-      chatId,
-      timer: null as number | null,
-      active: false,
-      lastX: event.clientX,
-      lastY: event.clientY,
-    };
-    drag.timer = window.setTimeout(() => {
-      drag.active = true;
+  const resetTouchDrag = () => {
+    setDraggedChatId(null);
+    setIsRootDropTarget(false);
+    window.setTimeout(() => {
+      suppressTouchDragClickRef.current = false;
+    }, 0);
+  };
+
+  const { startTouchDrag, startMouseDrag } = useTouchFolderDrag({
+    delayMs: 420,
+    onActivate: (chatId) => {
       setDraggedChatId(chatId);
-    }, 420);
-    touchDragRef.current = drag;
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }, []);
-
-  const updateTouchDrag = useCallback((event: React.PointerEvent<HTMLElement>) => {
-    const drag = touchDragRef.current;
-    if (!drag) return;
-    drag.lastX = event.clientX;
-    drag.lastY = event.clientY;
-    if (drag.active) event.preventDefault();
-  }, []);
-
-  const finishTouchDrag = useCallback(
-    (event: React.PointerEvent<HTMLElement>) => {
-      const drag = touchDragRef.current;
-      if (!drag) return;
-      if (drag.timer !== null) {
-        window.clearTimeout(drag.timer);
-      }
-      touchDragRef.current = null;
-
-      if (drag.active) {
-        const target = document.elementFromPoint(drag.lastX, drag.lastY);
-        const folderEl = target?.closest<HTMLElement>("[data-chat-folder-id]");
-        const rootEl = target?.closest<HTMLElement>("[data-chat-root-drop-zone]");
-        const folderId = folderEl?.dataset.chatFolderId ?? null;
-        if (folderId) {
-          handleDropChatsToFolder(getDragChatIds(drag.chatId), folderId);
-        } else if (rootEl) {
-          handleDropChatsToFolder(getDragChatIds(drag.chatId), null);
-        }
-        setDraggedChatId(null);
-        setIsRootDropTarget(false);
-        suppressTouchDragClickRef.current = true;
-        event.preventDefault();
-      }
+      suppressTouchDragClickRef.current = true;
     },
-    [getDragChatIds, handleDropChatsToFolder],
-  );
+    onDrop: (chatId, x, y) => {
+      const target = document.elementFromPoint(x, y);
+      const folderId = target?.closest<HTMLElement>("[data-chat-folder-id]")?.dataset.chatFolderId;
+      if (folderId) {
+        handleDropChatsToFolder(getDragChatIds(chatId), folderId);
+      } else if (target?.closest("[data-chat-root-drop-zone]")) {
+        handleDropChatsToFolder(getDragChatIds(chatId), null);
+      }
+      resetTouchDrag();
+    },
+    onCancel: resetTouchDrag,
+  });
 
   // ── Batch actions ──
   const handleBatchDelete = useCallback(async () => {
@@ -969,6 +970,7 @@ export function ChatSidebar() {
         tabIndex={0}
         key={chat.groupId ?? chat.id}
         data-chat-id={chat.id}
+        onMouseDown={(event) => startMouseDrag(event, chat.id)}
         draggable
         onDragStart={(event) => {
           const chatIds = getDragChatIds(chat.id);
@@ -1008,7 +1010,7 @@ export function ChatSidebar() {
           }
           internalNavRef.current = true;
           setActiveChatId(chat.id);
-          if (window.innerWidth < 768) setSidebarOpen(false);
+          if (isMobileShellViewport()) setSidebarOpen(false);
         }}
         className={cn(
           "group relative isolate flex w-full touch-pan-y items-center gap-2.5 overflow-hidden rounded-lg px-3 py-2.5 text-left transition-all duration-150",
@@ -1030,22 +1032,15 @@ export function ChatSidebar() {
             )}
           </div>
         )}
-        <button
-          type="button"
-          aria-label={localizeUi("ui.layout.chatsidebar.dragChat")}
-          title={localizeUi("ui.layout.chatsidebar.dragChat")}
-          className="mari-chrome-accent-text-muted mari-accent-animated flex h-8 w-6 shrink-0 cursor-grab touch-none items-center justify-center rounded-md opacity-100 transition-all hover:bg-[var(--marinara-chat-chrome-highlight-bg)] hover:text-[var(--marinara-chat-chrome-button-text-hover)] active:cursor-grabbing active:scale-95 md:h-7 md:w-5 md:opacity-0 md:group-hover:opacity-100"
-          onClick={(event) => event.stopPropagation()}
-          onPointerDown={(event) => {
-            event.stopPropagation();
-            startTouchDrag(chat.id, event);
+        <TouchDragHandle
+          label={localizeUi("ui.layout.chatsidebar.dragChat")}
+          onTouchStart={(event) => {
+            startTouchDrag(event, chat.id, {
+              allowInteractiveTarget: true,
+              sourceElement: event.currentTarget.closest<HTMLElement>("[data-chat-id]"),
+            });
           }}
-          onPointerMove={updateTouchDrag}
-          onPointerUp={finishTouchDrag}
-          onPointerCancel={finishTouchDrag}
-        >
-          <GripVertical size="0.8125rem" />
-        </button>
+        />
 
         {/* Chat background banner — active/hovered only, behind everything */}
         {bannerUrl && (
@@ -1214,6 +1209,19 @@ export function ChatSidebar() {
           >
             {displayName}
           </span>
+          {chat.metadata?.multiplayer && (
+            <span className="mari-chrome-accent-text-muted block truncate text-[0.6875rem]">
+              {localizeUi(
+                (chat.metadata.multiplayer as { role?: string; status?: string }).role === "host"
+                  ? (chat.metadata.multiplayer as { status?: string }).status === "ended"
+                    ? "multiplayer.sidebar.stopped"
+                    : "multiplayer.sidebar.hosting"
+                  : (chat.metadata.multiplayer as { status?: string }).status === "joined"
+                    ? "multiplayer.sidebar.joined"
+                    : "multiplayer.sidebar.disconnected",
+              )}
+            </span>
+          )}
           {subtitle && (
             <span className="mari-chrome-accent-text-muted flex items-center gap-1 truncate text-[0.6875rem] leading-tight">
               {SubtitleIcon && (
@@ -1277,22 +1285,33 @@ export function ChatSidebar() {
 
   return (
     <nav
+      ref={sidebarNavRef}
       data-component="ChatSidebar"
       aria-label={localize("Chat navigation")}
-      className="mari-chat-sidebar mari-chrome-token-scope flex h-full flex-col"
+      tabIndex={-1}
+      onKeyDown={sidebarKeyboard.onKeyDown}
+      className="mari-chat-sidebar mari-chrome-token-scope flex h-full flex-col outline-none"
     >
       {/* Header */}
-      <div className="mari-sidebar-header relative flex h-12 items-center justify-between bg-[var(--card)]/80 px-4 backdrop-blur-sm">
+      <div className="mari-sidebar-header relative flex h-12 items-center justify-between px-4">
         <div className="absolute inset-x-0 bottom-0 h-px bg-[var(--border)]/30" />
         <div className="flex min-w-0 items-center gap-2.5">
           <ChatSidebarTitleIcon />
           <h2 className="mari-chrome-text-strong truncate text-sm font-semibold">{localize("Chats")}</h2>
+          <HelpTooltip
+            text={t("navigation.sidebarHelp.chats")}
+            ariaLabel={t("navigation.sidebarHelp.button", { sidebar: localize("Chats") })}
+            side="bottom"
+            wide
+            className="shrink-0 [@media(pointer:coarse)]:-ml-3"
+            buttonClassName="justify-center [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9"
+          />
         </div>
         <div className="flex min-w-0 shrink-0 items-center gap-1">
           <PersonalExtensionContributionSlot surface="chats" position="header" className="max-w-28" />
           <button
             onClick={() => setSidebarOpen(false)}
-            className="mari-chrome-control mari-chrome-control--small mari-accent-animated p-1.5 active:scale-90 md:hidden"
+            className="mari-chrome-control mari-chrome-control--small mari-accent-animated p-1.5 active:scale-90 md:hidden max-md:h-9 max-md:w-9 [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9"
             title={localize("Close")}
             aria-label={localize("Close chats")}
           >
@@ -1360,7 +1379,7 @@ export function ChatSidebar() {
           title={t(`navigation.chatSidebar.new.${activeTab}`)}
           aria-label={t(`navigation.chatSidebar.new.${activeTab}`)}
         >
-          <Plus size="0.8125rem" className="mari-chrome-accent-icon mari-accent-animated" />
+          <Plus size="0.8125rem" className="mari-rgb-static-icon" />
         </button>
         <button
           onClick={() => chatImportInputRef.current?.click()}
@@ -1398,6 +1417,12 @@ export function ChatSidebar() {
               placeholder={t(`navigation.chatSidebar.search.${activeTab}`)}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && !event.nativeEvent.isComposing && searchQuery) {
+                  event.preventDefault();
+                  setSearchQuery("");
+                }
+              }}
               className="mari-chrome-field h-10 w-full py-0 pl-8 pr-3 text-xs md:h-9"
             />
           </div>
@@ -1408,6 +1433,7 @@ export function ChatSidebar() {
               className="mari-chrome-field mari-chrome-sort-field mari-accent-animated h-10 appearance-none py-0 pl-2.5 pr-7 text-[0.6875rem] md:h-9"
               title={localize("Sort chats")}
             >
+              <option value="custom">{localizeUi("ui.layout.chatsidebar.customOrder")}</option>
               <option value="recent">{localizeUi("ui.layout.chatsidebar.recent")}</option>
               <option value="newest">{localize("Newest")}</option>
               <option value="oldest">{localize("Oldest")}</option>
@@ -1419,6 +1445,15 @@ export function ChatSidebar() {
               className="mari-chrome-field-icon mari-chrome-sort-icon mari-accent-animated pointer-events-none absolute right-2 top-1/2 -translate-y-1/2"
             />
           </div>
+          <button
+            type="button"
+            onClick={() => openGlobalSearch(searchQuery.trim())}
+            className="mari-chrome-control mari-chrome-control--small h-10 w-10 shrink-0 justify-center p-0! md:h-9 md:w-9"
+            title={localizeUi("chatInsights.search.open")}
+            aria-label={localizeUi("chatInsights.search.open")}
+          >
+            <TextSearch size="0.875rem" />
+          </button>
         </div>
 
         {allTags.length > 0 && (
@@ -1522,30 +1557,14 @@ export function ChatSidebar() {
         }}
       >
         <ChatRowPeek containerRef={chatListRef} activeChatId={activeChatId} disabled={multiSelectMode} />
-        {isLoading && (
-          <div className="flex flex-col gap-2 px-2 py-4">
-            {[1, 2, 3].map((i) => (
-              <div key={i} className="shimmer h-10 rounded-lg" />
-            ))}
-          </div>
-        )}
+        {isLoading && <PanelListSkeleton />}
 
         {chatsError && !isLoading && (
-          <div className="flex flex-col items-center gap-2 px-3 py-12 text-center">
-            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--destructive)]/10">
-              <AlertTriangle size="1.25rem" className="text-[var(--destructive)]" />
-            </div>
-            <p className="text-xs text-[var(--muted-foreground)]">
-              {localizeUi("ui.layout.chatsidebar.marinaraIsStillWakingUpChatsShouldAppearIn")}
-            </p>
-            <button
-              onClick={() => void refetchChats()}
-              disabled={isFetching}
-              className="mari-chrome-control mari-chrome-control--compact mt-1 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {localize(isFetching ? "Checking..." : "Try Again")}
-            </button>
-          </div>
+          <PanelErrorState
+            message={localizeUi("ui.layout.chatsidebar.marinaraIsStillWakingUpChatsShouldAppearIn")}
+            onRetry={() => void refetchChats()}
+            retrying={isFetching}
+          />
         )}
 
         {displayChats.length === 0 && !isLoading && !chatsError && (
@@ -1566,7 +1585,7 @@ export function ChatSidebar() {
                 activeModeConfig.logoModeClass,
               )}
             >
-              <span className="mari-chrome-accent-icon mari-accent-animated">+</span>
+              <span>+</span>
               {t(`navigation.chatSidebar.new.${activeTab}`)}
             </button>
           </div>
@@ -1592,15 +1611,15 @@ export function ChatSidebar() {
           )}
 
           {/* Folders (drag-to-reorder) */}
-          {localFolderOrder.length > 0 && (
+          {folderOrder.length > 0 && (
             <Reorder.Group
               axis="y"
-              values={localFolderOrder}
+              values={folderOrder}
               onReorder={handleFolderReorder}
               as="div"
               className="flex flex-col gap-0.5 mt-1"
             >
-              {localFolderOrder.map((folderId) => {
+              {folderOrder.map((folderId) => {
                 const folder = modeFolders.find((f) => f.id === folderId);
                 if (!folder) return null;
                 const folderEntries = folderChatsMap.get(folderId) ?? [];
@@ -2063,6 +2082,7 @@ function UserStatusFooter({
             if (event.key === "Enter") {
               event.currentTarget.blur();
             } else if (event.key === "Escape") {
+              event.preventDefault();
               setActivityFocused(false);
               event.currentTarget.blur();
             }
@@ -2072,15 +2092,24 @@ function UserStatusFooter({
           aria-label={localizeUi("ui.layout.userstatusfooter.customActivity")}
           className="mari-chrome-field mari-chrome-field--compact min-w-0 flex-1 px-2 py-1 text-xs max-md:h-9 max-md:min-h-9"
         />
+        <button
+          type="button"
+          onClick={openActivityOverview}
+          title={localizeUi("chatInsights.activity.open")}
+          aria-label={localizeUi("chatInsights.activity.open")}
+          className="mari-chrome-control mari-chrome-control--small ml-1 h-7 w-7 shrink-0 justify-center p-0! max-md:h-9 max-md:min-h-9 max-md:w-9"
+        >
+          <Activity className="shrink-0" size="1rem" strokeWidth={2.25} />
+        </button>
         {showScheduleManager && (
           <button
             type="button"
             onClick={onOpenScheduleManager}
             title={localizeUi("ui.layout.chatsidebar.characterScheduleManager")}
             aria-label={localizeUi("ui.layout.chatsidebar.characterScheduleManager")}
-            className="mari-chrome-control mari-chrome-control--small ml-1 h-7 w-7 shrink-0 justify-center p-0 max-md:h-9 max-md:min-h-9 max-md:w-9"
+            className="mari-chrome-control mari-chrome-control--small ml-1 h-7 w-7 shrink-0 justify-center p-0! max-md:h-9 max-md:min-h-9 max-md:w-9"
           >
-            <CalendarClock size="1.25rem" strokeWidth={2.25} />
+            <CalendarClock className="shrink-0" size="1.25rem" strokeWidth={2.25} />
           </button>
         )}
       </div>

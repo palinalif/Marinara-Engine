@@ -97,6 +97,9 @@ export function applyGlmThinkingParameters(body: Record<string, unknown>, option
   }
 
   body.enable_thinking = thinkingEnabled;
+  // NanoGPT documents reasoning_effort "none" as the way to turn reasoning off. enable_thinking alone
+  // left GLM thinking at its default, so an explicit Off is sent the documented way too (#6961).
+  if (!nativeEndpoint && !thinkingEnabled && options.reasoningEffort === "none") body.reasoning_effort = "none";
   return true;
 }
 

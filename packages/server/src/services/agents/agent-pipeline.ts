@@ -20,6 +20,7 @@ import {
   type AgentToolContext,
 } from "./agent-executor.js";
 import { logger } from "../../lib/logger.js";
+import { failureLevel } from "../../lib/log-context.js";
 import { createAgentConcurrencyLimiter, settleAgentJobsWithConcurrencyLimit } from "./agent-concurrency.js";
 import { getCustomLorebookReadBehindMessages } from "../../routes/generate/lorebook-keeper-utils.js";
 export { settleAgentJobsWithConcurrencyLimit } from "./agent-concurrency.js";
@@ -251,7 +252,7 @@ async function executeGroup(
       if (entry.status === "fulfilled") return entry.value;
 
       const agent = toolAgents[index]!;
-      logger.error(entry.reason, "[agent-pipeline] Tool agent FAILED for %s", agent.type);
+      logger[failureLevel(entry.reason)](entry.reason, "[agent-pipeline] Tool agent FAILED for %s", agent.type);
       const errorResult: AgentResult = {
         agentId: agent.id,
         agentType: agent.type,
@@ -333,7 +334,7 @@ async function executePhase(
       // Group rejected — log and produce error results so they're visible
       const group = groups[i]!;
       if (entry.reason instanceof Error) {
-        logger.error(
+        logger[failureLevel(entry.reason)](
           entry.reason,
           '[agent-pipeline] Group REJECTED in phase "%s": [%s]',
           phase,
@@ -515,11 +516,14 @@ export function createAgentPipeline(
       options: {
         preGenInjections?: AgentInjection[];
         parallelResults?: AgentResult[];
+        /** Decision answers taken with the finished reply, in place of the pre-reply ones. */
+        decisions?: AgentContext["decisions"];
       } = {},
     ): Promise<AgentResult[]> {
       const postAgents = agents.filter((agent) => agent.phase === "post_processing");
       const fullContext: AgentContext = {
         ...baseContext,
+        ...("decisions" in options ? { decisions: options.decisions } : {}),
         mainResponse,
         preGenInjections: options.preGenInjections ?? preGenerationInjections,
         parallelResults: options.parallelResults ?? parallelPhaseResults,

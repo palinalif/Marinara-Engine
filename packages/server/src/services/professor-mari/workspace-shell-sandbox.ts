@@ -7,7 +7,12 @@ import { basename, delimiter, dirname, join, relative, resolve, sep } from "node
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { MAX_REVIEW_FILE_BYTES, workspacePathAccessPolicy } from "./workspace-change-review.service.js";
+import {
+  MAX_REVIEW_FILE_BYTES,
+  escapeRegExp,
+  isBuildOutputPath,
+  workspacePathAccessPolicy,
+} from "./workspace-change-review.service.js";
 import { getBubblewrapRuntimeStatus } from "../sandbox/bubblewrap-runtime.js";
 import { logger } from "../../lib/logger.js";
 
@@ -15,8 +20,7 @@ export type WorkspaceShellSandboxBackend = "macos-seatbelt" | "linux-bubblewrap"
 export type WorkspaceProcessIsolationBackend = WorkspaceShellSandboxBackend | "node-permission-opt-in";
 
 export type WorkspaceShellSandboxStatus =
-  | { available: true; backend: WorkspaceShellSandboxBackend }
-  | { available: false; backend: null; reason: string };
+  { available: true; backend: WorkspaceShellSandboxBackend } | { available: false; backend: null; reason: string };
 
 export type WorkspaceSandboxedShell = {
   backend: WorkspaceProcessIsolationBackend;
@@ -232,12 +236,34 @@ export async function workspacePolicyPaths(workspaceRoot: string) {
     }
   };
   await visit(workspaceRoot);
+  // #6984: build output is read-only too. It sits at packages/<pkg>/dist*, so two directory reads find all of
+  // it. The folders holding it are listed as well, so neither sandbox lets a command move a package folder away
+  // and write a new build in its place.
+  const packagesDir = join(workspaceRoot, "packages");
+  const buildOutputs: string[] = [];
+  const buildOutputHolders: string[] = [];
+  if (existsSync(packagesDir) && statSync(packagesDir).isDirectory()) {
+    buildOutputHolders.push(packagesDir);
+    for (const pkg of await readdir(packagesDir, { withFileTypes: true })) {
+      if (!pkg.isDirectory()) continue;
+      const pkgDir = join(packagesDir, pkg.name);
+      buildOutputHolders.push(pkgDir);
+      for (const name of await readdir(pkgDir)) {
+        if (isBuildOutputPath(workspaceRoot, join(pkgDir, name))) buildOutputs.push(join(pkgDir, name));
+      }
+    }
+  }
   return {
     forbidden: uniqueExistingPaths(forbidden),
     sensitive: uniqueExistingPaths(sensitive),
     packageStores: uniqueExistingPaths(packageStores),
     nodeModulesStores: uniqueExistingPaths(nodeModulesStores),
     storeLinks,
+    // Linked folders are protected at their real path, but only inside the workspace: binding a folder from
+    // elsewhere would let the sandbox reach it.
+    buildOutputs: uniqueExistingPaths(buildOutputs).filter((path) => path.startsWith(workspaceRoot + sep)),
+    buildOutputHolders: uniqueExistingPaths(buildOutputHolders).filter((path) => path.startsWith(workspaceRoot + sep)),
+    packagesDir: existsSync(packagesDir) ? realpathSync(packagesDir) : packagesDir,
   };
 }
 
@@ -645,6 +671,15 @@ export async function buildMacosWorkspaceShellProfile(
   // Placed AFTER the store deny: seatbelt's last matching rule wins, so the
   // cache subpaths stay writable inside the otherwise read-only store.
   const storeCacheRule = writableWorkspace && storeCacheAllows ? `(allow file-write*\n${storeCacheAllows})` : "";
+  // #6984: build output stays read-only. The pattern also covers folders that do not exist yet, new packages
+  // and dist-* builds; seatbelt matched DIST to dist on a case-insensitive volume when this was tested.
+  const buildOutputPattern = `^${escapeRegExp(policyPaths.packagesDir)}/[^/]+/dist(-[^/]*)?(/|$)`;
+  const buildOutputRule = writableWorkspace
+    ? `(deny file-write*\n    (regex ${JSON.stringify(buildOutputPattern)})\n${[
+        ...policyPaths.buildOutputs.map((path) => `    (subpath ${sandboxLiteral(path)})`),
+        ...policyPaths.buildOutputHolders.map((path) => `    (literal ${sandboxLiteral(path)})`),
+      ].join("\n")})`
+    : "";
   const workspaceWriteRule = writableWorkspace ? `    (subpath ${sandboxLiteral(workspaceRoot)})\n` : "";
   const processRules = allowChildProcesses
     ? `(allow process*)\n(allow signal)`
@@ -668,6 +703,7 @@ ${forbiddenReadRule}
 ${sensitiveWriteRule}
 ${storeWriteRule}
 ${storeCacheRule}
+${buildOutputRule}
 (deny network*)
 `;
 }
@@ -717,6 +753,10 @@ export async function linuxBubblewrapArgs(
     args.push("--ro-bind", root, root);
   }
   args.push(writableWorkspace ? "--bind" : "--ro-bind", workspaceRoot, workspaceRoot);
+  // #6984: binding the folders that hold build output onto themselves makes them mount points, which cannot be
+  // renamed, so a command cannot move a package away and build a new dist in its place. They come before every
+  // other bind inside the workspace, because a bind hides the ones already made beneath it.
+  if (writableWorkspace) for (const holder of policyPaths.buildOutputHolders) args.push("--bind", holder, holder);
   args.push("--bind", sandboxTemp, sandboxTemp);
   for (const path of policyPaths.sensitive) {
     args.push("--ro-bind", path, path);
@@ -730,6 +770,9 @@ export async function linuxBubblewrapArgs(
     for (const cache of await packageStoreCacheCarveouts(policyPaths.nodeModulesStores)) {
       args.push("--bind", cache, cache);
     }
+    // #6984: build output stays read-only. A mount needs an existing folder, so a dist a command creates in a
+    // package that has none yet is not covered here; the pre-run shell check refuses the usual ways to create one.
+    for (const output of policyPaths.buildOutputs) args.push("--ro-bind", output, output);
   }
   for (const path of policyPaths.forbidden) {
     if ((await lstat(path)).isDirectory()) args.push("--tmpfs", path);

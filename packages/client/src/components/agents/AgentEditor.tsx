@@ -1,3 +1,5 @@
+import { ActivationQuestionFields } from "./ActivationQuestionFields";
+import { useDecisionCalibration, useHasDecisionModel } from "../../hooks/use-decision-model";
 // ──────────────────────────────────────────────
 // Full-Page Agent Editor
 // Click an agent → opens this editor
@@ -102,10 +104,12 @@ import {
   mergeBuiltInAgentSettings,
   normalizeAgentPhaseForType,
   normalizeCustomAgentCapabilities,
-  normalizeCustomAgentContextSources,
+  getAgentContextSources,
   normalizeAgentPromptTemplateOptions,
   normalizeStoryboardAgentSettings,
   parseAgentSettingsRecord,
+  homeAgentWidgetsSchema,
+  type HomeAgentWidgetDefinition,
   CUSTOM_AGENT_CONTEXT_SOURCE_IDS,
   type AgentPhase,
   type AgentPromptTemplateOption,
@@ -695,7 +699,8 @@ export function AgentEditor() {
             (connection) =>
               connection.provider !== "image_generation" &&
               connection.provider !== "video_generation" &&
-              connection.provider !== "audio",
+              connection.provider !== "audio" &&
+              connection.provider !== "decision",
           )
           .map((connection) => connection.id),
       ),
@@ -751,6 +756,26 @@ export function AgentEditor() {
   const [localEchoMessageDelaySeconds, setLocalEchoMessageDelaySeconds] = useState(
     DEFAULT_ECHO_CHAMBER_MESSAGE_DELAY_SECONDS,
   );
+  /** Whether any decision model is chosen, which is what enables the question fields. */
+  const hasDecisionModel = useHasDecisionModel();
+  /**
+   * The selected model's operating point. A saved question keeps whatever its author
+   * chose; this only supplies the starting value, because 0.5 is meaningful for a
+   * model that answers around 0.5 and meaningless for one that answers around 0.2.
+   */
+  const decisionCalibration = useDecisionCalibration();
+  /**
+   * Read through a ref inside the reset effect.
+   *
+   * The calibration is a seed taken at reset time, not a trigger: listing it as a
+   * dependency would re-run the whole form reset whenever the options query refetches
+   * and throw away whatever the user had typed.
+   */
+  const decisionCalibrationRef = useRef(decisionCalibration);
+  decisionCalibrationRef.current = decisionCalibration;
+  const [localActivationQuestion, setLocalActivationQuestion] = useState("");
+  const [localActivationThreshold, setLocalActivationThreshold] = useState(0.5);
+  const [localActivationMaxSkip, setLocalActivationMaxSkip] = useState<number | "">("");
   const [localActivationKeywordsText, setLocalActivationKeywordsText] = useState("");
   const [localActivationScanDepth, setLocalActivationScanDepth] = useState<number | "">(
     DEFAULT_CUSTOM_AGENT_ACTIVATION_SCAN_DEPTH,
@@ -785,6 +810,7 @@ export function AgentEditor() {
   const [localSourceLorebookIds, setLocalSourceLorebookIds] = useState<string[]>([]);
   const [localUseChatActiveLorebooks, setLocalUseChatActiveLorebooks] = useState(false);
   const [localTriggerLorebooksForAgentCalls, setLocalTriggerLorebooksForAgentCalls] = useState(false);
+  const [localBatchWithOtherAgents, setLocalBatchWithOtherAgents] = useState(true);
   const [localSourceFileIds, setLocalSourceFileIds] = useState<string[]>([]);
   const [localAutoGenerateAvatars, setLocalAutoGenerateAvatars] = useState(false);
   const [localUseAvatarReferences, setLocalUseAvatarReferences] = useState(false);
@@ -794,6 +820,7 @@ export function AgentEditor() {
   const [localStoryboardSettings, setLocalStoryboardSettings] = useState<StoryboardAgentSettings>(() =>
     normalizeStoryboardAgentSettings({}),
   );
+  const [localHomeWidgets, setLocalHomeWidgets] = useState<HomeAgentWidgetDefinition[]>([]);
   const [localProseGuardianBanned, setLocalProseGuardianBanned] = useState(DEFAULT_PROSE_GUARDIAN_BANNED_WORDS);
   const [localProseGuardianAvoid, setLocalProseGuardianAvoid] = useState(DEFAULT_PROSE_GUARDIAN_AVOID);
   const [localProseGuardianPrefer, setLocalProseGuardianPrefer] = useState("");
@@ -818,6 +845,31 @@ export function AgentEditor() {
   const [youtubeSaving, setYoutubeSaving] = useState(false);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  /**
+   * Re-seed the threshold once the decision model's calibration arrives.
+   *
+   * The reset effect reads the calibration through a ref, so an editor opened before
+   * `/api/decision/options` resolves seeds from the fallback 0.5 and keeps it. That
+   * is the wrong number for a model answering around 0.2.
+   *
+   * Fires on the calibration changing, not on the question emptying. Watching the
+   * question would reset a threshold somebody had chosen the moment they cleared the
+   * text to rewrite it, and `dirty` is no better: it is set by any edit anywhere in
+   * the form, so renaming the agent first would strand the fallback 0.5.
+   */
+  const seededCalibrationRef = useRef<number | null>(null);
+  /** Whether the agent on screen brought a threshold of its own. */
+  const storedThresholdRef = useRef(false);
+  useEffect(() => {
+    const seed = decisionCalibration.defaultThreshold;
+    if (seededCalibrationRef.current === seed) return;
+    seededCalibrationRef.current = seed;
+    // An agent that stored its own threshold owns it. One that has a question but
+    // never stored one was seeded from whatever fallback was loaded at the time, so
+    // it still wants the real value.
+    if (storedThresholdRef.current) return;
+    setLocalActivationThreshold(seed);
+  }, [decisionCalibration.defaultThreshold]);
   const setEditorDirty = useUIStore((s) => s.setEditorDirty);
   const musicPlayerSource = useUIStore((s) => s.musicPlayerSource);
   const setMusicPlayerSource = useUIStore((s) => s.setMusicPlayerSource);
@@ -839,6 +891,8 @@ export function AgentEditor() {
       setLocalPhase(normalizeAgentPhaseForType(agentType, dbConfig.phase));
       setLocalConnectionId(normalizeTextConnectionOverride(dbConfig.connectionId));
       const settings = mergeBuiltInAgentSettings(agentType, dbConfig.settings);
+      const homeWidgets = homeAgentWidgetsSchema.safeParse(settings.homeWidgets ?? []);
+      setLocalHomeWidgets(!builtIn && homeWidgets.success ? homeWidgets.data : []);
       setLocalStoryboardSettings(normalizeStoryboardAgentSettings(settings));
       const promptTemplateSource = settings.promptTemplates ?? defaultSettings.promptTemplates;
       setLocalAuthor(
@@ -859,6 +913,12 @@ export function AgentEditor() {
           ? settings.activationKeywords.filter((keyword: unknown) => typeof keyword === "string").join("\n")
           : "",
       );
+      setLocalActivationQuestion(String(settings.activationQuestion ?? ""));
+      storedThresholdRef.current = typeof settings.activationThreshold === "number";
+      setLocalActivationThreshold(
+        Number(settings.activationThreshold ?? decisionCalibrationRef.current.defaultThreshold),
+      );
+      setLocalActivationMaxSkip(typeof settings.activationMaxSkip === "number" ? settings.activationMaxSkip : "");
       setLocalActivationScanDepth(
         (settings.activationScanDepth as number | undefined) ?? DEFAULT_CUSTOM_AGENT_ACTIVATION_SCAN_DEPTH,
       );
@@ -904,6 +964,7 @@ export function AgentEditor() {
         (settings.useChatActiveLorebooks as boolean | undefined) ?? defaultSettings.useChatActiveLorebooks === true,
       );
       setLocalTriggerLorebooksForAgentCalls(settings.triggerLorebooksForAgentCalls === true);
+      setLocalBatchWithOtherAgents(settings.batchWithOtherAgents !== false);
       setLocalSourceFileIds(normalizeStringArray(settings.sourceFileIds));
       setLocalAutoGenerateAvatars(settings.autoGenerateAvatars === true);
       setLocalUseAvatarReferences(
@@ -946,7 +1007,7 @@ export function AgentEditor() {
         normalizePositiveInteger(settings.secretPlotRunInterval ?? defaultSettings.secretPlotRunInterval, 8, 100),
       );
       setLocalCustomCapabilities(normalizeCustomAgentCapabilities(settings));
-      setLocalContextSources(normalizeCustomAgentContextSources(settings));
+      setLocalContextSources(getAgentContextSources({ isCustomAgent: !builtIn, settings }));
       setLocalResultType(normalizeCustomResultType(settings.resultType));
       setLocalOutputOptions({
         jsonContextOutput: settings.jsonContextOutput === true,
@@ -969,6 +1030,10 @@ export function AgentEditor() {
       setLocalRunInterval((defaultSettings.runInterval as number) ?? "");
       setLocalEchoMessageDelaySeconds(DEFAULT_ECHO_CHAMBER_MESSAGE_DELAY_SECONDS);
       setLocalActivationKeywordsText("");
+      setLocalActivationQuestion("");
+      storedThresholdRef.current = false;
+      setLocalActivationThreshold(decisionCalibrationRef.current.defaultThreshold);
+      setLocalActivationMaxSkip("");
       setLocalActivationScanDepth(DEFAULT_CUSTOM_AGENT_ACTIVATION_SCAN_DEPTH);
       setLocalInjectAsSection(defaultSettings.injectAsSection === true);
       setLocalEnabledTools(DEFAULT_AGENT_TOOLS[builtIn.id] ?? []);
@@ -976,6 +1041,7 @@ export function AgentEditor() {
       setLocalSourceLorebookIds([]);
       setLocalUseChatActiveLorebooks(defaultSettings.useChatActiveLorebooks === true);
       setLocalTriggerLorebooksForAgentCalls(false);
+      setLocalBatchWithOtherAgents(defaultSettings.batchWithOtherAgents !== false);
       setLocalSourceFileIds([]);
       setLocalAutoGenerateAvatars(false);
       setLocalUseAvatarReferences(defaultSettings.useAvatarReferences === true);
@@ -993,7 +1059,7 @@ export function AgentEditor() {
       setLocalSecretPlotEnabled(defaultSettings.secretPlotEnabled === true);
       setLocalSecretPlotRunInterval(normalizePositiveInteger(defaultSettings.secretPlotRunInterval, 8, 100));
       setLocalCustomCapabilities({});
-      setLocalContextSources({ ...DEFAULT_CUSTOM_AGENT_CONTEXT_SOURCES });
+      setLocalContextSources(getAgentContextSources({ settings: defaultSettings }));
       setLocalResultType("context_injection");
       setLocalOutputOptions({ jsonContextOutput: false, hideOutput: false });
       setLocalIncludePreGenInjections(false);
@@ -1019,6 +1085,7 @@ export function AgentEditor() {
     } else {
       // Brand new custom agent — start empty
       setLocalName("New Agent");
+      setLocalHomeWidgets([]);
       setLocalDescription("");
       setLocalAuthor("");
       setLocalPromptTemplates([]);
@@ -1031,6 +1098,10 @@ export function AgentEditor() {
       setLocalRunInterval(customRunIntervalMeta?.defaultValue ?? "");
       setLocalEchoMessageDelaySeconds(DEFAULT_ECHO_CHAMBER_MESSAGE_DELAY_SECONDS);
       setLocalActivationKeywordsText("");
+      setLocalActivationQuestion("");
+      storedThresholdRef.current = false;
+      setLocalActivationThreshold(decisionCalibrationRef.current.defaultThreshold);
+      setLocalActivationMaxSkip("");
       setLocalActivationScanDepth(DEFAULT_CUSTOM_AGENT_ACTIVATION_SCAN_DEPTH);
       setLocalInjectAsSection(false);
       setLocalEnabledTools([]);
@@ -1038,6 +1109,7 @@ export function AgentEditor() {
       setLocalSourceLorebookIds([]);
       setLocalUseChatActiveLorebooks(false);
       setLocalTriggerLorebooksForAgentCalls(false);
+      setLocalBatchWithOtherAgents(true);
       setLocalSourceFileIds([]);
       setLocalAutoGenerateAvatars(false);
       setLocalUseAvatarReferences(false);
@@ -1127,6 +1199,22 @@ export function AgentEditor() {
   const isContinuityAgent = agentDetailId === "continuity" || dbConfig?.type === "continuity";
   // Immersive HTML agent — shares the rewrite reveal timing control.
   const isHtmlAgent = agentDetailId === "html" || dbConfig?.type === "html";
+  // The fixed rules of the server's shouldRunAgentIndividually: these agents never share a request.
+  // Built-in rewrite agents still join the combined editor request, so their switch always works.
+  const alwaysRunsAlone =
+    musicDjYoutubeMode ||
+    musicDjCustomMode ||
+    isIllustratorAgent ||
+    isLorebookKeeperAgent ||
+    agentDetailId === "beholder" ||
+    dbConfig?.type === "beholder" ||
+    (localContextSources.previousOutput && !isProseGuardianAgent && !isContinuityAgent && !isHtmlAgent) ||
+    ((isCustomAgent || isNewCustomAgent) &&
+      (localResultType === "text_rewrite" ||
+        localOutputOptions.jsonContextOutput ||
+        localTriggerLorebooksForAgentCalls ||
+        localCustomCapabilities.trigger_image_generation === true ||
+        localCustomCapabilities.access_vectors === true));
 
   // Detect when both knowledge agents are configured. Actual activation is
   // chat-scoped, but saving both with overlapping sources can still bloat the
@@ -1218,8 +1306,7 @@ export function AgentEditor() {
 
   const allConnections =
     (connections as
-      | Array<{ id: string; name: string; provider: string; defaultForAgents?: boolean | string }>
-      | undefined) ?? [];
+      Array<{ id: string; name: string; provider: string; defaultForAgents?: boolean | string }> | undefined) ?? [];
 
   /**
    * Whether the engine's utility model slot holds a model for this agent.
@@ -1255,7 +1342,11 @@ export function AgentEditor() {
   }, [utilityAgentType]);
 
   const llmConnections = allConnections.filter(
-    (conn) => conn.provider !== "image_generation" && conn.provider !== "video_generation" && conn.provider !== "audio",
+    (conn) =>
+      conn.provider !== "image_generation" &&
+      conn.provider !== "video_generation" &&
+      conn.provider !== "audio" &&
+      conn.provider !== "decision",
   );
   const imageConnections = allConnections.filter((conn) => conn.provider === "image_generation");
 
@@ -1264,6 +1355,7 @@ export function AgentEditor() {
       c.provider !== "image_generation" &&
       c.provider !== "video_generation" &&
       c.provider !== "audio" &&
+      c.provider !== "decision" &&
       (c.defaultForAgents === true || c.defaultForAgents === "true"),
   );
   // The sidecar can be the agents default without owning a connection row
@@ -1289,6 +1381,10 @@ export function AgentEditor() {
     if (!agentDetailId) return;
     setSaveError(null);
     const isEditingCustomAgent = isCustomAgent || isNewCustomAgent;
+    if (isEditingCustomAgent && !homeAgentWidgetsSchema.safeParse(localHomeWidgets).success) {
+      setSaveError(localizeUi("ui.agents.agenteditor.invalidHomeWidgets"));
+      return;
+    }
     const agentType = dbConfig?.type ?? builtIn?.id ?? agentDetailId;
     const selectedPhase = resolveCustomAgentPhase(localPhase, localResultType, isEditingCustomAgent);
     const savedPhase = normalizeAgentPhaseForType(agentType, selectedPhase);
@@ -1364,7 +1460,9 @@ export function AgentEditor() {
         author: savedAuthor,
         promptTemplates: savedPromptTemplates,
         ...(isEditingCustomAgent ? { customCapabilities } : {}),
-        ...(isEditingCustomAgent ? { contextSources: localContextSources } : {}),
+        ...(isEditingCustomAgent ? { homeWidgets: localHomeWidgets } : {}),
+        contextSources: localContextSources,
+        batchWithOtherAgents: localBatchWithOtherAgents,
         ...(isEditingCustomAgent ? { resultType: localResultType } : {}),
         ...(isEditingCustomAgent ? localOutputOptions : {}),
         ...(isEditingCustomAgent ? { triggerLorebooksForAgentCalls: localTriggerLorebooksForAgentCalls } : {}),
@@ -1372,6 +1470,14 @@ export function AgentEditor() {
           ? {
               activationKeywords,
               activationScanDepth,
+            }
+          : {}),
+        ...(isEditingCustomAgent && localActivationQuestion.trim()
+          ? {
+              activationQuestion: localActivationQuestion.trim(),
+              activationThreshold: localActivationThreshold,
+              activationScanDepth,
+              ...(localActivationMaxSkip !== "" ? { activationMaxSkip: localActivationMaxSkip } : {}),
             }
           : {}),
         ...(mayIncludeTurnData && localIncludePreGenInjections ? { includePreGenInjections: true } : {}),
@@ -1473,8 +1579,10 @@ export function AgentEditor() {
       setDirty(false);
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 1500);
+      return true;
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "Failed to save agent config");
+      return false;
     }
   }, [
     agentDetailId,
@@ -1492,10 +1600,15 @@ export function AgentEditor() {
     localPrompt,
     localAuthor,
     localPromptTemplates,
+    localHomeWidgets,
+    localizeUi,
     localContextSize,
     localMaxTokens,
     localRunInterval,
     localEchoMessageDelaySeconds,
+    localActivationQuestion,
+    localActivationThreshold,
+    localActivationMaxSkip,
     localActivationKeywordsText,
     localActivationScanDepth,
     localInjectAsSection,
@@ -1512,6 +1625,7 @@ export function AgentEditor() {
     localSpotifyClientId,
     localUseChatActiveLorebooks,
     localTriggerLorebooksForAgentCalls,
+    localBatchWithOtherAgents,
     localSourceLorebookIds,
     localSourceFileIds,
     localAutoGenerateAvatars,
@@ -1567,6 +1681,10 @@ export function AgentEditor() {
       toast.error(localizeUi("ui.agents.agenteditor.enableTheMatchingCustomAgentAbilityBeforeExportingThis"));
       return;
     }
+    if (isEditingCustomAgent && !homeAgentWidgetsSchema.safeParse(localHomeWidgets).success) {
+      toast.error(localizeUi("ui.agents.agenteditor.fixHomeWidgetDefinitionsBeforeSaving"));
+      return;
+    }
     const writableLorebookId = localWritableLorebookId.trim();
     const lorebookWriterEnabled =
       isEditingCustomAgent && localLorebookWriteEnabled && customCapabilities.edit_lorebooks === true;
@@ -1590,11 +1708,21 @@ export function AgentEditor() {
       author: savedAuthor,
       promptTemplates: savedPromptTemplates,
       ...(isEditingCustomAgent ? { customCapabilities } : {}),
-      ...(isEditingCustomAgent ? { contextSources: localContextSources } : {}),
+      ...(isEditingCustomAgent ? { homeWidgets: localHomeWidgets } : {}),
+      contextSources: localContextSources,
+      batchWithOtherAgents: localBatchWithOtherAgents,
       ...(isEditingCustomAgent ? { resultType: localResultType } : {}),
       ...(isEditingCustomAgent ? localOutputOptions : {}),
       ...(isEditingCustomAgent ? { triggerLorebooksForAgentCalls: localTriggerLorebooksForAgentCalls } : {}),
       ...(activationKeywords.length > 0 ? { activationKeywords, activationScanDepth } : {}),
+      ...(isEditingCustomAgent && localActivationQuestion.trim()
+        ? {
+            activationQuestion: localActivationQuestion.trim(),
+            activationThreshold: localActivationThreshold,
+            activationScanDepth,
+            ...(localActivationMaxSkip !== "" ? { activationMaxSkip: localActivationMaxSkip } : {}),
+          }
+        : {}),
       ...(mayIncludeTurnData && localIncludePreGenInjections ? { includePreGenInjections: true } : {}),
       ...(mayIncludeTurnData && localIncludeParallelResults ? { includeParallelResults: true } : {}),
       ...(!isStoryboardAgent && localContextSize !== "" ? { contextSize: Number(localContextSize) } : {}),
@@ -1967,6 +2095,7 @@ export function AgentEditor() {
           )}
           <button
             onClick={handleSave}
+            aria-label={localizeUi("ui.noodle.noodlehome.save")}
             disabled={isPending}
             className="mari-editor-action mari-editor-action--primary inline-flex disabled:opacity-50"
           >
@@ -2012,8 +2141,7 @@ export function AgentEditor() {
             </button>
             <button
               onClick={async () => {
-                await handleSave();
-                closeAgentDetail();
+                if (await handleSave()) closeAgentDetail();
               }}
               className="rounded-lg bg-amber-500/20 px-3 py-1 hover:bg-amber-500/30"
             >
@@ -2126,6 +2254,103 @@ export function AgentEditor() {
 
           {(isCustomAgent || isNewCustomAgent) && (
             <FieldGroup
+              label={localizeUi("ui.agents.agenteditor.homeWidgets")}
+              icon={<Layers size="0.875rem" className="text-[var(--primary)]" />}
+              help={localizeUi("ui.agents.agenteditor.homeWidgetsHelp")}
+            >
+              <div className="space-y-3">
+                {localHomeWidgets.map((widget, index) => (
+                  <div key={widget.id} className="space-y-2 rounded-xl border border-[var(--border)] p-3">
+                    <div className="flex gap-2">
+                      <input
+                        className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1"
+                        aria-label={localizeUi("ui.agents.agenteditor.homeWidgetTitle")}
+                        value={widget.title}
+                        maxLength={80}
+                        onChange={(event) => {
+                          setLocalHomeWidgets((widgets) =>
+                            widgets.map((item) =>
+                              item.id === widget.id ? { ...item, title: event.target.value } : item,
+                            ),
+                          );
+                          markDirty();
+                        }}
+                      />
+                      <button
+                        type="button"
+                        aria-label={localizeUi("ui.agents.agenteditor.removeHomeWidget", { title: widget.title })}
+                        onClick={() => {
+                          setLocalHomeWidgets((widgets) => widgets.filter((item) => item.id !== widget.id));
+                          markDirty();
+                        }}
+                      >
+                        <Trash2 size="1rem" />
+                      </button>
+                    </div>
+                    <input
+                      className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1"
+                      aria-label={localizeUi("ui.agents.agenteditor.homeWidgetDescription")}
+                      value={widget.description}
+                      maxLength={240}
+                      onChange={(event) => {
+                        setLocalHomeWidgets((widgets) =>
+                          widgets.map((item) =>
+                            item.id === widget.id ? { ...item, description: event.target.value } : item,
+                          ),
+                        );
+                        markDirty();
+                      }}
+                    />
+                    <label className="flex items-center gap-2 text-xs">
+                      {localizeUi("ui.agents.agenteditor.homeWidgetSize")}
+                      <select
+                        value={widget.size}
+                        onChange={(event) => {
+                          setLocalHomeWidgets((widgets) =>
+                            widgets.map((item) =>
+                              item.id === widget.id
+                                ? { ...item, size: event.target.value as "compact" | "large" }
+                                : item,
+                            ),
+                          );
+                          markDirty();
+                        }}
+                        className="rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1"
+                      >
+                        <option value="compact">{localizeUi("ui.agents.agenteditor.homeWidgetCompact")}</option>
+                        <option value="large">{localizeUi("ui.agents.agenteditor.homeWidgetLarge")}</option>
+                      </select>
+                    </label>
+                    <span className="sr-only">{index + 1}</span>
+                  </div>
+                ))}
+                {localHomeWidgets.length < 3 && (
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs"
+                    onClick={() => {
+                      setLocalHomeWidgets((widgets) => [
+                        ...widgets,
+                        {
+                          id: createCustomAgentType("widget"),
+                          title: localizeUi("ui.agents.agenteditor.newHomeWidget"),
+                          description: "",
+                          size: "compact",
+                        },
+                      ]);
+                      markDirty();
+                    }}
+                  >
+                    <Plus size="0.875rem" className="mr-1 inline" />
+                    {localizeUi("ui.agents.agenteditor.addHomeWidget")}
+                  </button>
+                )}
+              </div>
+            </FieldGroup>
+          )}
+
+          {(isCustomAgent || isNewCustomAgent) && (
+            <FieldGroup
               label={localizeUi("ui.agents.agenteditor.customAgentAbilities")}
               icon={<Sparkles size="0.875rem" className="text-[var(--primary)]" />}
               help={localizeUi("ui.agents.agenteditor.optInPowersForCustomAgentsResultFormatsAnd")}
@@ -2161,33 +2386,31 @@ export function AgentEditor() {
             </FieldGroup>
           )}
 
-          {(isCustomAgent || isNewCustomAgent) && (
-            <FieldGroup
-              label={localizeUi("ui.agents.agenteditor.contextSources")}
-              icon={<Layers size="0.875rem" className="text-[var(--primary)]" />}
-              help={localizeUi("ui.agents.agenteditor.contextSourcesHelp")}
-            >
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {CUSTOM_AGENT_CONTEXT_SOURCE_META.map((source) => {
-                  const allowed =
-                    !source.requiredCapability || localCustomCapabilities[source.requiredCapability] === true;
-                  return (
-                    <EditorSwitchRow
-                      key={source.id}
-                      label={localizeUi(source.label)}
-                      description={localizeUi(source.description)}
-                      checked={allowed && localContextSources[source.id]}
-                      disabled={!allowed}
-                      onChange={(checked) => {
-                        setLocalContextSources((current) => ({ ...current, [source.id]: checked }));
-                        markDirty();
-                      }}
-                    />
-                  );
-                })}
-              </div>
-            </FieldGroup>
-          )}
+          <FieldGroup
+            label={localizeUi("ui.agents.agenteditor.contextSources")}
+            icon={<Layers size="0.875rem" className="text-[var(--primary)]" />}
+            help={localizeUi("ui.agents.agenteditor.contextSourcesHelp")}
+          >
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {CUSTOM_AGENT_CONTEXT_SOURCE_META.map((source) => {
+                const allowed =
+                  !source.requiredCapability || localCustomCapabilities[source.requiredCapability] === true;
+                return (
+                  <EditorSwitchRow
+                    key={source.id}
+                    label={localizeUi(source.label)}
+                    description={localizeUi(source.description)}
+                    checked={allowed && localContextSources[source.id]}
+                    disabled={!allowed}
+                    onChange={(checked) => {
+                      setLocalContextSources((current) => ({ ...current, [source.id]: checked }));
+                      markDirty();
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </FieldGroup>
 
           {(isCustomAgent || isNewCustomAgent) && (
             <FieldGroup
@@ -2459,6 +2682,21 @@ export function AgentEditor() {
                 ? localizeUi("ui.agents.agenteditor.usesTheBuiltInLocalModelFromTheConnections")
                 : localizeUi("ui.agents.agenteditor.whenEmptyUsesTheAgentDefaultConnectionIfOne")}
             </p>
+            {/* ponytail: alwaysRunsAlone copies the server's fixed rules and misses agents that run alone only
+                because of the chat's tools or music source. Upgrade: move the rules into shared for both sides. */}
+            <EditorSwitchRow
+              className="mt-3"
+              label={localizeUi("agents.batching.label")}
+              description={
+                alwaysRunsAlone ? localizeUi("agents.batching.alwaysAlone") : localizeUi("agents.batching.description")
+              }
+              checked={localBatchWithOtherAgents && !alwaysRunsAlone}
+              disabled={alwaysRunsAlone}
+              onChange={(checked) => {
+                setLocalBatchWithOtherAgents(checked);
+                markDirty();
+              }}
+            />
           </FieldGroup>
 
           {/* ── Image Generation Connection ── */}
@@ -2916,6 +3154,22 @@ export function AgentEditor() {
               <p className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
                 {localizeUi("ui.agents.agenteditor.leaveKeywordsEmptyToRunThisCustomAgentOn")}
               </p>
+              <ActivationQuestionFields
+                question={localActivationQuestion}
+                threshold={localActivationThreshold}
+                recommendedThreshold={decisionCalibration.defaultThreshold}
+                maxSkip={localActivationMaxSkip}
+                // A local model slot is a decision model too, and it owns no
+                // connection row, so this asks the server which entry is selected
+                // rather than scanning the connections list for a flag.
+                enabled={hasDecisionModel}
+                onChange={(values) => {
+                  if (values.question !== undefined) setLocalActivationQuestion(values.question);
+                  if (values.threshold !== undefined) setLocalActivationThreshold(values.threshold);
+                  if (values.maxSkip !== undefined) setLocalActivationMaxSkip(values.maxSkip);
+                  markDirty();
+                }}
+              />
             </FieldGroup>
           )}
 

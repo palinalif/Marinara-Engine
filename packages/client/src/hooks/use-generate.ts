@@ -7,7 +7,7 @@ import { normalizeEchoChamberMessages } from "../lib/echo-chamber-queue";
 import { characterDataSchema, normalizeAvatarCrop, type AvatarCrop } from "@marinara-engine/shared";
 import { useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
 import { toast, type ExternalToast } from "sonner";
-import { api, ApiError, isPassiveStreamDisconnect } from "../lib/api-client";
+import { api, ApiError, isPassiveStreamDisconnect, requestTimeoutSignal } from "../lib/api-client";
 import { recordClientRuntimeEvent } from "../lib/client-runtime-diagnostics";
 import {
   formatAgentFailuresToast,
@@ -23,6 +23,7 @@ import { formatGenerationParameterError } from "../lib/generation-parameter-erro
 import { createLeadingTrailingCoalescer } from "../lib/message-page-cache";
 import { reconcilePersistedMessages } from "../lib/message-cache-reconciliation";
 import { sanitizeAppCss } from "../lib/theme-css";
+import { isBuiltInAgentType, isBuiltInTrackerAgentType } from "../lib/tracker-agents";
 import {
   getRoleplayTypewriterRevealCharsPerSecond,
   getStreamingCharsPerSecond,
@@ -39,11 +40,10 @@ import {
   type TTSAutoplayMessage,
   type TTSAutoplayMessageReadyDetail,
 } from "../lib/tts-autoplay";
-import { startSceneWithPromptPreferences } from "../lib/scene-generation";
 import { translate } from "../localization/i18n";
 import { waitForPendingChatMetadataSaves } from "../lib/chat-metadata-save-barrier";
 import { agentKeys } from "./use-agents";
-import { advancedMemoryKeys, ADVANCED_MEMORY_SETTINGS_EVENT } from "./use-advanced-memory";
+import { advancedMemoryKeys, ADVANCED_MEMORY_SETTINGS_EVENT, notifyAdvancedMemoryFailure } from "./use-advanced-memory";
 import type { AdvancedMemoryJob, AdvancedMemoryReceipt, AdvancedMemoryStatus } from "@marinara-engine/shared";
 import { discardPendingGameStatePatch } from "./use-game-state-patcher";
 import { spatialContextKeys } from "./use-spatial-context";
@@ -57,7 +57,6 @@ import type { DelayedCharacterInfo } from "../stores/chat.store";
 import {
   applyQuestUpdatesToPlayerStats,
   applyTrackerFieldLocksToGameStatePatch,
-  BUILT_IN_AGENTS,
   createInlineThinkingStreamFilter,
   EDITABLE_CHARACTER_CARD_FIELDS,
   normalizeThinkingTagPairs,
@@ -88,6 +87,7 @@ type RetryAgentsOptions = {
     negativePrompt?: string;
   };
   illustratorRetryTargets?: IllustratorRetryTarget[];
+  illustratorMessageRange?: [string, string];
   /** Force image generation for the retried custom image agents' results (snapshot button, #4682). */
   forceImageGeneration?: boolean;
 };
@@ -128,9 +128,6 @@ function showAgentFailuresError(failures: AgentFailure[], onRetry?: () => void) 
 }
 
 const shownAgentWarnings = new Set<string>();
-const isBuiltInAgentType = (agentType: string) => BUILT_IN_AGENTS.some((agent) => agent.id === agentType);
-const isBuiltInTrackerAgentType = (agentType: string) =>
-  BUILT_IN_AGENTS.some((agent) => agent.id === agentType && agent.category === "tracker" && !agent.libraryHidden);
 
 type AgentWarningToastData = {
   code?: unknown;
@@ -633,8 +630,6 @@ import { agentResultMatchesVisibleSwipe } from "../lib/agent-result-ownership";
 import { isDiceRollResult } from "../lib/dice-roll-result";
 import { useGameModeStore } from "../stores/game-mode.store";
 import { useGameStateStore } from "../stores/game-state.store";
-import { useTranslationStore } from "../stores/translation.store";
-import { getChatTranslationConfig, translateMessage } from "./use-translate";
 import { useUIStore } from "../stores/ui.store";
 import {
   applyRecentMessageContentEditsToData,
@@ -656,7 +651,6 @@ import {
   resolveGameExperiencePackageId,
 } from "../lib/capability-client-events";
 import { messageHasPendingPostProcessing, parseMessageExtraRecord } from "../lib/chat-message-extra";
-import { stripGmTagsKeepReadables } from "../lib/game-tag-parser";
 import type { APIConnection, Chat, GameMap, Message } from "@marinara-engine/shared";
 
 function sortMessagesByCreatedAt(messages: Message[]): Message[] {
@@ -1051,6 +1045,22 @@ async function waitForServerGenerationToSettle(chatId: string, signal: AbortSign
   return false;
 }
 
+async function waitForServerTranslationToSettle(qc: QueryClient, chatId: string) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < PASSIVE_STREAM_SETTLE_MAX_WAIT_MS) {
+    try {
+      const status = await api.get<{ translating?: boolean }>(`/generate/status/${encodeURIComponent(chatId)}`, {
+        signal: requestTimeoutSignal(15_000),
+      });
+      if (!status.translating) break;
+    } catch {
+      // Keep the independent completion notification pending through a reconnect.
+    }
+    await wait(PASSIVE_STREAM_SETTLE_POLL_MS);
+  }
+  await qc.invalidateQueries({ queryKey: chatKeys.messages(chatId) });
+}
+
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -1228,6 +1238,7 @@ export function useGenerate() {
       attachments?: Array<{ type: string; data: string; filename?: string; name?: string }>;
       mentionedCharacterNames?: string[];
       forCharacterId?: string;
+      smartResponse?: boolean;
       skipPresenceDelay?: boolean;
       narrativeDirectorMode?: "natural" | "random";
       generationGuide?: string;
@@ -1285,7 +1296,10 @@ export function useGenerate() {
       // buffer, etc.) so that a background chat's events don't corrupt the active view.
       const isActiveChat = () => useChatStore.getState().activeChatId === params.chatId;
       const isGameGeneration = getCachedChatMode(qc, params.chatId) === "game";
-      let outputTranslationConfig: ReturnType<typeof getChatTranslationConfig> | null = null;
+      const completionNotifications: Array<() => void> = [];
+      const notifyWhenReady = (notify: () => void) => {
+        completionNotifications.push(notify);
+      };
       const shouldRefreshGameState = shouldRefreshGameStateAfterGeneration(qc, params.chatId);
       let spriteChangeReceived = false;
 
@@ -1448,6 +1462,16 @@ export function useGenerate() {
       const transportStreaming = useUIStore.getState().enableStreaming;
       const streamingEnabled = transportStreaming;
       const chatModeForGeneration = getCachedChatMode(qc, params.chatId);
+      const continuedMessage = params.continueMessageId
+        ? getCachedMessages(qc, params.chatId).find((message) => message.id === params.continueMessageId)
+        : undefined;
+      if (chatModeForGeneration === "roleplay" && continuedMessage) {
+        useChatStore.getState().setContinuationStream(params.chatId, {
+          messageId: continuedMessage.id,
+          content: continuedMessage.content,
+          addNewline: useUIStore.getState().continueAddsNewline,
+        });
+      }
       const smoothRoleplayTypewriter = chatModeForGeneration === "roleplay";
       const shouldDisplayRawStream =
         chatModeForGeneration !== "conversation" || !!params.regenerateMessageId || !!params.continueMessageId;
@@ -1817,12 +1841,6 @@ export function useGenerate() {
         if (flushPatch) await flushPatch();
 
         await waitForPendingChatMetadataSaves(params.chatId);
-        // Capture settled settings before the stream can outlive this chat's mounted view/cache.
-        const translationChat = getCachedChatForGeneration(qc, params.chatId);
-        const translationMeta = parseChatMetadata(translationChat?.metadata);
-        outputTranslationConfig = translationMeta.autoTranslate
-          ? getChatTranslationConfig(params.chatId, translationMeta)
-          : null;
         const currentBackground = getActiveChatBackgroundForGeneration(params.chatId);
 
         for await (const event of api.streamEvents(
@@ -1852,6 +1870,7 @@ export function useGenerate() {
               const data = event.data as { chatId?: string; job?: AdvancedMemoryJob } | undefined;
               if (data?.chatId !== params.chatId || !data.job) break;
               const job = data.job;
+              if (isActiveChat()) notifyAdvancedMemoryFailure(params.chatId, job);
               qc.setQueryData<AdvancedMemoryStatus>(advancedMemoryKeys.status(params.chatId), (current) =>
                 current ? { ...current, job } : current,
               );
@@ -1877,6 +1896,7 @@ export function useGenerate() {
                 current ? { ...current, latestReceipt: data.receipt } : current,
               );
               void qc.invalidateQueries({ queryKey: advancedMemoryKeys.status(params.chatId) });
+              void qc.invalidateQueries({ queryKey: chatKeys.detail(params.chatId) });
               break;
             }
             case "spatial_transition_committed": {
@@ -1910,8 +1930,7 @@ export function useGenerate() {
 
             case "spatial_transition_rejected": {
               const transitionData = event.data as
-                | { chatId?: string; commandId?: string; code?: string; message?: string }
-                | undefined;
+                { chatId?: string; commandId?: string; code?: string; message?: string } | undefined;
               if (transitionData?.chatId === params.chatId && transitionData.commandId) {
                 spatialCapabilityRefreshDispatched = true;
                 const pending = useChatStore.getState().pendingSpatialTransitions.get(params.chatId);
@@ -1976,6 +1995,22 @@ export function useGenerate() {
               useAgentStore
                 .getState()
                 .updateTaskProgress(params.chatId, agentProcessingRunId, event.data as AgentTaskProgress);
+              break;
+            }
+
+            case "lorebook_image_notice": {
+              const code = (event.data as { code?: string } | null)?.code;
+              if (isActiveChat() && (code === "unsupported" || code === "unavailable" || code === "limited")) {
+                toast.warning(
+                  translate(
+                    code === "unsupported"
+                      ? "ui.lorebooks.expandeddrawer.imagesUnsupportedModelNotice"
+                      : code === "limited"
+                        ? "ui.lorebooks.expandeddrawer.imagesLimitNotice"
+                        : "ui.lorebooks.expandeddrawer.imagesUnavailableNotice",
+                  ),
+                );
+              }
               break;
             }
 
@@ -2359,9 +2394,11 @@ export function useGenerate() {
                   const soundOn = isRpMode
                     ? useUIStore.getState().rpNotificationSound
                     : useUIStore.getState().convoNotificationSound;
-                  playConfiguredNotificationPing(
-                    soundOn && !messageHasPendingPostProcessing(previousGroupMessage),
-                    useUIStore.getState().notificationSoundsOnlyWhenUnfocused,
+                  notifyWhenReady(() =>
+                    playConfiguredNotificationPing(
+                      soundOn && !messageHasPendingPostProcessing(previousGroupMessage),
+                      useUIStore.getState().notificationSoundsOnlyWhenUnfocused,
+                    ),
                   );
                 }
                 // Reset the stream buffer for the new character
@@ -2487,6 +2524,11 @@ export function useGenerate() {
                 agentType?: string;
               };
               if (rw.editedText) {
+                // Post-processing rewrites the complete stored message, including its original text.
+                const continuation = useChatStore.getState().continuationStreams.get(params.chatId);
+                if (continuation) {
+                  useChatStore.getState().setContinuationStream(params.chatId, { ...continuation, content: "" });
+                }
                 const rewrittenText = normalizeLineBreakSpacing(rw.editedText);
                 const builtInRewriteApplied =
                   rw.rewriteApplied === true &&
@@ -2640,7 +2682,7 @@ export function useGenerate() {
                 const generatedText = normalizeLineBreakSpacing(fullBuffer + pendingText);
                 const heldMessage = {
                   ...savedMessage,
-                  content: generatedText || savedMessage.content,
+                  content: params.continueMessageId ? savedMessage.content : generatedText || savedMessage.content,
                   extra: heldExtra as unknown as Message["extra"],
                 };
                 holdingTextRewrite = true;
@@ -2925,36 +2967,6 @@ export function useGenerate() {
                   .getState()
                   .setChatBackground(`/api/backgrounds/file/${encodeURIComponent(sceneData.background)}`);
               }
-              break;
-            }
-
-            case "scene_requested": {
-              const sceneData = event.data as {
-                originChatId?: string;
-                prompt?: string;
-                background?: string | null;
-                plan?: string | null;
-                initiatorCharId?: string | null;
-                initiatorCharName?: string | null;
-              };
-              const sceneOriginChatId = sceneData.originChatId || params.chatId;
-              if (!isChatSurfaceVisible(sceneOriginChatId)) {
-                break;
-              }
-              void startSceneWithPromptPreferences({
-                chatId: sceneOriginChatId,
-                prompt: sceneData.prompt ?? "",
-                background: sceneData.background ?? null,
-                planHint: sceneData.plan ?? null,
-                initiatorCharId: sceneData.initiatorCharId ?? null,
-                initiatorCharName: sceneData.initiatorCharName ?? "Character",
-                connectionId: params.connectionId,
-                onCreated: () => {
-                  qc.invalidateQueries({ queryKey: chatKeys.all });
-                },
-              }).catch((error) => {
-                console.warn("[scene] Failed to handle requested scene:", error);
-              });
               break;
             }
 
@@ -3337,7 +3349,9 @@ export function useGenerate() {
         }
         if (isGameGeneration && sawDoneEvent && receivedContent) {
           const uiState = useUIStore.getState();
-          playConfiguredNotificationPing(uiState.gameNotificationSound, uiState.notificationSoundsOnlyWhenUnfocused);
+          notifyWhenReady(() =>
+            playConfiguredNotificationPing(uiState.gameNotificationSound, uiState.notificationSoundsOnlyWhenUnfocused),
+          );
           gameTurnLoadedSoundPlayed = true;
         }
         // Re-sort sidebar so this chat floats to the top
@@ -3389,7 +3403,9 @@ export function useGenerate() {
             : isRp
               ? uiState.rpNotificationSound
               : uiState.convoNotificationSound;
-          playConfiguredNotificationPing(soundEnabled, uiState.notificationSoundsOnlyWhenUnfocused);
+          notifyWhenReady(() =>
+            playConfiguredNotificationPing(soundEnabled, uiState.notificationSoundsOnlyWhenUnfocused),
+          );
         }
         const partialContent = normalizeLineBreakSpacing(fullBuffer + pendingText).trim();
         let unpersistedPartialMessage: Message | null = null;
@@ -3510,17 +3526,19 @@ export function useGenerate() {
               title: replyNotificationTitle(chat?.mode ?? chatModeForGeneration, characterName),
               tag: `marinara-chat-${params.chatId}`,
             };
-            void showLocalMessageNotification({
-              ...notification,
-              enabled: params.autonomous
-                ? uiState.conversationBrowserNotifications
-                : uiState.generationBrowserNotifications,
-            });
-            showNativeMessageNotification({
-              ...notification,
-              enabled: params.autonomous
-                ? uiState.conversationMobileNotifications
-                : uiState.generationMobileNotifications,
+            notifyWhenReady(() => {
+              void showLocalMessageNotification({
+                ...notification,
+                enabled: params.autonomous
+                  ? uiState.conversationBrowserNotifications
+                  : uiState.generationBrowserNotifications,
+              });
+              showNativeMessageNotification({
+                ...notification,
+                enabled: params.autonomous
+                  ? uiState.conversationMobileNotifications
+                  : uiState.generationMobileNotifications,
+              });
             });
           }
         }
@@ -3532,32 +3550,25 @@ export function useGenerate() {
           console.warn("[use-generate] dispatching generation-complete for chat:", params.chatId);
         }
         window.dispatchEvent(new CustomEvent("marinara:generation-complete", { detail: { chatId: params.chatId } }));
+        // Discover work started after this reply without polling a ready archive while idle.
+        if (qc.getQueryData<AdvancedMemoryStatus>(advancedMemoryKeys.status(params.chatId))?.settings.enabled) {
+          void qc.invalidateQueries({ queryKey: advancedMemoryKeys.status(params.chatId) });
+        }
 
-        // Auto-translate newly generated assistant messages if enabled
-        if (receivedContent) {
-          try {
-            if (outputTranslationConfig) {
-              const store = useTranslationStore.getState();
-              for (const [id, msg] of persistedMessages) {
-                const textToTranslate = isGameGeneration
-                  ? stripGmTagsKeepReadables(msg.content ?? "").trim()
-                  : (msg.content ?? "");
-                if (
-                  msg.role === "assistant" &&
-                  textToTranslate &&
-                  !store.translations[id] &&
-                  !store.hiddenTranslationIds[id]
-                ) {
-                  void translateMessage(qc, id, textToTranslate, outputTranslationConfig, params.chatId).catch(
-                    () => {},
-                  );
-                }
+        // Translation runs independently on the server. Wait for persistence
+        // before notifying, without retaining the browser's generation lock.
+        const translation = waitForServerTranslationToSettle(qc, params.chatId);
+        void translation
+          .finally(() => {
+            for (const notify of completionNotifications) {
+              try {
+                notify();
+              } catch (error) {
+                console.warn("[Generation] Completion notification failed:", error);
               }
             }
-          } catch {
-            /* non-critical — don't block generation cleanup */
-          }
-        }
+          })
+          .catch(() => {});
       }
       if (receivedContent || passiveStreamRecovered || spatialTransitionCommitted) return true;
       return await confirmDurableSubmittedUserTurn();
@@ -3659,6 +3670,7 @@ export function useGenerate() {
               ? { illustratorPromptReviewOverride: options.illustratorPromptReviewOverride }
               : {}),
             ...(options?.illustratorRetryTargets ? { illustratorRetryTargets: options.illustratorRetryTargets } : {}),
+            ...(options?.illustratorMessageRange ? { illustratorMessageRange: options.illustratorMessageRange } : {}),
             ...(options?.forceImageGeneration ? { forceImageGeneration: true } : {}),
             musicPlayerEnabled: useUIStore.getState().musicPlayerEnabled,
             musicPlayerSource: useUIStore.getState().musicPlayerSource,
@@ -3957,7 +3969,10 @@ export function useGenerate() {
               imagePromptReviewRequested = true;
               window.dispatchEvent(
                 new CustomEvent("marinara:image-prompt-review", {
-                  detail: event.data,
+                  detail: {
+                    ...(event.data as Record<string, unknown>),
+                    illustratorMessageRange: options?.illustratorMessageRange,
+                  },
                 }),
               );
               break;

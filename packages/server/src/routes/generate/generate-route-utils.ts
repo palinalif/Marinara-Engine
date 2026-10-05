@@ -8,6 +8,7 @@ import {
   customTrackerFieldLockPrefix,
   generationParametersSchema,
   normalizeInventoryTrackerRows,
+  normalizeGroupChatMode,
   normalizeTrackerFieldLocksForState,
   extractCharacterCardCastMembers,
   normalizeTextForMatch,
@@ -15,6 +16,7 @@ import {
   normalizeSummaryTailMessages,
   normalizeWorldCustomFields,
   isTrackerRowsUpdate,
+  isNamedTrackerRow,
   normalizeThinkingTagPairs,
   parseTrackerFieldLocks,
   parseTrackerHiddenFields,
@@ -35,6 +37,7 @@ import {
   type WrapFormat,
 } from "@marinara-engine/shared";
 import { wrapContent } from "../../services/prompt/format-engine.js";
+import { parseStoredRulesetLive } from "../../services/storage/game-state.storage.js";
 import {
   appendReadableAttachmentsToContent,
   extractFileAttachmentInputs,
@@ -231,8 +234,12 @@ export function buildLockedPlayerStatsArrayPatch<T>({
   basePlayerStats?: PlayerStats;
 }) {
   const existingPlayerStats = parseSnapshotPlayerStats(snapshot);
-  const lockedPatch = applyTrackerFieldLocksToGameStatePatch({ playerStats: { [field]: values } }, lockState);
-  const lockedValues = extractPlayerStatsPatchArray<T>(lockedPatch, field, values);
+  // Keep row positions until locks are merged, then discard nameless Custom Tracker rows.
+  const rawValues =
+    field === "customTrackerFields" ? values.map((row) => (isNamedTrackerRow(row) ? row : ({} as T))) : values;
+  const lockedPatch = applyTrackerFieldLocksToGameStatePatch({ playerStats: { [field]: rawValues } }, lockState);
+  const mergedValues = extractPlayerStatsPatchArray<T>(lockedPatch, field, rawValues);
+  const lockedValues = field === "customTrackerFields" ? mergedValues.filter(isNamedTrackerRow) : mergedValues;
   const playerStats = { ...(basePlayerStats ?? existingPlayerStats), [field]: lockedValues };
   const existingValues = existingPlayerStats[field];
   const changed = !isDeepStrictEqual(lockedValues, Array.isArray(existingValues) ? existingValues : []);
@@ -918,30 +925,53 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function readCharacterName(data: unknown): string | null {
+export interface CharacterIdentity {
+  name: string;
+  nameAliases: string[];
+}
+
+function readCharacterIdentity(data: unknown): CharacterIdentity | null {
   try {
     const parsed = typeof data === "string" ? JSON.parse(data) : data;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const name = (parsed as { name?: unknown }).name;
-    return typeof name === "string" && name.trim() ? name.trim() : null;
+    if (typeof name !== "string" || !name.trim()) return null;
+    const aliases = (parsed as { extensions?: { nameAliases?: unknown } | null }).extensions?.nameAliases;
+    return {
+      name: name.trim(),
+      nameAliases: Array.isArray(aliases)
+        ? aliases
+            .filter((alias): alias is string => typeof alias === "string" && !!alias.trim())
+            .map((alias) => alias.trim())
+        : [],
+    };
   } catch {
     return null;
   }
+}
+
+/** Supply the chat's full character list to include disabled members without reading unrelated cards. */
+export async function resolveCharacterIdentityMap(
+  characterIds: string[],
+  getCharacterById: (id: string) => Promise<{ data?: unknown } | null | undefined>,
+): Promise<Map<string, CharacterIdentity>> {
+  const entries = await Promise.all(
+    characterIds.map(async (id) => {
+      const row = await getCharacterById(id);
+      const identity = readCharacterIdentity(row?.data);
+      return identity ? ([id, identity] as const) : null;
+    }),
+  );
+
+  return new Map(entries.filter((entry): entry is readonly [string, CharacterIdentity] => !!entry));
 }
 
 export async function resolveCharacterNameMap(
   characterIds: string[],
   getCharacterById: (id: string) => Promise<{ data?: unknown } | null | undefined>,
 ): Promise<Map<string, string>> {
-  const entries = await Promise.all(
-    characterIds.map(async (id) => {
-      const row = await getCharacterById(id);
-      const name = readCharacterName(row?.data);
-      return name ? ([id, name] as const) : null;
-    }),
-  );
-
-  return new Map(entries.filter((entry): entry is readonly [string, string] => !!entry));
+  const identities = await resolveCharacterIdentityMap(characterIds, getCharacterById);
+  return new Map([...identities].map(([id, identity]) => [id, identity.name]));
 }
 
 function prefixSpeakerName(content: string, speakerName: string): string {
@@ -960,25 +990,39 @@ export function readPersonaSnapshotName(extra: unknown): string | null {
   return typeof name === "string" && name.trim() ? name.trim() : null;
 }
 
+interface GroupHistorySpeakerOptions {
+  personaName: string;
+  characterNamesById: ReadonlyMap<string, string>;
+  /** Individual group roles are relative to the recipient; characterId still identifies the speaker. */
+  recipientScoped?: boolean;
+}
+
+export function resolveGroupIndividualHistorySpeaker(
+  message: Omit<SpeakerPrefixMessage, "content">,
+  options: GroupHistorySpeakerOptions,
+): string | null {
+  if (options.recipientScoped && message.characterId) {
+    return (
+      options.characterNamesById.get(message.characterId) ??
+      (typeof message.name === "string" && message.name.trim() ? message.name.trim() : null)
+    );
+  }
+  if (message.role === "user") return message.personaSnapshotName?.trim() || options.personaName.trim() || "User";
+  if (message.role === "assistant") {
+    return (
+      (message.characterId ? (options.characterNamesById.get(message.characterId) ?? null) : null) ??
+      (typeof message.name === "string" && message.name.trim() ? message.name.trim() : null)
+    );
+  }
+  return null;
+}
+
 export function prefixGroupIndividualHistorySpeakers<T extends SpeakerPrefixMessage>(
   messages: T[],
-  options: {
-    personaName: string;
-    characterNamesById: ReadonlyMap<string, string>;
-  },
+  options: GroupHistorySpeakerOptions,
 ): T[] {
-  const personaName = options.personaName.trim() || "User";
-
   return messages.map((message) => {
-    let speakerName: string | null = null;
-    if (message.role === "user") {
-      speakerName = message.personaSnapshotName?.trim() || personaName;
-    } else if (message.role === "assistant") {
-      speakerName =
-        (message.characterId ? (options.characterNamesById.get(message.characterId) ?? null) : null) ??
-        (typeof message.name === "string" && message.name.trim() ? message.name.trim() : null);
-    }
-
+    const speakerName = resolveGroupIndividualHistorySpeaker(message, options);
     if (!speakerName) return message;
     const content = prefixSpeakerName(message.content, speakerName);
     return content === message.content ? message : { ...message, content };
@@ -1190,7 +1234,7 @@ export function resolveGroupGenerationMode(
   _chatMode: string | null | undefined,
   configuredMode: unknown,
 ): GroupGenerationMode {
-  return configuredMode === "individual" ? "individual" : "merged";
+  return normalizeGroupChatMode(configuredMode);
 }
 
 export function shouldRestoreRegenerationCharacterTarget(
@@ -1946,6 +1990,7 @@ export function parseGameStateRow(row: Record<string, unknown>): GameState {
     manualOverrides,
     fieldLocks,
     hiddenTrackerFields,
+    rulesetLive: parseStoredRulesetLive(row.rulesetLive),
     createdAt: row.createdAt as string,
   };
 }

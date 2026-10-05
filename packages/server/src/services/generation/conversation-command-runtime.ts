@@ -1,3 +1,4 @@
+import { currentRoomGeneration, roomConversationCommandAllowed } from "../multiplayer/generation-policy.js";
 import {
   BUILT_IN_AGENTS,
   CONVERSATION_COMMAND_AGENT_IDS,
@@ -48,7 +49,7 @@ export function readConversationCommandToggles(
 }
 
 export function isConversationCommandEnabled(metadata: Record<string, unknown>, key: ConversationCommandKey): boolean {
-  return readConversationCommandToggles(metadata)[key] !== false;
+  return roomConversationCommandAllowed(key) && readConversationCommandToggles(metadata)[key] !== false;
 }
 
 function getConversationCommandKey(command: CharacterCommand): ConversationCommandKey | null {
@@ -103,6 +104,7 @@ export function filterEnabledConversationCommands(
   metadata: Record<string, unknown>,
 ): CharacterCommand[] {
   return commands.filter((command) => {
+    if (!roomConversationCommandAllowed(command.type)) return false;
     const key = getConversationCommandKey(command);
     return key === null || (isConversationCommandAvailable(key) && isConversationCommandEnabled(metadata, key));
   });
@@ -167,7 +169,7 @@ export async function buildConversationCommandsReminder(args: {
         : "spotify";
 
   // Discover other chats this character is in (for cross_post targets + memory targets)
-  const allChatsForCrossPost = await args.chats.list();
+  const allChatsForCrossPost = currentRoomGeneration() ? [] : await args.chats.list();
   const crossPostTargets: string[] = [];
   const memoryTargetCharIds = new Set<string>();
   for (const c of allChatsForCrossPost) {
@@ -276,8 +278,7 @@ export async function buildConversationCommandsReminder(args: {
       `   - {{user}} says "I'm coming over" or "Let's go to the park" → trigger a scene for arriving/being at that location.`,
       `   - You invite {{user}} somewhere and they accept → trigger a scene for that activity.`,
       `   - A plan is made (date, trip, hangout, confrontation) and the moment arrives → trigger a scene.`,
-      `   Do NOT wait for {{user}} to explicitly ask for a scene. If the conversation implies you and {{user}} are about to DO something together, initiate the scene yourself.`,
-      `   EXCEPTION: Do NOT start a scene for playing UNO, chess, poker, 8-ball pool, tic-tac-toe, rock-paper-scissors, cards, or other board/table games — those have their own commands. Use [uno] for UNO, [chess] for chess, [poker] for poker, [eightball] for 8-ball pool, [tic_tac_toe] for tic-tac-toe, and [rock_paper_scissors] for rock-paper-scissors, not [scene].`,
+      `   - Do NOT wait for {{user}} to explicitly ask for a scene. If the conversation implies you and {{user}} are about to DO something together, initiate the scene yourself.`,
     );
   }
 

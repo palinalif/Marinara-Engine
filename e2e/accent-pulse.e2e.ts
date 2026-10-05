@@ -1,3 +1,4 @@
+import { clickTopbarPanel } from "./topbar-navigation.js";
 import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { seedUIState } from "./ui-state-fixture.js";
@@ -7,7 +8,7 @@ import { UI_PERSISTENCE } from "../packages/client/src/lib/ui-persistence.js";
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 async function openAppearance(page: Page) {
-  await page.locator('[data-tour="panel-settings"]').click();
+  await clickTopbarPanel(page, "settings");
   await page.getByRole("tab", { name: "Appearance", exact: true }).click();
 }
 
@@ -257,7 +258,7 @@ for (const color of ["#a78bfa", "linear-gradient(90deg, #a78bfa, #ec4899, #22d3e
       // Keep another browser project's synced Appearance choices out of this fixture.
       await page.route("**/api/app-settings/ui", (route) => route.fulfill({ json: { value: null } }));
       await page.goto("/");
-      await page.locator('[data-tour="panel-settings"]').tap();
+      await clickTopbarPanel(page, "settings", "tap");
       await page.getByRole("tab", { name: "Appearance", exact: true }).tap();
       await expect(page.getByLabel("Accent Pulse", { exact: true })).toBeChecked();
       const root = page.locator("html");
@@ -292,7 +293,7 @@ for (const color of ["#a78bfa", "linear-gradient(90deg, #a78bfa, #ec4899, #22d3e
       await testInfo.attach("idle-appearance.png", { body: await page.screenshot(), contentType: "image/png" });
 
       // Returning to Home restores its visible ambient effects.
-      await page.locator('[data-tour="panel-settings"]').tap();
+      await clickTopbarPanel(page, "settings", "tap");
       await expect.poll(async () => (await runningHomeAnimations(page)).length).toBeGreaterThan(0);
       await page.emulateMedia({ reducedMotion: "reduce" });
       await expect(root).not.toHaveAttribute("data-marinara-accent-animation");
@@ -320,7 +321,8 @@ for (const theme of ["dark", "light"] as const) {
     }, version);
     await page.goto("/");
     const home = page.locator('[data-component="HomeBrowserHub"]');
-    await expect(home).toBeVisible();
+    // Wait for the cold Home chunk before checking the rendered shell surfaces.
+    await expect(home).toBeVisible({ timeout: 30_000 });
     await expect.poll(async () => (await readAccentPreferences(page)).ready).toBe(true);
     await page.screenshot({ path: info.outputPath(`home-borders-${theme}.png`), animations: "disabled" });
     const renderedColor = (expression: string) =>
@@ -352,8 +354,21 @@ for (const theme of ["dark", "light"] as const) {
         await expect(bookmark).toHaveCSS("color", await renderedColor(color));
         await bookmark.tap();
       }
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await page.getByRole("tab", { name: "Appearance", exact: true }).click();
+      await expect(page.locator(".mari-right-panel:visible")).toHaveCSS(
+        "background-color",
+        await renderedColor("var(--sidebar)"),
+      );
+      await expect(page.locator(".mari-right-panel-header:visible")).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+      await expect(page.locator("#settings-section-app-style")).toHaveCSS(
+        "background-color",
+        await renderedColor("color-mix(in oklab, var(--sidebar) 35%, transparent)"),
+      );
+      await expect(page.locator("#settings-control-theme-mode select")).toHaveCSS(
+        "background-color",
+        await renderedColor("var(--sidebar)"),
+      );
       const settingsHeader = page.locator(".mari-right-panel-header:visible > div.absolute");
       await expect(settingsHeader).toHaveCSS(
         "background-color",
@@ -387,7 +402,97 @@ for (const theme of ["dark", "light"] as const) {
         path: info.outputPath(`settings-borders-${theme}-${color.slice(1)}.png`),
         animations: "disabled",
       });
-      await page.locator('[data-tour="panel-settings"]').click();
+      if (!info.project.name.includes("mobile")) {
+        const pointerSetting = page.locator("#settings-control-custom-cursor");
+        await pointerSetting.hover();
+        await expect(pointerSetting).toHaveCSS(
+          "background-color",
+          await renderedColor("color-mix(in oklab, var(--marinara-chat-chrome-highlight-bg) 50%, transparent)"),
+        );
+        await page.mouse.move(0, 0);
+      }
+      await clickTopbarPanel(page, "settings");
     }
+  });
+}
+
+for (const theme of ["dark", "light"] as const) {
+  test(`legacy package frames inherit the host accent without replacing app branding (${theme})`, async ({ page }) => {
+    await page.route("**/api/app-settings/ui", (route) => route.fulfill({ json: { value: null } }));
+    await seedUIState(page, {
+      hasCompletedOnboarding: true,
+      sidebarOpen: false,
+      rightPanelOpen: false,
+      appAccentColor: "#20b080",
+      appAccentPulseMode: false,
+      appAccentRgbMode: false,
+      theme,
+    });
+    await page.goto("/");
+    await expect.poll(async () => (await readAccentPreferences(page)).ready).toBe(true);
+    await page.evaluate(() => {
+      const fixture = document.createElement("div");
+      fixture.id = "legacy-package-accent-proof";
+      // Old published bundles append this scoped copy of Engine defaults after the host stylesheet.
+      fixture.innerHTML = ["noodle", "slurp", "slurp2"]
+        .map(
+          (id) => `
+          <style>@scope (marinara-capability-${id}, [data-marinara-capability-scope="${id}"]) {
+            :scope {
+              --primary: #ec4b97;
+              --marinara-app-accent-solid: var(--primary);
+              --marinara-chat-chrome-accent: var(--marinara-app-accent-solid);
+              --marinara-chat-chrome-panel-border: color-mix(in srgb, var(--marinara-chat-chrome-accent) 16%, transparent);
+            }
+          }</style>
+          <marinara-capability-${id} class="legacy-accent-frame" style="border:1px solid var(--marinara-chat-chrome-panel-border)"></marinara-capability-${id}>
+          <div data-marinara-capability-scope="${id}" class="legacy-accent-frame" style="border:1px solid var(--marinara-chat-chrome-panel-border)">
+            <span class="legacy-brand" style="--noodle-accent:${id === "noodle" ? "#7ea7ff" : "#ff7ec1"};color:var(--noodle-accent)"></span>
+          </div>`,
+        )
+        .join("");
+      document.body.append(fixture);
+    });
+    for (const accent of ["#20b080", "#8060ff"]) {
+      await page.evaluate(async (color) => {
+        const { useUIStore } = await import("/src/stores/ui.store.ts" as string);
+        useUIStore.getState().setAppAccentColor(color);
+      }, accent);
+      const border = await page.evaluate((color) => {
+        const reference = document.createElement("span");
+        reference.style.border = `1px solid color-mix(in srgb, ${color} 16%, transparent)`;
+        document.body.append(reference);
+        const rendered = getComputedStyle(reference).borderTopColor;
+        reference.remove();
+        return rendered;
+      }, accent);
+      await expect
+        .poll(() =>
+          page.locator("#legacy-package-accent-proof .legacy-accent-frame").evaluateAll((frames) =>
+            frames.map((frame) => ({
+              accent: getComputedStyle(frame).getPropertyValue("--marinara-chat-chrome-accent").trim(),
+              border: getComputedStyle(frame).borderTopColor,
+            })),
+          ),
+        )
+        .toEqual(
+          Array.from({ length: 6 }, () => ({
+            accent,
+            border,
+          })),
+        );
+    }
+    await expect(page.locator(".legacy-brand").nth(0)).toHaveCSS("color", "rgb(126, 167, 255)");
+    await expect(page.locator(".legacy-brand").nth(1)).toHaveCSS("color", "rgb(255, 126, 193)");
+    await expect(page.locator(".legacy-brand").nth(2)).toHaveCSS("color", "rgb(255, 126, 193)");
+    const explicitTheme = page.locator('#legacy-package-accent-proof [data-marinara-capability-scope="slurp2"]');
+    await explicitTheme.evaluate((element) => {
+      (element as HTMLElement).style.setProperty("--marinara-chat-chrome-accent", "#ff7ec1");
+    });
+    expect(
+      await explicitTheme.evaluate((element) =>
+        getComputedStyle(element).getPropertyValue("--marinara-chat-chrome-accent").trim(),
+      ),
+    ).toBe("#ff7ec1");
   });
 }

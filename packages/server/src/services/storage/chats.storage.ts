@@ -1,3 +1,4 @@
+import { currentRoomGeneration, resolveRoomGenerationPolicy } from "../multiplayer/generation-policy.js";
 // ──────────────────────────────────────────────
 // Storage: Chats
 // ──────────────────────────────────────────────
@@ -40,6 +41,7 @@ import {
   lorebookEntries,
 } from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
+import { parseSourceMessageRefs } from "./lorebook-provenance.js";
 import { existsSync, rmSync } from "fs";
 import { join } from "path";
 import { DATA_DIR } from "../../utils/data-dir.js";
@@ -47,11 +49,14 @@ import {
   getRoleplayCommandActivity,
   TRANSLATOR_DEFAULTS_SETTINGS_KEY,
   normalizeTranslatorSettings,
+  getChatWindowDefaultSettingsKey,
+  parseChatWindowDefault,
   type CreateChatInput,
   type CreateMessageInput,
   type RoleplayCommandActivity,
 } from "@marinara-engine/shared";
 import { prepareRoleplayInterruption } from "../generation/roleplay-interrupt.js";
+import { prepareUserRoleplayCommands } from "../generation/roleplay-commands.js";
 import {
   ensureTimestampAfter,
   latestTrustedTimestamp,
@@ -60,8 +65,17 @@ import {
 } from "../import/import-timestamps.js";
 import { type CharacterSchedules, type WeekSchedule } from "../conversation/schedule.service.js";
 import type { ConversationStatusOverride } from "@marinara-engine/shared";
+import { MESSAGE_MARK_EXTRA_KEYS, redoChatVariableChanges, undoChatVariableChanges } from "@marinara-engine/shared";
 import { resolveConversationTimeZone } from "../conversation/timezone.js";
+import { parseConversationStatusOverrides } from "../generation/conversation-context-utils.js";
 import { logger } from "../../lib/logger.js";
+import { logRateLimited } from "../../lib/log-rate-limit.js";
+import { isLorebookScanCompactionEnabled } from "../../config/runtime-config.js";
+import {
+  compactLorebookScanInExtra,
+  lorebookScanHasContent,
+  serializedExtraMayHoldFullLorebookScan,
+} from "../lorebook/lorebook-scan-compaction.js";
 import { galleryFileHasReferences, unlinkGalleryFileIfUnreferenced } from "../image/gallery-file-lifecycle.js";
 
 import { createAppSettingsStorage } from "./app-settings.storage.js";
@@ -74,6 +88,13 @@ export const CONVERSATION_NOTES_BUDGET_CHARS = 4000;
 
 export type MetadataPatch = Record<string, unknown>;
 export type MetadataUpdater = (current: MetadataPatch) => MetadataPatch | Promise<MetadataPatch>;
+type RoomMetadataKey = "multiplayerCharacterMemories" | "multiplayerGameAppliedMessages" | "multiplayerGameTurn";
+
+function protectRoomMetadata(patch: MetadataPatch, allowed: readonly RoomMetadataKey[] = []): void {
+  for (const key of Object.keys(patch)) {
+    if (key.startsWith("multiplayer") && !allowed.includes(key as RoomMetadataKey)) delete patch[key];
+  }
+}
 export type ChatDeleteGuardResult = { allowed: true } | { allowed: false; reason: string };
 
 function lorebookEntryStateRemovalPatch(metadata: MetadataPatch, entryIds: ReadonlySet<string>): MetadataPatch {
@@ -94,6 +115,40 @@ function lorebookEntryStateRemovalPatch(metadata: MetadataPatch, entryIds: Reado
 
 const metadataPatchQueues = new Map<string, Promise<void>>();
 const messageExtraPatchQueues = new Map<string, Promise<void>>();
+
+/**
+ * Opt-in stored lorebook scan compaction (LOREBOOK_COMPACT_STORED_SCANS, see lorebook-scan-compaction.ts), per chat:
+ * `keep` is the newest message whose scans keep their entry text, `pending` the messages still to compact and
+ * `swept` whether this process has already checked the rest of the chat once.
+ */
+type LorebookScanCompactionState = {
+  keep: string | null;
+  /** Message order (createdAt, then id) of `keep`, so an older message saved later cannot take its place. */
+  keepOrder: { createdAt: string; id: string } | null;
+  pending: Set<string>;
+  swept: boolean;
+  running: Promise<void> | null;
+};
+const lorebookScanCompactionStates = new WeakMap<object, Map<string, LorebookScanCompactionState>>();
+const runningLorebookScanCompactions = new Set<Promise<void>>();
+
+/** True when `a` sorts at or after `b` in the store's message order (createdAt, ties by id). */
+function isAtOrAfterInMessageOrder(a: { createdAt: string; id: string }, b: { createdAt: string; id: string }) {
+  return a.createdAt > b.createdAt || (a.createdAt === b.createdAt && a.id >= b.id);
+}
+
+/** Assistant and narrator messages are the ones whose scan Active Context and agent retries read. */
+function isGeneratedMessageRole(role: unknown): boolean {
+  return role === "assistant" || role === "narrator";
+}
+
+/**
+ * Resolves once every scheduled background lorebook scan compaction has finished. Used by tests; shutdown does not
+ * wait for it (each row update is atomic, and a compaction cut short is redone by the next save in that chat).
+ */
+export async function settleLorebookScanCompactions(): Promise<void> {
+  while (runningLorebookScanCompactions.size > 0) await Promise.allSettled([...runningLorebookScanCompactions]);
+}
 
 /**
  * LOCK ORDER (#5599/#5600): the message patch queue is always acquired
@@ -165,6 +220,14 @@ export async function withChatMetadataPatchQueue<T>(chatId: string, operation: (
 
 export async function withMessageExtraPatchQueue<T>(messageId: string, operation: () => Promise<T>): Promise<T> {
   return withPatchQueue(messageExtraPatchQueues, messageId, operation);
+}
+
+/** One swipe selection per chat at a time: which telling is shown and the inventory that follows it
+ *  are read and changed together. Taken before every other lock (setActiveSwipe's own queue, then the
+ *  metadata queue) and by nothing else, so it cannot close a cycle. */
+const swipeSelectionQueues = new Map<string, Promise<void>>();
+export async function withChatSwipeSelectionQueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {
+  return withPatchQueue(swipeSelectionQueues, chatId, operation);
 }
 
 function parseMetadata(raw: unknown): MetadataPatch {
@@ -424,15 +487,9 @@ function hasConversationSchedules(value: unknown): value is CharacterSchedules {
   return !!value && typeof value === "object" && Object.keys(value as Record<string, unknown>).length > 0;
 }
 
-/**
- * A chat opts into schedules explicitly, or implicitly by already having a
- * cached schedule from an earlier opt-in. An unset flag on a chat that has never
- * used schedules means off, so a character gaining a schedule does not silently
- * switch it on in every old chat.
- */
+/** Reuse character-owned routines unless this chat explicitly disables them. */
 function areConversationSchedulesEnabled(meta: MetadataPatch): boolean {
-  if (typeof meta.conversationSchedulesEnabled === "boolean") return meta.conversationSchedulesEnabled;
-  return hasConversationSchedules(meta.characterSchedules);
+  return meta.conversationSchedulesEnabled !== false;
 }
 
 /** Resolved presence state for one chat, read from the character cards it uses. */
@@ -599,6 +656,7 @@ function freshSwipeMessageExtra(value: unknown): Record<string, unknown> {
     "conversationStartForCharacterIds",
     "reactions",
     "personaSnapshot",
+    ...MESSAGE_MARK_EXTRA_KEYS,
   ]) {
     if (current.commandOnly === true && (key === "hiddenFromAI" || key === "hiddenFromUser")) continue;
     if (Object.prototype.hasOwnProperty.call(current, key)) {
@@ -709,6 +767,181 @@ export function createChatsStorage(db: DB) {
   const readMessage = async (id: string) => (await db.select().from(messages).where(eq(messages.id, id)))[0] ?? null;
   const readSwipes = (id: string) =>
     db.select().from(messageSwipes).where(eq(messageSwipes.messageId, id)).orderBy(messageSwipes.index);
+
+  // Deleting a reply puts back the chat variables it changed (#6923). The changes live on its
+  // swipes, so they are read before the rows go and undone once the message queues are released.
+  // ponytail: two deletes running at the same moment can undo in the wrong order and leave a deleted
+  // reply's value. The UI deletes one at a time and bulk deletes undo in one sorted batch; if this ever
+  // matters, hold the message and metadata queues together in one fixed order for delete and replay.
+  type VariableChanges = { chatId: string; createdAt: string; index: number; changes: unknown };
+  async function readVariableChanges(rows: MessageRow[]): Promise<VariableChanges[]> {
+    if (rows.length === 0) return [];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const swipes = await db
+      .select()
+      .from(messageSwipes)
+      .where(inArray(messageSwipes.messageId, [...byId.keys()]));
+    return swipes.flatMap((swipe) => {
+      const row = byId.get(swipe.messageId)!;
+      // Only the swipe on screen holds the values in place; a hidden swipe's changes were already undone.
+      if (swipe.index !== row.activeSwipeIndex) return [];
+      const changes = parseExtraRecord(swipe.extra).macroVariableChanges;
+      return changes ? [{ chatId: row.chatId, createdAt: row.createdAt, index: swipe.index, changes }] : [];
+    });
+  }
+  // Each undo then meets the values the next newer reply left.
+  const newestFirst = (a: VariableChanges, b: VariableChanges) =>
+    b.createdAt.localeCompare(a.createdAt) || b.index - a.index;
+
+  async function userRoleplayPreparer(chatId: string) {
+    const [chat] = await db.select().from(chats).where(eq(chats.id, chatId)).limit(1);
+    if (chat?.mode !== "roleplay") return null;
+    const ids = parseCharacterIds(chat.characterIds);
+    const rows = ids.length
+      ? await db
+          .select({ id: characters.id, data: characters.data })
+          .from(characters)
+          .where(inArray(characters.id, ids))
+      : [];
+    const roster = rows.flatMap((row) => {
+      const name = parseExtraRecord(row.data).name;
+      return typeof name === "string" ? [{ id: row.id, name }] : [];
+    });
+    const metadata = parseExtraRecord(chat.metadata);
+    return (content: string, extra: unknown) =>
+      prepareUserRoleplayCommands({ content, extra: parseExtraRecord(extra), metadata, characters: roster });
+  }
+
+  let scanCompactionByChat = lorebookScanCompactionStates.get(db);
+  if (!scanCompactionByChat) {
+    scanCompactionByChat = new Map();
+    lorebookScanCompactionStates.set(db, scanCompactionByChat);
+  }
+  const scanCompactionStates = scanCompactionByChat;
+
+  /**
+   * Opt-in (LOREBOOK_COMPACT_STORED_SCANS): `messageId` just saved a scan with entry text. Call it inside that
+   * message's patch queue. When it is an assistant or narrator message (what Active Context and agent retries read),
+   * its row and all its swipes keep their text, so swiping back on the newest message still shows the text that
+   * built each swipe, and the previous newest message is queued for compaction. A scan saved on any other message
+   * (an impersonated user turn) is compacted and never replaces the kept message. The compaction runs in the
+   * background, one message queue at a time, never on the caller's save path. A generated message older than the
+   * kept one (a scan saved later on an earlier turn) is compacted too: only the newest message by order keeps text.
+   */
+  function noteLorebookScanSaved(chatId: string, messageId: string, role: string, createdAt: string, scan: unknown) {
+    if (!isLorebookScanCompactionEnabled() || !lorebookScanHasContent(scan)) return;
+    let state = scanCompactionStates.get(chatId);
+    if (!state) {
+      state = { keep: null, keepOrder: null, pending: new Set(), swept: false, running: null };
+      scanCompactionStates.set(chatId, state);
+    }
+    const order = { createdAt, id: messageId };
+    if (isGeneratedMessageRole(role) && (!state.keepOrder || isAtOrAfterInMessageOrder(order, state.keepOrder))) {
+      if (state.keep && state.keep !== messageId) state.pending.add(state.keep);
+      state.pending.delete(messageId);
+      state.keep = messageId;
+      state.keepOrder = order;
+    } else if (state.keep !== messageId) {
+      state.pending.add(messageId);
+    }
+    if (state.running) return;
+    const running = runLorebookScanCompaction(chatId, state);
+    state.running = running;
+    runningLorebookScanCompactions.add(running);
+    void running.finally(() => runningLorebookScanCompactions.delete(running));
+  }
+
+  /**
+   * A deleted kept message no longer marks the newest generated message: forget it and sweep again on the next save,
+   * so a scan on the message that is newest now is kept instead of compared against the deleted one.
+   */
+  function forgetDeletedLorebookScanKeep(messageIds: readonly string[]) {
+    const deleted = new Set(messageIds);
+    for (const state of scanCompactionStates.values()) {
+      if (!state.keep || !deleted.has(state.keep)) continue;
+      state.keep = null;
+      state.keepOrder = null;
+      state.swept = false;
+    }
+    for (const state of scanCompactionStates.values()) for (const id of deleted) state.pending.delete(id);
+  }
+
+  async function runLorebookScanCompaction(chatId: string, state: LorebookScanCompactionState) {
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (!state.swept) {
+        // First save in this chat since start: queue every older message that still stores a full scan. Later saves
+        // only queue the previous newest message, so this read happens once per chat per process.
+        const rows = await db
+          .select({ id: messages.id, role: messages.role, createdAt: messages.createdAt, extra: messages.extra })
+          .from(messages)
+          .where(eq(messages.chatId, chatId));
+        // Keep the newest assistant/narrator message (ties by id, like the store's message order), so a scan saved
+        // on an impersonated turn or on an older generated message before this sweep cannot compact it.
+        let newest: (typeof rows)[number] | null = null;
+        for (const row of rows) {
+          if (!isGeneratedMessageRole(row.role)) continue;
+          if (!newest || isAtOrAfterInMessageOrder(row, newest)) newest = row;
+        }
+        if (newest && (!state.keepOrder || isAtOrAfterInMessageOrder(newest, state.keepOrder))) {
+          if (state.keep && state.keep !== newest.id) state.pending.add(state.keep);
+          state.keep = newest.id;
+          state.keepOrder = { createdAt: newest.createdAt, id: newest.id };
+        }
+        const ids = rows.map((row) => row.id);
+        const swipeRows =
+          ids.length > 0
+            ? await db
+                .select({ messageId: messageSwipes.messageId, extra: messageSwipes.extra })
+                .from(messageSwipes)
+                .where(inArray(messageSwipes.messageId, ids))
+            : [];
+        for (const row of rows) if (serializedExtraMayHoldFullLorebookScan(row.extra)) state.pending.add(row.id);
+        for (const row of swipeRows)
+          if (serializedExtraMayHoldFullLorebookScan(row.extra)) state.pending.add(row.messageId);
+        state.swept = true;
+      }
+      while (state.pending.size > 0) {
+        const messageId = state.pending.values().next().value as string;
+        state.pending.delete(messageId);
+        await withPatchQueue(messageExtraPatchQueues, messageId, () => compactMessageLorebookScans(messageId, state));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } catch (error) {
+      // Not fatal: a scan that keeps its text is still valid, and the next save in this chat retries the sweep.
+      state.swept = false;
+      logRateLimited(
+        "warn",
+        "chats.lorebook-scan-compaction",
+        error,
+        "[chats] Could not compact older lorebook scans for chat %s",
+        chatId,
+      );
+    } finally {
+      state.running = null;
+    }
+  }
+
+  async function compactMessageLorebookScans(messageId: string, state: LorebookScanCompactionState) {
+    // Checked inside the message queue: a message that became the newest again keeps its text.
+    if (messageId === state.keep) return;
+    const message = await readMessage(messageId);
+    if (!message) return;
+    const compacted = compactLorebookScanInExtra(parseExtraRecord(message.extra));
+    if (compacted)
+      await db
+        .update(messages)
+        .set({ extra: JSON.stringify(compacted) })
+        .where(eq(messages.id, messageId));
+    for (const swipe of await readSwipes(messageId)) {
+      const compactedSwipe = compactLorebookScanInExtra(parseExtraRecord(swipe.extra));
+      if (compactedSwipe)
+        await db
+          .update(messageSwipes)
+          .set({ extra: JSON.stringify(compactedSwipe) })
+          .where(eq(messageSwipes.id, swipe.id));
+    }
+  }
   const receipts = (extra: unknown) =>
     getRoleplayCommandActivity(parseExtraRecord(extra)).flatMap((activity) => {
       const receipt = readRoleplayInterruption(activity.interruption);
@@ -780,6 +1013,7 @@ export function createChatsStorage(db: DB) {
         .update(messages)
         .set({ extra: JSON.stringify({ ...parseExtraRecord(owner.extra), ...extra }) })
         .where(eq(messages.id, owner.id));
+    noteLorebookScanSaved(owner.chatId, owner.id, owner.role, owner.createdAt, extra.lorebookScan);
   }
 
   async function changeInterruptionTarget(
@@ -947,6 +1181,84 @@ export function createChatsStorage(db: DB) {
       // resume from a queue belonging to a turn that no longer exists.
       await db.delete(gameDicePools).where(chatScoped(gameDicePools.chatId, inArray(gameDicePools.messageId, chunk)));
     }
+  }
+
+  /**
+   * Cascade message deletions into agent-authored lorebook entries (deleted
+   * chat messages used to leave agent-written lore live, still steering later
+   * generations — the deleted-turn "facts" kept being injected and the model
+   * argued with the user's corrections).
+   *
+   * Entries carry sourceMessageRefs ({ id, swipeIndex } of the turn their
+   * CURRENT content was extracted from) and a depth-1 pre-write snapshot
+   * (previousContent/previousSourceMessageRefs, taken on every agent rewrite).
+   * For each agent-authored entry whose current refs mention a removed
+   * message:
+   *   - a snapshot whose own refs survive the batch → revert to it (an
+   *     in-place rewrite is undone, like addSwipe's outgoing-swipe backfill);
+   *   - otherwise → remove the entry: a keeper create has nothing to revert
+   *     to, and lore whose source turn is gone must not steer prompts.
+   * A snapshot whose refs are in the SAME batch is discarded first, so the
+   * entry deletes instead of reverting to lore whose source is also gone.
+   * Entries that never mention a removed message — and manual entries
+   * (sourceAgentId NULL; a human edit takes ownership) — are untouched.
+   *
+   * Return removed IDs so callers can prune metadata after releasing the transaction.
+   */
+  async function cascadeAgentLorebookEntriesForMessages(messageIds: string[]): Promise<string[]> {
+    const deletedIds = new Set(messageIds.filter(Boolean));
+    if (deletedIds.size === 0) return [];
+    const candidates = await db
+      .select({
+        id: lorebookEntries.id,
+        content: lorebookEntries.content,
+        sourceMessageRefs: lorebookEntries.sourceMessageRefs,
+        previousContent: lorebookEntries.previousContent,
+        previousSourceMessageRefs: lorebookEntries.previousSourceMessageRefs,
+        previousSourceAgentId: lorebookEntries.previousSourceAgentId,
+      })
+      .from(lorebookEntries)
+      .where(isNotNull(lorebookEntries.sourceAgentId));
+
+    const removed: string[] = [];
+    for (const entry of candidates) {
+      const currentRefs = parseSourceMessageRefs(entry.sourceMessageRefs);
+      const previousRefs = parseSourceMessageRefs(entry.previousSourceMessageRefs);
+      const currentHit = currentRefs.some((ref) => deletedIds.has(ref.id));
+      const snapshotPoisoned = previousRefs.some((ref) => deletedIds.has(ref.id));
+      if (!currentHit && !snapshotPoisoned) continue;
+
+      if (snapshotPoisoned) {
+        await db
+          .update(lorebookEntries)
+          .set({ previousContent: null, previousSourceMessageRefs: null, previousSourceAgentId: null })
+          .where(eq(lorebookEntries.id, entry.id));
+      }
+
+      if (currentHit) {
+        const canRevert = !snapshotPoisoned && typeof entry.previousContent === "string";
+        if (canRevert) {
+          await db
+            .update(lorebookEntries)
+            .set({
+              content: entry.previousContent as string,
+              embedding: null,
+              embeddingSpaceId: null,
+              sourceMessageRefs: entry.previousSourceAgentId ? (entry.previousSourceMessageRefs ?? "[]") : "[]",
+              sourceAgentId: entry.previousSourceAgentId ?? null,
+              previousSourceAgentId: null,
+              previousContent: null,
+              previousSourceMessageRefs: null,
+              updatedAt: now(),
+            })
+            .where(eq(lorebookEntries.id, entry.id));
+        } else {
+          await db.delete(lorebookEntries).where(eq(lorebookEntries.id, entry.id));
+          removed.push(entry.id);
+        }
+      }
+    }
+    return removed;
   }
 
   async function readLatestMessageAt(chatId: string): Promise<string | null> {
@@ -1228,14 +1540,19 @@ export function createChatsStorage(db: DB) {
         : undefined;
       const inheritedSchedules =
         input.mode === "conversation" ? await collectConversationSchedules(input.characterIds) : {};
+      const appSettings = createAppSettingsStorage(db);
+      const windowDefault = parseChatWindowDefault(await appSettings.get(getChatWindowDefaultSettingsKey(input.mode)));
       const metadata: MetadataPatch = {
-        ...normalizeTranslatorSettings(await createAppSettingsStorage(db).get(TRANSLATOR_DEFAULTS_SETTINGS_KEY)),
+        ...normalizeTranslatorSettings(await appSettings.get(TRANSLATOR_DEFAULTS_SETTINGS_KEY)),
         summary: null,
         tags: [],
         enableAgents: true,
         agentOverrides: {},
         activeAgentIds: [],
         activeToolIds: [],
+        // Missing means a pre-window chat whose toolbar needs migrating; null selects the new defaults.
+        windowLayout: null,
+        ...windowDefault,
       };
       if (hasConversationSchedules(inheritedSchedules)) {
         metadata.conversationSchedulesEnabled = true;
@@ -1274,6 +1591,14 @@ export function createChatsStorage(db: DB) {
 
       const meta = parseMetadata(chat.metadata);
       const characterIds = parseCharacterIds(chat.characterIds);
+
+      if (meta.multiplayer || meta.multiplayerSetup === true) {
+        const overrides = parseConversationStatusOverrides(meta.conversationStatusOverrides);
+        return {
+          schedules: await this.resolveConversationSchedules(id),
+          statusOverrides: Object.fromEntries(Object.entries(overrides).filter(([key]) => characterIds.includes(key))),
+        };
+      }
 
       // Hoist before the opt-in gate, so a chat that is switched off does not
       // strand the only copy of a pre-existing schedule in its metadata.
@@ -1323,6 +1648,12 @@ export function createChatsStorage(db: DB) {
 
       const characterIds = parseCharacterIds(chat.characterIds);
       const currentSchedules = hasConversationSchedules(meta.characterSchedules) ? meta.characterSchedules : {};
+
+      // Shared rooms own their cached routines. Resolving one must neither read
+      // a later private-card update nor hoist room changes back into that card.
+      if (meta.multiplayer || meta.multiplayerSetup === true) {
+        return Object.fromEntries(Object.entries(currentSchedules).filter(([key]) => characterIds.includes(key)));
+      }
 
       // The character card is the source of truth; the chat map is a cache that
       // can be stale or hold a schedule the character has since replaced.
@@ -1465,6 +1796,11 @@ export function createChatsStorage(db: DB) {
      * is in the same category — it carries the mirror through untouched rather than restamping.
      */
     async updateMetadata(id: string, metadata: Record<string, unknown>) {
+      const room = currentRoomGeneration();
+      if (room) {
+        // A model/agent's old snapshot must never restore an ended room or overwrite its coordinator.
+        return this.patchMetadata(id, () => metadata);
+      }
       await db
         .update(chats)
         .set({ metadata: JSON.stringify(metadata), updatedAt: now() })
@@ -1537,19 +1873,28 @@ export function createChatsStorage(db: DB) {
     async patchMetadata(
       id: string,
       patchOrUpdater: MetadataPatch | MetadataUpdater,
-      opts: { touchUpdatedAt?: boolean; metadataQueueHeld?: boolean } = {},
+      opts: { touchUpdatedAt?: boolean; metadataQueueHeld?: boolean; allowRoomKeys?: readonly RoomMetadataKey[] } = {},
     ) {
       const applyPatch = async () => {
         const existing = await this.getById(id);
         if (!existing) return null;
 
         const current = parseMetadata(existing.metadata);
+        const room = currentRoomGeneration();
+        if (room) {
+          if (id !== room.chatId) throw new Error("Shared-room generation cannot modify another chat.");
+          resolveRoomGenerationPolicy(id, current, [], room);
+        }
         // #5406: fingerprint BEFORE the updater runs. `{ ...current }` is a shallow copy, so an
         // updater that mutates a nested value in place mutates `current`'s value too and the
         // post-hoc comparison would see two identical objects and skip the stamp.
         const before = typeof patchOrUpdater === "function" ? fingerprintMetadata(current) : null;
         const raw = typeof patchOrUpdater === "function" ? await patchOrUpdater({ ...current }) : patchOrUpdater;
-        const patch = stripOrdinalMirrorKey(raw);
+        const patch = stripOrdinalMirrorKey(room ? { ...raw } : raw);
+        if (room) {
+          room.signal?.throwIfAborted();
+          protectRoomMetadata(patch, opts.allowRoomKeys);
+        }
         const merged = mergeMetadataPatch(current, patch);
         // Explicitly detaching a pinned book resets its chat-local entry state.
         // Temporary exclusions retain it so disabling/re-enabling a book is reversible.
@@ -1608,9 +1953,20 @@ export function createChatsStorage(db: DB) {
         if (!existing) return null;
 
         const current = parseMetadata(existing.metadata);
+        const room = currentRoomGeneration();
+        if (room) {
+          if (id !== room.chatId) throw new Error("Shared-room generation cannot modify another chat.");
+          resolveRoomGenerationPolicy(id, current, [], room);
+        }
         const before = fingerprintMetadata(current);
         const { metadata: raw, characterIds } = await updater({ ...current });
-        const patch = stripOrdinalMirrorKey(raw);
+        const patch = stripOrdinalMirrorKey(room ? { ...raw } : raw);
+        if (room) {
+          if (characterIds.some((characterId) => !room.characterIds.includes(characterId)))
+            throw new Error("The character is not approved for this room.");
+          room.signal?.throwIfAborted();
+          protectRoomMetadata(patch);
+        }
         const merged = mergeMetadataPatch(current, patch);
         const stamp = stampMetadataWriteOrdinals(existing.writeOrdinalCounter, current, merged, patch, before);
         applyOrdinalStamp(merged, stamp);
@@ -1667,16 +2023,16 @@ export function createChatsStorage(db: DB) {
       );
     },
 
-    async pruneLorebookChatMetadata(remove: () => Promise<string[]>, lorebookId?: string) {
+    async pruneLorebookChatMetadata(remove: (tx: DB) => Promise<string[]>, lorebookId?: string) {
       // Match the existing queue-before-transaction order. Deletion and metadata cleanup roll back together.
       for (;;) {
         const lockedIds = new Set((await db.select({ id: chats.id }).from(chats)).map((chat) => chat.id));
         const complete = await withPatchQueues(metadataPatchQueues, [...lockedIds], () =>
-          db.transaction(async () => {
+          db.transaction(async (tx) => {
             const allChats = await db.select().from(chats);
             // A chat created while waiting may also reference this book; reacquire all queues before deleting.
             if (allChats.some((chat) => !lockedIds.has(chat.id))) return false;
-            const removedEntryIds = new Set(await remove());
+            const removedEntryIds = new Set(await remove(tx));
             for (const chat of allChats) {
               const metadata = parseMetadata(chat.metadata);
               const hasBook =
@@ -1879,6 +2235,10 @@ export function createChatsStorage(db: DB) {
     },
 
     async createMessage(input: CreateMessageInput, timestampOverrides?: TimestampOverrides | null) {
+      const prepare = input.role === "user" ? await userRoleplayPreparer(input.chatId) : null;
+      const prepared = prepare?.(input.content, input.extra);
+      const content = prepared?.content ?? input.content;
+      const extra = prepared?.extra ?? parseExtraRecord(input.extra);
       const id = newId();
       const resolvedTimestamp = resolveTimestamps(timestampOverrides).createdAt;
       const explicitTimestamp = normalizeTimestampOverrides(timestampOverrides)?.createdAt;
@@ -1895,10 +2255,10 @@ export function createChatsStorage(db: DB) {
         chatId: input.chatId,
         role: input.role,
         characterId: input.characterId,
-        content: input.content,
+        content,
         activeSwipeIndex: 0,
         extra: JSON.stringify({
-          ...parseExtraRecord(input.extra),
+          ...extra,
           displayText: null,
           isGenerated: input.role !== "user",
           tokenCount: null,
@@ -1911,8 +2271,8 @@ export function createChatsStorage(db: DB) {
         id: newId(),
         messageId: id,
         index: 0,
-        content: input.content,
-        extra: JSON.stringify(parseExtraRecord(input.extra)),
+        content,
+        extra: JSON.stringify(extra),
         createdAt: timestamp,
       });
       await db.update(chats).set({ lastMessageAt: timestamp, updatedAt: timestamp }).where(eq(chats.id, input.chatId));
@@ -1950,6 +2310,7 @@ export function createChatsStorage(db: DB) {
       timestampOverrides?: TimestampOverrides | null,
     ) {
       if (inputs.length === 0) return [];
+      const prepareUser = inputs.some((input) => input.role === "user") ? await userRoleplayPreparer(chatId) : null;
       const msgRows: (typeof messages.$inferInsert)[] = [];
       const swipeRows: (typeof messageSwipes.$inferInsert)[] = [];
       const createdIds: string[] = [];
@@ -1968,19 +2329,21 @@ export function createChatsStorage(db: DB) {
         })?.createdAt;
         const timestamp = explicitTimestamp ?? new Date(safeBaseTime + idx).toISOString();
         createdTimestamps.push(timestamp);
+        const fallbackExtra = {
+          displayText: null,
+          isGenerated: input.role !== "user",
+          tokenCount: null,
+          generationInfo: null,
+        };
+        const prepared = input.role === "user" ? prepareUser?.(input.content, input.extra ?? fallbackExtra) : null;
         msgRows.push({
           id,
           chatId,
           role: input.role,
           characterId: input.characterId,
-          content: input.content,
+          content: prepared?.content ?? input.content,
           activeSwipeIndex: input.activeSwipeIndex ?? 0,
-          extra: serializeJsonField(input.extra, {
-            displayText: null,
-            isGenerated: input.role !== "user",
-            tokenCount: null,
-            generationInfo: null,
-          }),
+          extra: serializeJsonField(prepared?.extra ?? input.extra, fallbackExtra),
           createdAt: timestamp,
         });
         const inputSwipes = input.swipes?.length
@@ -1994,12 +2357,21 @@ export function createChatsStorage(db: DB) {
               },
             ];
         for (const swipe of inputSwipes) {
+          const preparedSwipe =
+            input.role === "user"
+              ? prepareUser?.(
+                  swipe.content,
+                  swipe.index === (input.activeSwipeIndex ?? 0)
+                    ? { ...parseExtraRecord(swipe.extra), ...parseExtraRecord(input.extra) }
+                    : swipe.extra,
+                )
+              : null;
           swipeRows.push({
             id: newId(),
             messageId: id,
             index: swipe.index,
-            content: swipe.content,
-            extra: serializeJsonField(swipe.extra, {}),
+            content: preparedSwipe?.content ?? swipe.content,
+            extra: serializeJsonField(preparedSwipe?.extra ?? swipe.extra, {}),
             createdAt: normalizeTimestampOverrides({ createdAt: swipe.createdAt })?.createdAt ?? timestamp,
           });
         }
@@ -2225,9 +2597,19 @@ export function createChatsStorage(db: DB) {
       }
     },
 
-    async updateMessageContent(id: string, content: string) {
+    /**
+     * `authored`: a person typed this text in the editor, so Roleplay private tags in it become
+     * commands on any message. Generated rewrites never reinterpret model text as typed tags.
+     */
+    async updateMessageContent(id: string, content: string, options: { authored?: boolean } = {}) {
       return withPatchQueue(messageExtraPatchQueues, id, async () => {
         const existing = await this.getMessage(id);
+        const prepare =
+          existing && (existing.role === "user" || options.authored)
+            ? await userRoleplayPreparer(existing.chatId)
+            : null;
+        const prepared = prepare?.(content, existing?.extra);
+        content = prepared?.content ?? content;
 
         // Conversation-mode prompt history prefers `conversationCommandContent` (the raw
         // reply before command stripping) over `content`, so a rewrite of the visible text
@@ -2243,8 +2625,11 @@ export function createChatsStorage(db: DB) {
           content !== (existing?.content ?? "");
 
         const messagePatch: Record<string, unknown> = { content };
-        if (clearCommandContent) {
-          messagePatch.extra = JSON.stringify({ ...existingExtra, conversationCommandContent: null });
+        if (prepared || clearCommandContent) {
+          messagePatch.extra = JSON.stringify({
+            ...(prepared?.extra ?? existingExtra),
+            ...(clearCommandContent ? { conversationCommandContent: null } : {}),
+          });
         }
         // One transaction around the messages row and its swipe mirror
         // (#5600): the store defers flushes while a transaction is active, so
@@ -2263,8 +2648,11 @@ export function createChatsStorage(db: DB) {
             const activeSwipe = swipes.find((s: any) => s.index === msg.activeSwipeIndex);
             if (activeSwipe) {
               const swipePatch: Record<string, unknown> = { content };
+              if (prepared) {
+                swipePatch.extra = JSON.stringify({ ...parseExtraRecord(activeSwipe.extra), ...prepared.extra });
+              }
               if (clearCommandContent) {
-                const swipeExtra = parseExtraRecord(activeSwipe.extra);
+                const swipeExtra = { ...parseExtraRecord(activeSwipe.extra), ...prepared?.extra };
                 // Clear only a raw copy this swipe itself carries, and never a
                 // command-only carrier's.
                 if (
@@ -2284,6 +2672,85 @@ export function createChatsStorage(db: DB) {
           return msg;
         });
       });
+    },
+
+    /** Save a context flag, every swipe mirror and its automatic cutoff in one transaction. */
+    async updateMessageExtraWithContextStart(
+      id: string,
+      partial: Record<string, unknown>,
+      sharedExtra: Record<string, unknown>,
+      swipeIndex?: number,
+      opts: { metadataQueueHeld?: boolean } = {},
+    ) {
+      const owner = await readMessage(id);
+      if (!owner) return null;
+      // Summary hiding already takes metadata before message queues. Acquire both
+      // before the transaction, and never call a queue-taking writer inside it.
+      const apply = () =>
+        withMessageExtraPatchQueue(id, async () => {
+          const updated = await db.transaction(async () => {
+            const msg = await readMessage(id);
+            if (!msg || msg.chatId !== owner.chatId) return null;
+            const swipes = await readSwipes(id);
+            if (swipeIndex !== undefined && !swipes.some((swipe) => swipe.index === swipeIndex)) return null;
+            const previousExtra = parseExtraRecord(msg.extra);
+            await db
+              .update(messages)
+              .set({
+                extra: JSON.stringify({
+                  ...previousExtra,
+                  ...(swipeIndex === undefined || swipeIndex === msg.activeSwipeIndex ? partial : {}),
+                  ...sharedExtra,
+                }),
+              })
+              .where(eq(messages.id, id));
+            for (const swipe of swipes) {
+              await db
+                .update(messageSwipes)
+                .set({
+                  extra: JSON.stringify({
+                    ...parseExtraRecord(swipe.extra),
+                    ...(swipe.index === (swipeIndex ?? msg.activeSwipeIndex) ? partial : {}),
+                    ...sharedExtra,
+                  }),
+                })
+                .where(eq(messageSwipes.id, swipe.id));
+            }
+            await this.patchMetadata(
+              msg.chatId,
+              (metadata) => {
+                if (!Object.prototype.hasOwnProperty.call(partial, "isConversationStart")) return {};
+                const state = parseExtraRecord(metadata.advancedMemoryState);
+                if (!Array.isArray(state.contextStarts) || !state.contextStarts.length) return {};
+                // A new manual shared flag replaces the automatic window. Unchecking
+                // the automatic flag itself clears it through this same control.
+                const contextStarts =
+                  partial.isConversationStart === true && previousExtra.isConversationStart !== true
+                    ? []
+                    : state.contextStarts.filter((raw) => {
+                        const start = parseExtraRecord(raw);
+                        return start.messageId !== id && start.sceneStartMessageId !== id;
+                      });
+                if (contextStarts.length === state.contextStarts.length) return {};
+                return {
+                  advancedMemoryState: {
+                    ...state,
+                    contextStarts,
+                    contextStartRevision:
+                      (typeof state.contextStartRevision === "number" && Number.isFinite(state.contextStartRevision)
+                        ? state.contextStartRevision
+                        : 0) + 1,
+                  },
+                };
+              },
+              { touchUpdatedAt: false, metadataQueueHeld: true },
+            );
+            return this.getMessage(id);
+          });
+          if (updated) noteLorebookScanSaved(updated.chatId, id, updated.role, updated.createdAt, partial.lorebookScan);
+          return updated;
+        });
+      return opts.metadataQueueHeld ? apply() : withChatMetadataPatchQueue(owner.chatId, apply);
     },
 
     /** Merge partial data into a message's extra JSON field. */
@@ -2307,13 +2774,19 @@ export function createChatsStorage(db: DB) {
             .set({ extra: JSON.stringify({ ...swipeExtra, ...partial }) })
             .where(and(eq(messageSwipes.messageId, id), eq(messageSwipes.id, activeSwipe.id)));
         }
+        noteLorebookScanSaved(msg.chatId, id, msg.role, msg.createdAt, partial.lorebookScan);
 
         return this.getMessage(id);
       });
     },
 
     /** Merge partial data into a specific swipe and mirror it to the message only if that swipe is active. */
-    async updateMessageExtraForSwipe(id: string, swipeIndex: number, partial: Record<string, unknown>) {
+    async updateMessageExtraForSwipe(
+      id: string,
+      swipeIndex: number,
+      partial: Record<string, unknown>,
+      expectedContent?: string,
+    ) {
       return withPatchQueue(messageExtraPatchQueues, id, async () => {
         const msg = await this.getMessage(id);
         if (!msg) return null;
@@ -2322,10 +2795,17 @@ export function createChatsStorage(db: DB) {
         if (!targetSwipe) return null;
 
         const swipeExtra = parseExtraRecord(targetSwipe.extra);
+        // A delayed automatic translation must not replace an edit or a translation the user hid.
+        if (
+          expectedContent !== undefined &&
+          (targetSwipe.content !== expectedContent || swipeExtra.translationHidden === true)
+        )
+          return null;
         await db
           .update(messageSwipes)
           .set({ extra: JSON.stringify({ ...swipeExtra, ...partial }) })
           .where(and(eq(messageSwipes.messageId, id), eq(messageSwipes.id, targetSwipe.id)));
+        noteLorebookScanSaved(msg.chatId, id, msg.role, msg.createdAt, partial.lorebookScan);
 
         if (msg.activeSwipeIndex === swipeIndex) {
           const msgExtra = parseExtraRecord(msg.extra);
@@ -2707,55 +3187,124 @@ export function createChatsStorage(db: DB) {
       // mutation (#5599): an in-flight edit either completes before the
       // delete or starts after it and sees a consistent world, instead of
       // having its writes silently vanish mid-flight into a 404.
-      return withInterruptionQueue([id], async (locked) => {
+      const { removedEntries, variableChanges } = await withInterruptionQueue([id], async (locked) => {
         const existing = await this.getMessage(id);
         await reconcileEffects(existing, true, locked);
         if (existing) await deleteGameStateForMessages([id], [existing.chatId]);
+        const variableChanges = existing ? await readVariableChanges([existing]) : [];
         await db.delete(messages).where(eq(messages.id, id));
         if (existing) {
+          const removed = await cascadeAgentLorebookEntriesForMessages([id]);
           await invalidateMemoryChunksFrom(db, existing.chatId, existing.createdAt);
           await refreshChatLastMessageAt(existing.chatId);
+          return { removedEntries: removed, variableChanges };
         }
+        return { removedEntries: [], variableChanges };
       });
+      forgetDeletedLorebookScanKeep([id]);
+      if (removedEntries.length > 0) await this.pruneLorebookChatMetadata(async (_tx) => removedEntries);
+      const chatId = variableChanges[0]?.chatId;
+      if (chatId)
+        await this.replayVariableChanges(
+          chatId,
+          variableChanges.sort(newestFirst).map((e) => e.changes),
+        );
     },
 
-    async removeMessages(ids: string[], chatId?: string) {
+    /**
+     * Take back the chat-variable changes `undo` recorded, then apply `redo`'s (#6923): a reply
+     * that is deleted or swapped for another swipe takes its changes with it. A value someone
+     * changed since, the user or a later reply, stays as it is.
+     */
+    async replayVariableChanges(
+      chatId: string,
+      undo: unknown[],
+      redo: unknown[] = [],
+      options: { metadataQueueHeld?: boolean } = {},
+    ) {
+      if (!undo.some(Boolean) && !redo.some(Boolean)) return;
+      await this.patchMetadata(
+        chatId,
+        (current) => ({
+          macroVariables: redoChatVariableChanges(undoChatVariableChanges(current.macroVariables, undo), redo),
+        }),
+        { touchUpdatedAt: false, ...options },
+      );
+    },
+
+    async removeMessages(ids: string[], chatId?: string, beforeDelete?: (rows: MessageRow[]) => Promise<void>) {
       if (ids.length === 0) return;
       const earliestByChat = new Map<string, string>();
+      const removedEntryIds: string[] = [];
+      const variableChanges: VariableChanges[] = [];
+      const finishDeletion = async () => {
+        forgetDeletedLorebookScanKeep(ids);
+        if (removedEntryIds.length > 0) await this.pruneLorebookChatMetadata(async (_tx) => removedEntryIds);
+        for (const [affectedChatId, createdAt] of earliestByChat) {
+          await invalidateMemoryChunksFrom(db, affectedChatId, createdAt);
+          await refreshChatLastMessageAt(affectedChatId);
+        }
+        variableChanges.sort(newestFirst);
+        for (const affectedChatId of new Set(variableChanges.map((entry) => entry.chatId))) {
+          const records = variableChanges
+            .filter((entry) => entry.chatId === affectedChatId)
+            .map((entry) => entry.changes);
+          await this.replayVariableChanges(affectedChatId, records);
+        }
+      };
       const CHUNK = 500;
-      for (let i = 0; i < ids.length; i += CHUNK) {
-        const chunk = ids.slice(i, i + CHUNK);
-        // Per-chunk queue acquisition (#5599): each message's delete is
-        // ordered against its in-flight edits; cross-chunk atomicity was
-        // never promised by this bulk path.
-        await withInterruptionQueue(chunk, async (locked) => {
-          const condition = chatId
-            ? and(inArray(messages.id, chunk), eq(messages.chatId, chatId))
-            : inArray(messages.id, chunk);
-          const existingRows = await db
-            .select({ id: messages.id, chatId: messages.chatId, createdAt: messages.createdAt, extra: messages.extra })
-            .from(messages)
-            .where(condition);
-          for (const row of existingRows) {
+      try {
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          // Per-chunk queue acquisition (#5599): each message's delete is
+          // ordered against its in-flight edits; cross-chunk atomicity was
+          // never promised by this bulk path.
+          const removed = await withInterruptionQueue(chunk, async (locked) => {
+            const condition = chatId
+              ? and(inArray(messages.id, chunk), eq(messages.chatId, chatId))
+              : inArray(messages.id, chunk);
+            const existingRows = await db.select().from(messages).where(condition);
+            // Recovery snapshots share the deletion's queues and transaction, so queued edits
+            // are captured and a failed delete cannot leave a second copy in the trash.
+            await beforeDelete?.(existingRows);
+            // Undo newest effects first when a whole interrupted exchange is removed.
+            for (const row of existingRows
+              .filter((row) => receipts(row.extra).some((receipt) => !receipt.restored))
+              .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)))
+              await reconcileEffects(await readMessage(row.id), true, locked);
+            await deleteGameStateForMessages(
+              existingRows.map((row) => row.id),
+              existingRows.map((row) => row.chatId),
+            );
+            const chunkVariableChanges = await readVariableChanges(existingRows);
+            await db.delete(messages).where(condition);
+            // Cascade only the ids this scoped deletion actually removed — a
+            // requested id excluded by the chatId filter (or nonexistent) keeps
+            // its message, so its lore must keep its anchors too.
+            return {
+              rows: existingRows,
+              variableChanges: chunkVariableChanges,
+              // ponytail: one lore scan per 500-message chunk keeps deletion atomic;
+              // index source refs if large history deletions outgrow this path.
+              entryIds: await cascadeAgentLorebookEntriesForMessages(existingRows.map((row) => row.id)),
+            };
+          });
+          // Forget a deleted kept message now, so saves made while later chunks run are not compared against it.
+          forgetDeletedLorebookScanKeep(removed.rows.map((row) => row.id));
+          removedEntryIds.push(...removed.entryIds);
+          variableChanges.push(...removed.variableChanges);
+          for (const row of removed.rows) {
             const current = earliestByChat.get(row.chatId);
             if (!current || row.createdAt < current) earliestByChat.set(row.chatId, row.createdAt);
           }
-          // Undo newest effects first when a whole interrupted exchange is removed.
-          for (const row of existingRows
-            .filter((row) => receipts(row.extra).some((receipt) => !receipt.restored))
-            .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)))
-            await reconcileEffects(await readMessage(row.id), true, locked);
-          await deleteGameStateForMessages(
-            existingRows.map((row) => row.id),
-            existingRows.map((row) => row.chatId),
-          );
-          await db.delete(messages).where(condition);
+        }
+      } catch (error) {
+        await finishDeletion().catch((cleanupError) => {
+          logger.error(cleanupError, "Failed to clean up lore after partial message deletion");
         });
+        throw error;
       }
-      for (const [affectedChatId, createdAt] of earliestByChat) {
-        await invalidateMemoryChunksFrom(db, affectedChatId, createdAt);
-        await refreshChatLastMessageAt(affectedChatId);
-      }
+      await finishDeletion();
     },
 
     async getSwipes(messageId: string) {
@@ -2780,6 +3329,10 @@ export function createChatsStorage(db: DB) {
         const nextIndex = existing.length;
         const msg = await this.getMessage(messageId);
         const retainedExtra = msg ? freshSwipeMessageExtra(msg.extra) : {};
+        const prepare = msg?.role === "user" ? await userRoleplayPreparer(msg.chatId) : null;
+        const prepared = prepare?.(content, retainedExtra);
+        content = prepared?.content ?? content;
+        const nextExtra = prepared?.extra ?? retainedExtra;
 
         // Backfill: save current message extra onto the currently-active swipe
         // so its thinking/generationInfo isn't lost when we switch away
@@ -2801,7 +3354,7 @@ export function createChatsStorage(db: DB) {
           messageId,
           index: nextIndex,
           content,
-          extra: JSON.stringify(retainedExtra),
+          extra: JSON.stringify(nextExtra),
           createdAt: now(),
         });
 
@@ -2810,7 +3363,7 @@ export function createChatsStorage(db: DB) {
           // Set active swipe to the new one and reset message extra for the fresh swipe.
           await db
             .update(messages)
-            .set({ activeSwipeIndex: nextIndex, content, extra: JSON.stringify(retainedExtra) })
+            .set({ activeSwipeIndex: nextIndex, content, extra: JSON.stringify(nextExtra) })
             .where(eq(messages.id, messageId));
           if (msg) {
             await invalidateMemoryChunksFrom(db, msg.chatId, msg.createdAt);
@@ -2821,7 +3374,7 @@ export function createChatsStorage(db: DB) {
     },
 
     async setActiveSwipe(messageId: string, index: number) {
-      return withInterruptionQueue([messageId], async (locked) => {
+      const switched = await withInterruptionQueue([messageId], async (locked) => {
         const swipes = await this.getSwipes(messageId);
         const target = swipes.find((s: any) => s.index === index);
         if (!target) return null;
@@ -2854,12 +3407,24 @@ export function createChatsStorage(db: DB) {
           await invalidateMemoryChunksFrom(db, msg.chatId, msg.createdAt);
         }
         await reconcileEffects(await readMessage(messageId), false, locked);
-        return this.getMessage(messageId);
+        // The chat variables follow the swipe that is shown.
+        const variables =
+          msg && msg.activeSwipeIndex !== index
+            ? {
+                chatId: msg.chatId,
+                undo: parseExtraRecord(msg.extra).macroVariableChanges,
+                redo: swipeExtra.macroVariableChanges,
+              }
+            : null;
+        return { message: await this.getMessage(messageId), variables };
       });
+      const variables = switched?.variables;
+      if (variables) await this.replayVariableChanges(variables.chatId, [variables.undo], [variables.redo]);
+      return switched?.message ?? null;
     },
 
     async removeSwipe(messageId: string, index: number) {
-      return withInterruptionQueue([messageId], async (locked) => {
+      const removed = await withInterruptionQueue([messageId], async (locked) => {
         const msg = await this.getMessage(messageId);
         if (!msg) return null;
 
@@ -3023,8 +3588,15 @@ export function createChatsStorage(db: DB) {
           await reconcileEffects(await readMessage(messageId), false, locked);
         }
 
-        return this.getMessage(messageId);
+        // The chat variables follow the swipe that is shown.
+        const variables = activeSwipeRemoved
+          ? { chatId: msg.chatId, undo: currentExtra.macroVariableChanges, redo: nextExtra.macroVariableChanges }
+          : null;
+        return { message: await this.getMessage(messageId), variables };
       });
+      const variables = removed?.variables;
+      if (variables) await this.replayVariableChanges(variables.chatId, [variables.undo], [variables.redo]);
+      return removed?.message ?? null;
     },
 
     /** Merge partial data into a swipe's extra JSON field. */

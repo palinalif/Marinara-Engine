@@ -142,7 +142,12 @@ assert.equal(
 );
 assert.match(
   generateRouteSource,
-  /const agentAbortController = new AbortController\(\);\s*const agentSignal = AbortSignal\.any\(\[abortController\.signal, agentAbortController\.signal\]\)/u,
+  /const roomSignal = currentRoomGeneration\(\)\?\.signal;\s*const generationSignal = roomSignal\s*\? AbortSignal\.any\(\[abortController\.signal, roomSignal\]\)\s*: abortController\.signal;/u,
+  "room cancellation must compose with the primary response signal while ordinary generations retain their signal",
+);
+assert.match(
+  generateRouteSource,
+  /const agentAbortController = new AbortController\(\);\s*const agentSignal = AbortSignal\.any\(\[generationSignal, agentAbortController\.signal\]\)/u,
   "normal generations must keep an agent-only cancellation signal alongside the primary response signal",
 );
 assert.match(
@@ -407,6 +412,7 @@ const echoChamberPanelSource = readSourceText(
   "utf8",
 );
 const uiStoreSource = readSourceText(new URL("../../packages/client/src/stores/ui.store.ts", import.meta.url), "utf8");
+const { normalizeConversationBackgroundImageOpacity } = await import("../../packages/client/src/stores/ui.store.js");
 const globalStylesSource = readSourceText(
   new URL("../../packages/client/src/styles/globals.css", import.meta.url),
   "utf8",
@@ -430,7 +436,7 @@ const chatStoreSource = readSourceText(
   "utf8",
 );
 const summaryPopoverSource = readSourceText(
-  new URL("../../packages/client/src/components/chat/SummaryPopover.tsx", import.meta.url),
+  new URL("../../packages/client/src/components/chat/ChatSummaryPanel.tsx", import.meta.url),
   "utf8",
 );
 const professorMariHomeSource = readSourceText(
@@ -520,22 +526,20 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(pageActivitySource, /document\.hasFocus|addEventListener\(\s*["'](?:blur|focus)["']/u);
 assert.match(pageActivitySource, /document\.visibilityState === "visible"/u);
-const activeContextLinksButtonSource =
-  chatRoleplaySurfaceSource.match(/function ActiveContextLinksButton[\s\S]*?\nfunction SummaryButton/u)?.[0] ?? "";
-assert.match(
+const activeContextLinksPanelSource =
+  chatRoleplaySurfaceSource.match(/function ActiveContextLinksPanel[\s\S]*?\nfunction RoleplaySummaryPanel/u)?.[0] ??
+  "";
+assert.match(activeContextLinksPanelSource, /data-component="RoleplayActiveContextPanel"/u);
+// Both are drawers in the Chat Settings window now, so they render inline instead of portaling over the chat.
+assert.doesNotMatch(
   summaryPopoverSource,
-  /className="fixed z-\[9999\]"[\s\S]*?return createPortal\(content, document\.body\)/u,
-  "the Roleplay Chat Summary panel should portal above independent floating-panel stacking contexts",
-);
-assert.match(
-  activeContextLinksButtonSource,
-  /desktopAnchor &&[\s\S]*?createPortal\([\s\S]*?data-component="RoleplayActiveContextPanel"[\s\S]*?fixed z-\[9999\][\s\S]*?document\.body/u,
-  "the desktop Roleplay Active Context panel should portal above independent floating-panel stacking contexts",
+  /createPortal|fixed z-\[9999\]/u,
+  "the Roleplay Chat Summary drawer should render inline in Chat Settings",
 );
 assert.doesNotMatch(
-  activeContextLinksButtonSource,
-  /absolute right-0 top-full/u,
-  "the desktop Roleplay Active Context panel must not remain trapped in the toolbar stacking context",
+  activeContextLinksPanelSource,
+  /createPortal|fixed z-\[9999\]/u,
+  "the Roleplay Active Context drawer should render inline in Chat Settings",
 );
 const spatialTransitionEventSource =
   useGenerateSource.match(/case "spatial_transition_committed": \{[\s\S]*?case "token":/u)?.[0] ?? "";
@@ -676,29 +680,27 @@ assert.match(
 );
 assert.match(
   echoChamberPanelSource,
-  /if \(activeChatId\) setEchoChamberSizeForChat\(activeChatId, nextSize\);/u,
-  "Echo Chamber should persist a completed resize against the active chat",
+  /<FloatingWindow\s+id=\{ECHO_WINDOW_ID\}/u,
+  "Echo Chamber should reuse the shared window's drag and resize behavior",
 );
 assert.match(
   echoChamberPanelSource,
-  /onPointerCancel=\{handleResizeCancel\}/u,
-  "a canceled Echo Chamber resize should use its rollback path",
+  /useFloatingWindowStore\(\(s\) => s\.layouts\[ECHO_WINDOW_ID\]\)/u,
+  "Echo Chamber should read the shared per-chat layout before falling back to legacy dimensions",
 );
 assert.match(
   echoChamberPanelSource,
-  /onLostPointerCapture=\{handleResizeLostCapture\}/u,
-  "Echo Chamber should still commit a finished drag when the browser drops pointer capture",
-);
-assert.doesNotMatch(
-  echoChamberPanelSource,
-  /onPointerCancel=\{handleResizeEnd\}/u,
-  "pointer cancellation must not persist an incomplete Echo Chamber resize",
+  /const minimized = savedLayout\?\.minimized \?\? !echoChamberOpen/u,
+  "a saved Echo Chamber close should take precedence over the old global open preference",
 );
 assert.match(
   uiStoreSource,
   /echoChamberSizeByChatId: state\.echoChamberSizeByChatId/u,
   "per-chat Echo Chamber dimensions should survive UI-store rehydration",
 );
+assert.equal(normalizeConversationBackgroundImageOpacity(-10), 0);
+assert.equal(normalizeConversationBackgroundImageOpacity(140), 100);
+assert.equal(normalizeConversationBackgroundImageOpacity("invalid"), 45);
 assert.match(
   uiStoreSource,
   /previous\.echoChamberSizes !== next\.echoChamberSizes/u,
@@ -1102,8 +1104,8 @@ assert.match(
 );
 assert.match(
   firefoxSupportsSource,
-  /(?:^|\})\s*\[data-chat-mode="roleplay"\] \.marinara-chat-input-shell\s*\{[^{}]*background:\s*linear-gradient\(var\(--card\), var\(--card\)\),\s*var\(--background\) !important;[^{}]*\}/u,
-  "Firefox should use an opaque Roleplay composer surface after disabling backdrop blur",
+  /(?:^|\})\s*\[data-chat-mode="roleplay"\] \.marinara-chat-input-shell\s*\{[^{}]*--mari-chat-existing-bg:\s*linear-gradient\(var\(--card\), var\(--card\)\),\s*var\(--background\);[^{}]*background:\s*var\(--mari-chat-surface-paint,\s*var\(--mari-chat-existing-bg\)\) !important;[^{}]*\}/u,
+  "Firefox should retain the opaque Roleplay composer fallback while allowing the selected chat surface paint",
 );
 assert.doesNotMatch(
   chatInputSource,
@@ -1533,6 +1535,23 @@ assert.equal(merged.length, 2, "the three built-in rewrite agents should share o
 assert.match(merged[0]!.name, /prose-guardian.*continuity.*html/u);
 assert.equal(getAgentBatchLane(merged[0]!), "rewrite");
 assert.equal(getAgentBatchLane(trackerAgent), "standard");
+// #6977: a rewrite agent with sharing turned off keeps its own editor request.
+const soloContinuity = {
+  ...rewriteAgents[1]!,
+  settings: { ...rewriteAgents[1]!.settings, batchWithOtherAgents: false },
+};
+const partlyMerged = mergePairedBuiltInRewriteAgents([
+  rewriteAgents[0]!,
+  soloContinuity,
+  rewriteAgents[2]!,
+  trackerAgent,
+]);
+assert.deepEqual(
+  partlyMerged.map((agent) => agent.name),
+  ["prose-guardian + html", "continuity", "world-state"],
+  "a rewrite agent that may not share runs on its own beside the merged editor",
+);
+assert.doesNotMatch(partlyMerged[0]!.promptTemplate, /continuity prompt/u, "the merged editor leaves out its tasks");
 assert.equal(
   estimateAgentLoadCost(
     [
@@ -1555,6 +1574,20 @@ assert.equal(
   ).extraCalls,
   2,
   "rewrite editors should count as one call separate from the tracker call",
+);
+assert.equal(
+  estimateAgentLoadCost(
+    ["notes-a", "notes-b", "notes-solo"].map((type) => ({
+      type,
+      phase: "post_processing" as const,
+      connectionId: "connection-1",
+      promptTemplate: `${type} prompt`,
+      ownRequest: type === "notes-solo",
+    })),
+    null,
+  ).extraCalls,
+  2,
+  "#6977: an agent with its own request counts as a call of its own",
 );
 
 class CountingTrackerBatchProvider extends BaseLLMProvider {

@@ -531,6 +531,8 @@ Please restart your computer and run this installer again."
     nsExec::ExecToStack 'git rev-parse HEAD'
     Pop $0
     Pop $2
+    ; ExecToStack keeps git's trailing newline, so the untrimmed HEAD never equaled the trimmed release commit (#6984).
+    ${StrTrimNewLines} $2 "$2"
     ${If} $2 != "$3"
       ${If} $5 == "1"
         nsExec::ExecToLog 'git stash apply -q'

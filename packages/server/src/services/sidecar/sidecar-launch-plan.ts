@@ -17,6 +17,7 @@ export function buildLlamaArgs(options: {
   embeddingPooling: string;
   embeddingBatchSize: number;
   maxParallelJobs: number;
+  kvCacheType?: "f16" | "q8_0" | "q4_0";
 }): string[] {
   // llama-server divides --ctx-size across --parallel slots; Marinara's setting is the per-request budget.
   const totalContextSize = options.contextSize * options.maxParallelJobs;
@@ -38,7 +39,20 @@ export function buildLlamaArgs(options: {
     args.push("--jinja");
   }
 
-  args.push("--embeddings", "--pooling", options.embeddingPooling, "--ubatch-size", String(options.embeddingBatchSize));
+  if (options.kvCacheType && options.kvCacheType !== "f16") {
+    args.push("--cache-type-k", options.kvCacheType, "--cache-type-v", options.kvCacheType, "--flash-attn", "on");
+  }
+
+  // llama.cpp caps the physical batch at the logical batch (2048 by default).
+  args.push(
+    "--embeddings",
+    "--pooling",
+    options.embeddingPooling,
+    "--batch-size",
+    String(Math.max(2048, options.embeddingBatchSize)),
+    "--ubatch-size",
+    String(options.embeddingBatchSize),
+  );
 
   // Gemma 4 needs split mode disabled on CUDA multi-GPU launches,
   // but non-CUDA builds may reject the flag entirely.

@@ -74,7 +74,7 @@ assert.deepEqual(
   }),
   {
     temperature: 0.42,
-    enabledParameters: { temperature: true, topP: false, reasoningEffort: false },
+    enabledParameters: { temperature: true, topP: false, reasoningEffort: false, maxTokens: true },
   },
 );
 assert.deepEqual(
@@ -82,7 +82,7 @@ assert.deepEqual(
     enabledParameters: { temperature: true, topP: false, reasoningEffort: false },
   }),
   {
-    enabledParameters: { temperature: false, topP: false, reasoningEffort: false },
+    enabledParameters: { temperature: false, topP: false, reasoningEffort: false, maxTokens: true },
   },
 );
 
@@ -151,7 +151,7 @@ assert.match(
 );
 
 const summaryPopoverSource = await readFile(
-  new URL("../../packages/client/src/components/chat/SummaryPopover.tsx", import.meta.url),
+  new URL("../../packages/client/src/components/chat/ChatSummaryPanel.tsx", import.meta.url),
   "utf8",
 );
 assert.match(
@@ -167,8 +167,8 @@ assert.match(
 );
 assert.match(
   summaryPopoverSource,
-  /grid-cols-1 gap-1\.5 sm:grid-cols-2/u,
-  "Batch ranges should use one column on mobile and two on desktop",
+  /max-h-\[min\(16rem,30dvh\)\] overflow-y-auto pr-1">\s*<div className="space-y-1\.5">/u,
+  "Batch ranges should stack as full-width rows on every screen so five-digit message numbers fit",
 );
 assert.match(
   summaryPopoverSource,
@@ -187,8 +187,8 @@ assert.match(
 );
 assert.match(
   summaryPopoverSource,
-  /w-\[4\.5rem\][\s\S]*?aria-label=.*batchRangeFrom/u,
-  "Range inputs should fit four digits",
+  /w-\[5\.5rem\][\s\S]*?aria-label=.*batchRangeFrom/u,
+  "Range inputs should fit five-digit message numbers",
 );
 assert.match(summaryPopoverSource, /<span[^>]*>\s*-\s*<\/span>/u, "Range inputs should show a separator");
 assert.match(
@@ -206,13 +206,13 @@ assert.match(summaryPopoverSource, /chat\.summary\.source\.batchRanges/u);
 assert.match(summaryPopoverSource, /chat\.summary\.source\.batchMessages/u);
 assert.match(
   summaryPopoverSource,
-  /grid-cols-\[1\.25rem_4\.5rem_minmax\(0,1fr\)_4\.5rem_1rem_1rem\].*?gap-0\.5/u,
-  "Range controls should keep the number left and the separator centered within the card",
+  /flex min-w-0 items-center gap-1 @sm:gap-2[\s\S]*?<label className="mr-auto min-w-0/u,
+  "Range controls should sit in one row with the number on the left and the status and remove controls at the end",
 );
 assert.match(
   summaryPopoverSource,
-  /range\.status === "pending" \|\| range\.status === "cancelled"[\s\S]*?h-4 w-4[\s\S]*?<button/u,
-  "Pending ranges should reserve the status column so the remove button stays inside the card",
+  /<div className="flex w-4 shrink-0 justify-center">\s*\{range\.status === "success"[\s\S]*?handleRemoveBatchRange/u,
+  "Every range should reserve the status slot so a status icon never narrows its fields",
 );
 assert.match(
   summaryPopoverSource,
@@ -231,8 +231,8 @@ assert.match(
 );
 assert.match(
   summaryPopoverSource,
-  /if \(batchRun !== null \|\| batchAbortControllerRef\.current\)[\s\S]*?batchAbortControllerRef\.current\?\.abort\(\)[\s\S]*?onClose\(\)/u,
-  "Closing during a batch should abort and discard active work",
+  /useEffect\(\s*\(\) => \(\) => \{\s*batchRunTokenRef\.current \+= 1;\s*batchAbortControllerRef\.current\?\.abort\(\);/u,
+  "Collapsing the drawer or closing Chat Settings during a batch should abort and discard active work",
 );
 assert.match(
   chatsRouteSource,

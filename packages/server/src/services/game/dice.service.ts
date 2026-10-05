@@ -71,8 +71,10 @@ export function parseRollDiceToolResult(raw: string): DiceRollResult | null {
   if (!rolls.every((roll): roll is number => typeof roll === "number" && Number.isFinite(roll))) return null;
   if (typeof total !== "number" || !Number.isFinite(total)) return null;
   if (!Number.isFinite(modifier)) return null;
+  const dc = payload.dc;
+  if (dc !== undefined && (typeof dc !== "number" || !Number.isSafeInteger(dc))) return null;
 
-  return { notation, rolls, modifier, total };
+  return { notation, rolls, modifier, total, ...(dc !== undefined ? { dc } : {}) };
 }
 
 /** Fresh regex so callers can collect or remove the same narration roll records. */
@@ -126,6 +128,10 @@ export function resolveGameDiceRequests(
   knownRolls: readonly DiceRollResult[] = [],
   roll: (notation: string) => DiceRollResult = rollDice,
   pool?: GameDicePoolSession,
+  /** The game pins a ruleset, whose checks are its own resolver's alone: rolled already, or left as
+   *  asks on purpose. A record it wrote with its own dice (2d6, a pool) is not a request, so no check
+   *  tag is read here, and rolling one again would lose the sheet it was rolled with. */
+  rulesetChecks = false,
 ): {
   content: string;
   diceRolls: DiceRollResult[];
@@ -138,7 +144,9 @@ export function resolveGameDiceRequests(
   let rolled = 0;
   const unresolved: string[] = [];
   const reportUnresolved = (request: string, reason: string) => {
-    logger.warn({ request: request.slice(0, 200) }, "[game/dice] Unresolved roll request: %s", reason);
+    // The request is model text: its length at warn, the text itself at debug.
+    logger.warn({ requestLength: request.length }, "[game/dice] Unresolved roll request: %s", reason);
+    logger.debug({ request: request.slice(0, 200) }, "[game/dice] Unresolved roll request text");
     if (unresolved.length < 8) unresolved.push(`${request.slice(0, 200)}: ${reason}`);
   };
   let poolTagIndex = 0;
@@ -177,6 +185,7 @@ export function resolveGameDiceRequests(
       return serializeDiceRecord(result);
     }
 
+    if (rulesetChecks) return original;
     const tag = parseSkillCheckTagBody(body);
     // Standard d20 checks keep their existing character-sheet modifier path.
     if (!tag || tag.skill.length > 100 || isEngineRollableSkillCheckTag(tag) || tag.advantage || tag.disadvantage)
@@ -191,6 +200,7 @@ export function resolveGameDiceRequests(
     if (
       !notation ||
       (resolution !== "sum" && resolution !== "successes") ||
+      tag.dc === undefined ||
       !Number.isSafeInteger(tag.dc) ||
       tag.dc < 1
     )
@@ -279,16 +289,16 @@ export function resolveGameDiceRequests(
       rollMode: "normal",
       resolution,
       dice: dice.dice,
+      // The threshold this path counted with rides on the result itself now, so the dice card can
+      // mark the dice that counted and the serializer writes `threshold=` from one place.
+      ...(resolution === "successes" ? { threshold } : {}),
     };
     checkResults.push(check);
     if (pool && poolResult) logPoolDcFit(pool, boundedDc, check.usedRoll, check.modifier);
     // `threshold=` is written by the serializer now rather than spliced onto a finished
     // tag by this caller, so the two spellings of the same attribute cannot drift. The
     // bytes are the ones this path has always written.
-    return serializeResolvedSkillCheckTag(check, {
-      ...(resolution === "successes" ? { threshold } : {}),
-      ...(poolName ? { pool: poolName } : {}),
-    });
+    return serializeResolvedSkillCheckTag(check, { ...(poolName ? { pool: poolName } : {}) });
   });
   return { content: resolved, diceRolls, checkResults, rolled, unresolved };
 }

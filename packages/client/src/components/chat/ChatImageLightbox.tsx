@@ -1,19 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useBackdropDismiss } from "../../hooks/use-backdrop-dismiss";
 import { Download, Pin, X } from "lucide-react";
 import type { GeneratedSceneVideo } from "@marinara-engine/shared";
 import type { ChatImage } from "../../hooks/use-gallery";
 import { useGalleryStore } from "../../stores/gallery.store";
-import {
-  downloadUrlToDevice,
-  prepareImageSave,
-  savePreparedImageToDevice,
-  shouldUseIosImageShare,
-  type PreparedImageSave,
-} from "../../lib/file-download";
+import { ImageDownloadButton } from "../ui/ImageDownloadButton";
 import { ImagePromptPanel } from "./ImagePromptPanel";
 import { useTranslation as useUiTranslation } from "react-i18next";
-import { toast } from "sonner";
 
 export function formatChatImageMeta(image: Pick<ChatImage, "model" | "provider" | "width" | "height">) {
   const details: string[] = [];
@@ -66,44 +60,16 @@ export function ChatImageLightbox({
   onClose,
 }: ChatImageLightboxProps) {
   const { t: localizeUi } = useUiTranslation();
+  const backdropDismiss = useBackdropDismiss(onClose);
   const pinImage = useGalleryStore((s) => s.pinImage);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const portalRoot = typeof document !== "undefined" ? document.body : null;
   const prompt = image.prompt.trim();
   const meta = formatChatImageMeta(image);
   const downloadName = getChatImageDownloadName(image);
-  const useIosShare = shouldUseIosImageShare();
-  const [preparedImage, setPreparedImage] = useState<PreparedImageSave | null>(null);
-  const currentPreparedImage =
-    preparedImage?.url === image.url && preparedImage.filename === downloadName ? preparedImage : null;
-
-  const handleDownload = () => {
-    const save = useIosShare
-      ? currentPreparedImage
-        ? savePreparedImageToDevice(currentPreparedImage)
-        : Promise.resolve()
-      : downloadUrlToDevice(image.url, downloadName);
-    void save.catch(() => toast.error(localizeUi("ui.chat.chatgallery.downloadFailed")));
-  };
-
   useEffect(() => {
     closeButtonRef.current?.focus();
   }, []);
-
-  useEffect(() => {
-    if (!downloadEnabled || !useIosShare) return;
-    let active = true;
-    void prepareImageSave(image.url, downloadName)
-      .then((prepared) => {
-        if (active) setPreparedImage(prepared);
-      })
-      .catch(() => {
-        if (active) toast.error(localizeUi("ui.chat.chatgallery.downloadFailed"));
-      });
-    return () => {
-      active = false;
-    };
-  }, [downloadEnabled, downloadName, image.url, localizeUi, useIosShare]);
 
   if (!portalRoot) return null;
 
@@ -115,9 +81,7 @@ export function ChatImageLightbox({
       aria-modal="true"
       aria-label={localizeUi("ui.chat.chatimagelightbox.imagePreview")}
       tabIndex={-1}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.stopPropagation();
@@ -159,17 +123,7 @@ export function ChatImageLightbox({
                 <Pin size="0.875rem" />
               </button>
             )}
-            {downloadEnabled && (
-              <button
-                type="button"
-                onClick={handleDownload}
-                disabled={useIosShare && !currentPreparedImage}
-                aria-label={localizeUi("ui.chat.chatgallery.downloadImage")}
-                className="rounded-lg bg-black/60 p-2 text-white transition-colors hover:bg-black/80 disabled:opacity-50"
-              >
-                <Download size="0.875rem" />
-              </button>
-            )}
+            {downloadEnabled && <ImageDownloadButton url={image.url} filename={downloadName} />}
             <button
               type="button"
               ref={closeButtonRef}
@@ -204,6 +158,7 @@ export function ChatVideoLightbox({
   onClose,
 }: ChatVideoLightboxProps) {
   const { t: localizeUi } = useUiTranslation();
+  const backdropDismiss = useBackdropDismiss(onClose);
   const pinVideo = useGalleryStore((s) => s.pinVideo);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const portalRoot = typeof document !== "undefined" ? document.body : null;
@@ -224,9 +179,7 @@ export function ChatVideoLightbox({
       aria-modal="true"
       aria-label={localizeUi("ui.chat.chatvideolightbox.videoPreview")}
       tabIndex={-1}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.stopPropagation();

@@ -182,6 +182,7 @@ const SHARDED_TABLES = [
   "lorebook_persona_links",
   "lorebook_folders",
   "lorebook_entries",
+  "lorebook_entry_activation_stats",
   "prompt_presets",
   "prompt_groups",
   "prompt_sections",
@@ -201,6 +202,7 @@ const SHARDED_TABLES = [
   "game_turn_storyboards",
   "game_turn_storyboard_keyframes",
   "game_dice_pools",
+  "game_rulesets",
   "regex_scripts",
   "chat_images",
   "character_images",
@@ -211,6 +213,7 @@ const SHARDED_TABLES = [
   "custom_stickers",
   "ooc_influences",
   "conversation_notes",
+  "message_trash",
   "memory_chunks",
   "advanced_memory_records",
   "chat_folders",
@@ -225,7 +228,11 @@ const SHARDED_TABLES = [
   "mari_instructions",
   "mari_workspace_context",
 ];
-const PRIMARY_KEY_COLUMNS = { app_settings: "key", prompt_overrides: "key" };
+const PRIMARY_KEY_COLUMNS = {
+  lorebook_entry_activation_stats: "entryId",
+  app_settings: "key",
+  prompt_overrides: "key",
+};
 const UNSHARD_SENTINEL = ".unshard-in-progress";
 
 async function pathExists(path) {
@@ -532,6 +539,7 @@ export async function snapshotLauncherData({
   const incompleteDir = resolve(backupRoot, `.incomplete-${backupName}`);
   const backupDir = resolve(backupRoot, backupName);
   const capabilityRuntimeLink = resolve(dataDir, "capability-packages", "node_modules");
+  const capabilityRuntimeSnapshots = resolve(dataDir, "capability-runtime-snapshots");
   const downloadableDataDirs = ["models", "sidecar-runtime"].map((name) => resolve(dataDir, name));
   // The storage writer lease is per-process runtime state (owner record plus the
   // live.sock liveness socket, #5389). A snapshot taken while the previous server
@@ -549,7 +557,11 @@ export async function snapshotLauncherData({
       errorOnExist: true,
       filter: async (source) => {
         const sourcePath = resolve(source);
-        if (sourcePath === capabilityRuntimeLink || sourcePath === writerLeaseDir) return false;
+        if (
+          sourcePath === capabilityRuntimeLink ||
+          sourcePath === capabilityRuntimeSnapshots ||
+          sourcePath === writerLeaseDir
+        ) return false;
         if (
           !downloadableDataDirs.every(
             (downloadableDir) => sourcePath !== downloadableDir && !sourcePath.startsWith(`${downloadableDir}${sep}`),

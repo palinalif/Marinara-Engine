@@ -89,6 +89,8 @@ export const RESERVED_GM_TAG_NAMES = Object.freeze([
   "element_attack",
   "extra",
   "inventory",
+  "item_used",
+  "loot",
   "main",
   "map_update",
   "music",
@@ -98,6 +100,7 @@ export const RESERVED_GM_TAG_NAMES = Object.freeze([
   "party-turn",
   "party_add",
   "party_change",
+  "place",
   "qte",
   "qte_bonus",
   "qte_result",
@@ -105,6 +108,7 @@ export const RESERVED_GM_TAG_NAMES = Object.freeze([
   "roll",
   "session_end",
   "sfx",
+  "sheet",
   "side",
   "skill_check",
   "state",
@@ -182,6 +186,7 @@ export const ENGINE_OWNED_METADATA_KEY_PREFIXES = Object.freeze([
   "cross",
   "custom",
   "day",
+  "decision",
   "discord",
   "dm",
   "embedding",
@@ -213,6 +218,7 @@ export const ENGINE_OWNED_METADATA_KEY_PREFIXES = Object.freeze([
   "manual",
   "mari",
   "metadata",
+  "multiplayer",
   "narrative",
   "noodle",
   "past",
@@ -240,6 +246,7 @@ export const ENGINE_OWNED_METADATA_KEY_PREFIXES = Object.freeze([
   "translate",
   "translation",
   "week",
+  "window",
 ] as const);
 
 /** The package id as it appears at the head of a metadata key: `hierarchical-maps` →

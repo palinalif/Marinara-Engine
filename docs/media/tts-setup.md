@@ -10,6 +10,14 @@ The app sends TTS requests through its own server. Your provider API key is stor
 
 Turning TTS on does not make anything speak by itself. It only reveals the **Speak** button on each message and the **Auto-play** options. You still choose what gets read and when.
 
+### Use a saved Audio connection
+
+The expanded **Text to Speech** card contains the existing **Audio** default and fallback selectors (moved here from **Defaults**). Choose a saved Audio connection: the default is preferred, or the fallback is used when no default is selected. This is the existing shared Audio category selection, not a separate TTS-only connection setting; Game setups with an explicit Audio connection keep their override.
+
+With a connection selected, the card loads that backend's voices, saves the default voice to that connection only, and previews through that exact connection without saving legacy provider settings. **Manage custom voices** opens its connection-scoped manager directly here; the connection editor entry remains available. Non-OpenAI sources show an explanation instead. Merely selecting a connection or opening the manager does not register a voice or opt into a custom-voice profile. Switching connections closes the manager and stops its preview.
+
+With neither a default nor fallback selected, the existing legacy provider controls remain available below; the rest of this guide describes those controls. Your legacy settings and per-character voice assignments are preserved. Existing voice IDs are not converted between backends and may be unsupported on a newly selected provider. The selected-connection **Preview** tests its default voice, not the saved per-character assignments.
+
 ## Step 1: Enable TTS and pick a Source
 
 1. Open the **Connections** panel and expand the **Text to Speech** card.
@@ -73,7 +81,9 @@ For **ElevenLabs**, you must pick a voice. Marinara loads the paginated account 
 4. Pick a character in the left dropdown and a voice in the right dropdown.
 5. Repeat for each character you want to give a custom voice.
 
-The **Refresh** button in the Character Voices box reloads the same provider library without switching back to the one-voice mode. You must create your characters first. If you have none yet, the app tells you to add characters in the Characters tab before assigning voices. Characters without a personal voice fall back to the global voice. See [Creating and Editing Characters](../characters/creating-and-editing-characters.md).
+You can also pick a character's voice in the **Character Editor**, on its **Voice** tab. It changes the same row, so both places always show the same voice.
+
+The **Refresh** button in the Character Voices box reloads the same provider library without switching back to the one-voice mode. You must create your characters first. If you have none yet, the app tells you to add characters in the Characters tab before assigning voices. A character without a personal voice uses one set for a card with a matching name, such as the original of an AU copy. Otherwise it falls back to the global voice. See [Creating and Editing Characters](../characters/creating-and-editing-characters.md).
 
 ## Narrator Voice
 
@@ -150,11 +160,11 @@ The same TTS setup serves every mode, with a few per-mode extras:
 
 - Roleplay uses the **Roleplay messages** auto-play toggle and the per-message **Speak** controls. See [Roleplay Mode: Getting Started](../roleplay/getting-started.md).
 - Conversation Mode uses the **Conversation messages** toggle and the same **Speak** controls. Spoken audio calls are a larger feature covered in [Conversation Audio and Video Calls](../conversation/calls.md).
-- Game Mode uses the **Game narration** toggle. Game Mode also has its own audio mixer with a **TTS** channel next to **Master**, **Music**, **Sound Effects**, and **Ambient**. That channel sets the overall volume of spoken game audio and starts at 100 percent. See [Game Mode: Getting Started](../game/getting-started.md).
+- Game Mode uses the **Game narration** toggle. Game Mode also has its own audio mixer with a **TTS** channel next to **Master**, **Music**, **Sound Effects**, and **Ambient**. That channel sets the overall volume of spoken game audio and starts at 100 percent. See [The Game's controls](../game/getting-started.md#the-games-controls).
 
 ## Phonetic name (pronunciation in calls)
 
-If a character or persona name is spelled in a way the voice mispronounces, you can add a **Phonetic name**. In the **Character Editor**, the field sits next to the character's **Name** field. In the **Persona Editor**, it sits with the other basic info fields. Type how the name should sound.
+If a character or persona name is spelled in a way the voice mispronounces, you can add a **Phonetic name**. In the **Character Editor**, the field is on the **Voice** tab. In the **Persona Editor**, it sits with the other basic info fields. Type how the name should sound.
 
 This override is used only during Conversation audio and video calls. The regular per-message **Speak** button, chat auto-play, and Game Mode narration do not read this field.
 
@@ -165,6 +175,27 @@ This override is used only during Conversation audio and video calls. The regula
 - ElevenLabs will not speak: make sure you selected a real voice, not the "Select an ElevenLabs voice" placeholder. Also check that the **Model** is a speech model, not a voice-design model whose ID contains `ttv`.
 - A self-hosted TTS server on a local address is blocked: turn on the server setting `TTS_LOCAL_URLS_ENABLED`. It lets the app reach a local or private address for OpenAI-compatible or ElevenLabs-style servers. PocketTTS does not need this setting. See [Server Configuration Reference](../CONFIGURATION.md).
 - Test your setup fast: click the **Preview** button in the card to play a short sample line with your current settings.
+
+## Custom voices (optional API profiles)
+
+Some OpenAI-compatible endpoints can **register new voices from a short recording** using the generic `openai-compatible` or `vllm-omni` custom-voice profile. Marinara manages these per audio connection through a **Manage custom voices** dialog, opened directly from **Connections → Text to Speech** after selecting a saved Audio connection, or from the connection editor. The dialog is available only for audio connections that use the **OpenAI-compatible** source; other sources show a short explanation of why custom voices are not available.
+
+- **The profile is explicit, not model-name-based.** Registration is gated by an opt-in **custom-voice profile** stored with the connection (`openai-compatible` or `vllm-omni`), not by the provider name or the configured model name. A bare OpenAI-compatible endpoint starts in an _unknown_ state: select a profile matching your server to unlock the upload form. Enabling a profile declares the protocol; it does not prove the server supports registration. Missing voice-management endpoints surface a capability error without disabling ordinary speech. This keeps the feature opt-in and avoids guessing from a model string.
+- **Uploads are validated locally and on the server.** The manager accepts **16-bit WAV PCM** — 1 to 2 channels, 8,000–48,000 Hz, up to 10 MiB and up to 120 seconds. Each upload requires a **display name** and a permission acknowledgement; the acknowledgement does not verify consent. The `vllm-omni` profile additionally requires a **provider-issued consent recording ID** (never fabricated by the app) and accepts a transcript of up to 10,000 characters. The generic profile sends only `name` and `audio_sample` as multipart fields to `/audio/voices`, without a consent ID or transcript. Marinara does not retain the recording or these sensitive fields.
+- **Audio is backend-owned.** Marinara retains connection-bound management metadata (identifier, display name and status), not the recording, transcript or consent ID. Personal settings/backups may preserve assigned provider IDs, but exclude the separate management records and backend-held audio. Ordinary character/chat/package sharing does not gain custom voice metadata or recordings. Explicit, backend-confirmed deletion clears only matching assignments on that connection, including saved per-source voice selections; unassigning or deleting a character does not delete provider storage. If the backend confirms deletion but local cleanup fails, the manager keeps a deleted record: refresh, review the remaining references and confirm deletion again to retry local cleanup without another backend delete. Keep the supported API profile selected for deletion.
+- **The in-app “Test” is explicit synthesis, not acoustic verification.** Enter a test line and press **Test** to synthesize through the same saved connection and selected identifier. A successful fake-backend test proves wiring, not cloning quality. Real-backend acoustic validation has **NOT RUN** for this change.
+- **Manual acoustic check (requires separate authorization):** use a disposable instance, a permitted recording and a non-production backend whose loaded model supports registration. Confirm the destination and profile, preview the WAV locally without network activity, supply genuine provider consent and any required transcript for the vLLM profile (neither is sent for the generic profile), then explicitly register. Verify the intended identifier through provider listing, close/reopen and assign through the existing picker. Explicitly synthesize and listen for matching identity, intelligibility, noise and clipping; record backend/model versions. Verify stale-connection refusal, response-loss reconciliation and confirmed deletion of only matching references. Check sharing exports exclude sensitive voice data. Do not use production recordings/accounts or treat HTTP success as an acoustic pass.
+- **Concurrent edits are isolated.** The manager works against a snapshot of the connection and saved custom-voice profile revision. If either changed behind the scenes (even if the profile was switched back), a mutation is rejected as a stale-snapshot conflict and the manager asks you to refresh rather than silently using an outdated confirmation. Saving a different profile, or refreshing a changed snapshot, clears outstanding permission and deletion confirmations.
+
+### Generic OpenAI-compatible server (including VoxCPM2)
+
+1. Save an **Audio** connection using the **OpenAI-compatible** source, base URL `http://<server>:3042/v1`, and model `voxcpm` (or the model your wrapper accepts). Use an address reachable by Marinara's server; container-local `127.0.0.1` is usually not the host. For a private/local address, the server administrator must set `TTS_LOCAL_URLS_ENABLED=true` in Marinara's runtime `.env` file. The connection's **Treat as local/custom endpoint** switch does not grant this permission, and `PROVIDER_LOCAL_URLS_ENABLED` alone is not enough. **OpenAI-compatible** describes the API format, not the company hosting your server; it includes VoxCPM2 and other compatible backends. Set **Audio Format** to **WAV** for ordinary playback too: this wrapper supports WAV/PCM, not Marinara's default MP3.
+2. Select the connection under **Connections → Text to Speech**. **Refresh** enumerates `GET /v1/audio/voices` list responses (`data` entries with `id` and `name`); existing IDs can be selected through the character voice picker without enrollment.
+3. Open **Manage custom voices**, select **OpenAI-compatible (name + audio sample)**, and save the profile. Preview a permitted PCM16 WAV locally, supply its display name, acknowledge permission and explicitly upload.
+4. Marinara sends `POST /v1/audio/voices` with a generated `marinara_…` identifier as `name` and the clip as `audio_sample`. The display name remains local. The matching provider response/list confirms the resulting ID; select it in the existing character voice picker. **Test** uses the same connection's `/v1/audio/speech`, passing the ID as a string and requesting WAV, avoiding raw-PCM sample-rate assumptions.
+5. To replace a managed clone, explicitly confirm deletion and its affected assignments, then enroll the new clip and reassign the new ID. Marinara never sends `overwrite=true`. Existing provider voices remain selectable but are not adopted for deletion; only voices enrolled by Marinara can be deleted here.
+
+The generic profile expects `{ object: "list", data: [{ id, object: "audio.voice", name }] }` for listing and `{ id, object: "audio.voice", name, created: true }` for enrollment. The returned ID may differ from the submitted name. An uncertain response keeps the journaled registration name for refresh/recovery instead of blindly uploading again; only an unambiguous matching provider entry can confirm it. The provisional registration name is not proof of ownership of a provider ID: deletion is blocked until the actual identity is confirmed. There is no automatic character-clip import, in-place replacement, or cloning via `/audio/clone`; this flow reuses the existing upload manager and character voice-ID assignment.
 
 ## Related guides
 

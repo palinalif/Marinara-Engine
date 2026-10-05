@@ -21,10 +21,19 @@ interface ContextMenuProps {
   onClose: () => void;
   /** Visual treatment for destructive items. Defaults to the semantic destructive color. */
   destructiveTone?: "destructive" | "accent";
+  /** Opened from the keyboard: focus the first item, and return focus when the menu closes. */
+  autoFocus?: boolean;
 }
 
 /** Right-click menu anchored at (x, y). Auto-flips when it would clip the viewport. */
-export function ContextMenu({ x, y, items, onClose, destructiveTone = "destructive" }: ContextMenuProps) {
+export function ContextMenu({
+  x,
+  y,
+  items,
+  onClose,
+  destructiveTone = "destructive",
+  autoFocus = false,
+}: ContextMenuProps) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState({ left: x, top: y });
 
@@ -42,6 +51,14 @@ export function ContextMenu({ x, y, items, onClose, destructiveTone = "destructi
     setPos({ left, top });
   }, [x, y]);
 
+  // Keyboard users land inside the menu, and return to where they were when it closes.
+  useEffect(() => {
+    if (!autoFocus) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    ref.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus({ preventScroll: true });
+    return () => previous?.focus({ preventScroll: true });
+  }, [autoFocus]);
+
   // Close on outside click, Escape, scroll, or window resize.
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
@@ -50,17 +67,21 @@ export function ContextMenu({ x, y, items, onClose, destructiveTone = "destructi
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
+    // A long menu scrolls itself; only scrolling the page behind it closes it.
+    const onScroll = (e: Event) => {
+      if (!ref.current?.contains(e.target as Node)) onClose();
+    };
     const raf = requestAnimationFrame(() => {
       document.addEventListener("mousedown", onDown);
       document.addEventListener("keydown", onKey);
-      window.addEventListener("scroll", onClose, true);
+      window.addEventListener("scroll", onScroll, true);
       window.addEventListener("resize", onClose);
     });
     return () => {
       cancelAnimationFrame(raf);
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
-      window.removeEventListener("scroll", onClose, true);
+      window.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onClose);
     };
   }, [onClose]);
@@ -70,7 +91,7 @@ export function ContextMenu({ x, y, items, onClose, destructiveTone = "destructi
       ref={ref}
       role="menu"
       style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 9999 }}
-      className="min-w-[12rem] rounded-lg border border-[var(--border)] bg-[var(--card)] py-1 shadow-xl animate-fade-in-up"
+      className="max-h-[calc(100dvh-0.5rem)] min-w-[12rem] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--card)] py-1 shadow-xl animate-fade-in-up"
       onContextMenu={(e) => e.preventDefault()}
     >
       {items.map((item, i) => (
@@ -85,7 +106,7 @@ export function ContextMenu({ x, y, items, onClose, destructiveTone = "destructi
             onClose();
           }}
           className={cn(
-            "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors",
+            "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors outline-none focus-visible:bg-[var(--accent)]",
             item.disabled
               ? "cursor-not-allowed text-[var(--muted-foreground)] opacity-50"
               : item.destructive

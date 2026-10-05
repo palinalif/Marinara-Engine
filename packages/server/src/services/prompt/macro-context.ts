@@ -7,19 +7,27 @@
 
 import {
   CHARACTER_REFERENCE_ID_PATTERN,
+  DEFERRED_RELOCATION_CONDITIONAL_TOKEN_RE,
+  hasDeferredRelocationConditionals,
+  parseDeferredConditionalPayload,
+  selectConditionalPayloadBranch,
+  CHAT_VARIABLE_STORED_NAME_RE,
+  MAX_CHAT_VARIABLES,
   PERSONA_REFERENCE_ID_PATTERN,
   formatRpgStatsForPrompt,
   resolveMacros,
   stripMacroComments,
+  usesLorebookIncludes,
   type CharacterMacroProfile,
   type CharacterData,
+  type LorebookIncludeSource,
   type MacroContext,
   type RPGStatsConfig,
   type ResolveMacroOptions,
   type WrapFormat,
 } from "@marinara-engine/shared";
 import type { DB } from "../../db/connection.js";
-import { processLorebooks, type LorebookScanResult } from "../lorebook/index.js";
+import { loadLorebookIncludes, processLorebooks, type LorebookScanResult } from "../lorebook/index.js";
 import { createCharactersStorage, type PersonaStorageRow } from "../storage/characters.storage.js";
 import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
 import { wrapContent } from "./format-engine.js";
@@ -48,6 +56,11 @@ export interface BuildPromptMacroContextInput {
   timeZone?: string;
   /** Extra prompt templates that may contain macros outside card/persona fields. */
   macroSources?: readonly string[];
+  /**
+   * Name the `{{<card ID>}}` macros found in these sources. For prompts the preset
+   * assembler does not build: it names them itself, as it pulls their cards in (#6956).
+   */
+  nameCharacterReferences?: boolean;
 }
 
 export interface CharacterMacroData {
@@ -86,11 +99,74 @@ export function normalizeChatMacroVariables(value: unknown): Record<string, stri
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const entries: Array<[string, string]> = [];
   for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (!/^[\w.-]+$/u.test(name) || typeof entry !== "string") continue;
+    if (!CHAT_VARIABLE_STORED_NAME_RE.test(name) || typeof entry !== "string") continue;
     entries.push([name, entry]);
-    if (entries.length >= 500) break;
+    if (entries.length >= MAX_CHAT_VARIABLES) break;
   }
   return Object.fromEntries(entries);
+}
+
+/** Persist generation writes only while the saved value still matches its starting snapshot. */
+export function mergeGeneratedChatMacroVariables(
+  current: unknown,
+  previous: Record<string, string>,
+  generated: Record<string, string>,
+): Record<string, string> {
+  const merged = normalizeChatMacroVariables(current);
+  for (const [name, value] of Object.entries(generated)) {
+    const before = Object.hasOwn(previous, name) ? previous[name] : undefined;
+    const saved = Object.hasOwn(merged, name) ? merged[name] : undefined;
+    // A newer editor change (including removal/rename) wins over this request.
+    if (value !== before && saved === before) {
+      Object.defineProperty(merged, name, { value, enumerable: true, writable: true, configurable: true });
+    }
+  }
+  // A regeneration starts by undoing its reply, which removes what that reply created.
+  for (const [name, before] of Object.entries(previous)) {
+    if (!Object.hasOwn(generated, name) && Object.hasOwn(merged, name) && merged[name] === before) delete merged[name];
+  }
+  return normalizeChatMacroVariables(merged);
+}
+
+/**
+ * Names a preset defines through its stored variable values.
+ *
+ * Only the names matter to callers that need to know which names a preset owns
+ * before the assembler has resolved their values.
+ */
+export function parsePresetVariableNames(rawVariableValues: unknown): string[] {
+  if (typeof rawVariableValues !== "string" || !rawVariableValues.trim()) return [];
+  try {
+    const parsed: unknown = JSON.parse(rawVariableValues);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    return Object.keys(parsed as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Evaluate `{{#if}}` blocks that were deferred because a preset owned their
+ * operand, now that the assembler has merged the real values in.
+ *
+ * Deferral keeps a conditional from being decided off the chat's value while the
+ * preset's is still pending; this is the other half of it. Uses the same token
+ * as the conversation relocation deferral, which never overlaps: preset
+ * variables do not apply in Conversation mode. Mutates the messages in place.
+ */
+export function decodeDeferredPresetConditionals(messages: Array<{ content: string }>, macroCtx: MacroContext): void {
+  for (const message of messages) {
+    if (!hasDeferredRelocationConditionals(message.content)) continue;
+    message.content = message.content.replace(DEFERRED_RELOCATION_CONDITIONAL_TOKEN_RE, (_match, encoded: string) => {
+      const payload = parseDeferredConditionalPayload(encoded);
+      if (!payload) {
+        logger.error("[prompt] Malformed deferred preset conditional token; dropping block");
+        return "";
+      }
+      const selected = selectConditionalPayloadBranch(payload, macroCtx, { trimResult: false });
+      return resolveMacros(selected, macroCtx, { trimResult: false });
+    });
+  }
 }
 
 /** Clone mutable macro maps for preview-only resolution that must discard variable writes. */
@@ -119,7 +195,7 @@ export function resolveMacrosForPreview(
   return resolveMacros(template, cloneMacroContextForPreview(macroCtx), options);
 }
 
-export function extractCharacterReferenceIds(sources: readonly string[]): string[] {
+export function extractCharacterReferenceIds(sources: readonly string[], limit = MAX_REFERENCED_CHARACTERS): string[] {
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const source of sources) {
@@ -128,7 +204,7 @@ export function extractCharacterReferenceIds(sources: readonly string[]): string
       if (seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
-      if (ids.length >= MAX_REFERENCED_CHARACTERS) return ids;
+      if (ids.length >= limit) return ids;
     }
   }
   return ids;
@@ -417,29 +493,41 @@ export async function buildReferencedCharacterContext(input: {
   excludedLorebookIds?: string[];
   excludedLorebookSourceAgentIds?: string[];
   maxReferences?: number;
+  /** Only the names: no card text and no lorebook scan. */
+  namesOnly?: boolean;
 }): Promise<{ content: string; references: Record<string, string> }> {
   const characters = createCharactersStorage(input.db);
   const activeIds = new Set(input.activeCharacterIds);
   const sources = [...input.sources, ...input.chatMessages.map((message) => message.content)];
 
+  const activeNames = new Map<string, string>();
   const activeRows = await Promise.all([...activeIds].map((id) => characters.getById(id)));
-  for (const row of activeRows) {
-    const data = parseCharacterData(row?.data);
-    if (data) sources.push(...referencedCharacterSourceFields(data));
-  }
+  [...activeIds].forEach((id, index) => {
+    const data = parseCharacterData(activeRows[index]?.data);
+    if (!data) return;
+    activeNames.set(id, data.name || "Character");
+    sources.push(...referencedCharacterSourceFields(data));
+  });
 
-  const candidateIds = extractCharacterReferenceIds(sources)
-    .filter((id) => !activeIds.has(id))
-    .slice(0, Math.max(0, input.maxReferences ?? MAX_REFERENCED_CHARACTERS));
-  const referencedRows = await Promise.all(candidateIds.map((id) => characters.getById(id)));
-  const referenced = candidateIds.flatMap((id, index) => {
-    const data = parseCharacterData(referencedRows[index]?.data);
+  // Every referenced ID gets a name in every mode; the cap only limits which cards are added (#6956).
+  const mentionedIds = extractCharacterReferenceIds(sources, Infinity);
+  const outsideIds = mentionedIds.filter((id) => !activeIds.has(id));
+  const outsideRows = await Promise.all(outsideIds.map((id) => characters.getById(id)));
+  const outside = outsideIds.flatMap((id, index) => {
+    const data = parseCharacterData(outsideRows[index]?.data);
     return data ? [{ id, data }] : [];
   });
-  if (referenced.length === 0) return { content: "", references: {} };
+  const cardLimit = input.namesOnly ? 0 : Math.max(0, input.maxReferences ?? MAX_REFERENCED_CHARACTERS);
+  const referenced = outside.slice(0, cardLimit);
+  // A character already in the chat still resolves to its name; its card is
+  // already in the prompt, so it gets no second copy below (#6924).
+  const references = Object.fromEntries([
+    ...mentionedIds.flatMap((id) => (activeNames.has(id) ? [[id, activeNames.get(id)!] as const] : [])),
+    ...outside.map(({ id, data }) => [id, data.name || "Character"] as const),
+  ]);
+  if (referenced.length === 0 || input.namesOnly) return { content: "", references };
 
-  const references = Object.fromEntries(referenced.map(({ id, data }) => [id, data.name || "Character"]));
-  const macroCtx = { ...input.macroCtx, characterReferences: references };
+  const macroCtx = { ...input.macroCtx, characterReferences: { ...Object.fromEntries(activeNames), ...references } };
   const lorebooks = createLorebooksStorage(input.db);
   if (referenced.some(({ data }) => /\{\{\s*lorebooksize::/iu.test(JSON.stringify(data) ?? ""))) {
     try {
@@ -706,8 +794,16 @@ export async function buildPromptMacroContext(input: BuildPromptMacroContextInpu
       // If the count fails, continue with empty counts — {{lorebooksize::ID}} resolves to 0.
     }
   }
+  let lorebookIncludes: LorebookIncludeSource | undefined;
+  if (macroSources.some(usesLorebookIncludes)) {
+    try {
+      lorebookIncludes = await loadLorebookIncludes(input.db, input.chatId);
+    } catch (err) {
+      logger.warn(err, "Failed to load lorebooks for include macros; leaving them as written");
+    }
+  }
 
-  return {
+  const macroCtx: MacroContext = {
     user: input.personaName || "User",
     userPhonetic: input.personaPhoneticName || input.personaFields?.phoneticName || input.personaName || "User",
     char: characterMacroData.names[0] || "Character",
@@ -724,6 +820,7 @@ export async function buildPromptMacroContext(input: BuildPromptMacroContextInpu
     idleDuration: input.idleDuration,
     timeZone: input.timeZone,
     lorebookEntryCounts,
+    ...(lorebookIncludes ? { lorebookIncludes } : {}),
     characterFields: {
       ...(characterMacroData.primaryFields ?? {}),
       ...(input.groupScenarioOverrideText ? { scenario: input.groupScenarioOverrideText } : {}),
@@ -733,6 +830,21 @@ export async function buildPromptMacroContext(input: BuildPromptMacroContextInpu
       ...(input.personaFields ?? {}),
     },
   };
+  if (input.nameCharacterReferences) {
+    macroCtx.characterReferences = (
+      await buildReferencedCharacterContext({
+        db: input.db,
+        activeCharacterIds: input.groupCharacterIds ?? input.characterIds,
+        sources: macroSources,
+        chatMessages: [],
+        macroCtx,
+        wrapFormat: "none",
+        chatId: input.chatId ?? "",
+        namesOnly: true,
+      })
+    ).references;
+  }
+  return macroCtx;
 }
 
 function characterFieldsFromProfile(profile: CharacterMacroProfile): NonNullable<MacroContext["characterFields"]> {

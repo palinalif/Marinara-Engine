@@ -5,7 +5,44 @@
 // (WORLD_INFO_BEFORE / WORLD_INFO_AFTER / depth).
 // ──────────────────────────────────────────────
 import { estimateTextTokens, type LorebookRole } from "@marinara-engine/shared";
+import type { LorebookImageEntry } from "../generation/lorebook-image-prompt.js";
 import type { ActivatedEntry } from "./keyword-scanner.js";
+
+/** Same per-image estimate used by provider context fitting. */
+function estimateLorebookImageTokens(images: Array<{ caption: string }> = []): number {
+  return images.reduce((tokens, image) => tokens + 256 + estimateTextTokens(image.caption), 0);
+}
+
+export function estimateLorebookEntryTokens(entry: { content: string; images?: Array<{ caption: string }> }): number {
+  return estimateTextTokens(entry.content) + estimateLorebookImageTokens(entry.images);
+}
+
+/** Fit an entry into a budget, dropping its images before its text so text-only retries keep the lore. */
+export function fitLorebookEntryToBudget(
+  candidate: ActivatedEntry,
+  fits: (tokens: number) => boolean,
+  includeImages = true,
+): { candidate: ActivatedEntry; tokens: number } | null {
+  const textTokens = estimateTextTokens(candidate.entry.content);
+  if (!candidate.entry.content.trim() && !candidate.entry.images?.length) return null;
+  if (candidate.entry.content.trim() && !fits(textTokens)) return null;
+  const images = [] as NonNullable<ActivatedEntry["entry"]["images"]>;
+  let tokens = candidate.entry.content.trim() ? textTokens : 0;
+  for (const image of includeImages ? (candidate.entry.images ?? []) : []) {
+    const imageTokens = estimateLorebookImageTokens([image]);
+    if (!fits(tokens + imageTokens)) continue;
+    images.push(image);
+    tokens += imageTokens;
+  }
+  if (tokens === 0 && images.length === 0) return null;
+  return {
+    candidate:
+      images.length === (candidate.entry.images?.length ?? 0)
+        ? candidate
+        : { ...candidate, entry: { ...candidate.entry, images } },
+    tokens,
+  };
+}
 
 /** A prompt message ready for injection. */
 export interface PromptMessage {
@@ -145,13 +182,21 @@ export function applyTokenBudget(activatedEntries: ActivatedEntry[], tokenBudget
   });
 
   for (const entry of sorted) {
-    const entryTokens = estimateTextTokens(entry.entry.content);
-    if (totalTokens + entryTokens > tokenBudget) {
-      // Budget exhausted — skip remaining entries
-      break;
-    }
-    totalTokens += entryTokens;
-    result.push(entry);
+    const fitted = fitLorebookEntryToBudget(entry, (tokens) => totalTokens + tokens <= tokenBudget, false);
+    if (!fitted) continue;
+    totalTokens += fitted.tokens;
+    result.push(fitted.candidate);
+  }
+
+  for (const [index, entry] of result.entries()) {
+    const original = sorted.find((candidate) => candidate.entry.id === entry.entry.id) ?? entry;
+    const fitted = fitLorebookEntryToBudget(
+      original,
+      (tokens) => totalTokens - estimateTextTokens(entry.entry.content) + tokens <= tokenBudget,
+    );
+    if (!fitted) continue;
+    totalTokens += fitted.tokens - estimateTextTokens(entry.entry.content);
+    result[index] = fitted.candidate;
   }
 
   return result;
@@ -168,6 +213,7 @@ export function processActivatedEntries(
   worldInfoAfter: string;
   depthEntries: Array<{ content: string; role: LorebookRole; depth: number; order: number }>;
   outlets: Record<string, string>;
+  imageEntries?: LorebookImageEntry[];
   totalEntries: number;
   totalTokensEstimate: number;
 } {
@@ -197,13 +243,29 @@ export function processActivatedEntries(
   const outlets = Object.fromEntries(Array.from(outletParts, ([name, parts]) => [name, parts.join("\n")]));
 
   // Estimate tokens
-  const totalTokensEstimate = estimateTextTokens(budgeted.map((a) => a.entry.content).join(""));
+  const totalTokensEstimate =
+    estimateTextTokens(budgeted.map((a) => a.entry.content).join("")) +
+    budgeted.reduce((tokens, a) => tokens + estimateLorebookImageTokens(a.entry.images), 0);
 
   return {
     worldInfoBefore: before,
     worldInfoAfter: after,
     depthEntries,
     outlets,
+    ...(budgeted.some(({ entry }) => entry.images?.length)
+      ? {
+          imageEntries: budgeted
+            .filter(({ entry }) => entry.images?.length)
+            .map(({ entry }) => ({
+              id: entry.id,
+              name: entry.name,
+              content: entry.content,
+              position: entry.position,
+              outletName: entry.outletName,
+              images: entry.images!,
+            })),
+        }
+      : {}),
     totalEntries: budgeted.length,
     totalTokensEstimate,
   };

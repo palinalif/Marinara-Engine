@@ -1,7 +1,14 @@
-import { BUILT_IN_TOOLS, DEFAULT_AGENT_TOOLS, customAgentHasCapability } from "@marinara-engine/shared";
-import type { AgentContext } from "@marinara-engine/shared";
+import { currentRoomGeneration, roomGenerationMetadata, roomToolAllowed } from "../multiplayer/generation-policy.js";
+import {
+  BUILT_IN_TOOLS,
+  DEFAULT_AGENT_TOOLS,
+  customAgentHasCapability,
+  homeAgentWidgetsSchema,
+} from "@marinara-engine/shared";
+import type { AgentContext, SourceMessageRef } from "@marinara-engine/shared";
 import type { LLMToolDefinition } from "../llm/base-provider.js";
 import type { ResolvedAgent } from "../agents/agent-pipeline.js";
+import { capabilityToolDefs } from "../capability-packages/capability-tool-registry.service.js";
 import {
   createCustomToolArgumentsValidator,
   executeToolCallForModel,
@@ -36,6 +43,7 @@ import {
 } from "../conversation/timezone.js";
 
 const LORE_SEARCH_MIN_SIMILARITY = 0.25;
+const HOME_WIDGET_PUBLISH_TOOL_NAME = "home_widget_publish";
 
 type CustomToolsStore = {
   listEnabled(): Promise<
@@ -66,10 +74,21 @@ type LorebooksStore = {
   getById(id: string): Promise<any | null>;
   listEntries(lorebookId: string): Promise<any[]>;
   createEntry(entry: Record<string, unknown>): Promise<any>;
-  updateEntry(id: string, entry: Record<string, unknown>): Promise<any>;
+  updateEntry(
+    id: string,
+    entry: Record<string, unknown>,
+    expectedProvenance?: {
+      sourceAgentId: string;
+      sourceMessageRefs: SourceMessageRef[];
+      updatedAt: string;
+      content: string;
+    },
+  ): Promise<any>;
 };
 
-type AgentsStore = unknown;
+type AgentsStore = {
+  publishHomeWidgetState(agentId: string, widgetId: string, text: string): Promise<{ updatedAt: string }>;
+};
 
 export type ResolveGenerationToolsArgs = {
   requestBody: Record<string, unknown>;
@@ -99,6 +118,7 @@ export type ResolveGenerationToolsArgs = {
    */
   autoAttachToolNames?: readonly string[];
   nativeToolsAvailable?: boolean;
+  getLorebookSourceMessageRefs?: (agent: ResolvedAgent) => SourceMessageRef[];
   lorebookEmbeddingOptions?: LorebookEmbeddingOptions;
 };
 
@@ -118,6 +138,7 @@ export type ResolvedGenerationTools = {
   toolDefs: LLMToolDefinition[] | undefined;
   baseToolExecutionContext: ToolExecutionContext;
   updateChatMetadataForTools: (patchOrUpdater: MetadataPatchInput) => Promise<MetadataPatch>;
+  finalizeLorebookWrites: () => Promise<void>;
 };
 
 export function resolveToolLorebookCharacterIds(
@@ -452,10 +473,41 @@ function validateParameterProperty(prop: unknown, path: string): void {
   }
 }
 
+/**
+ * Appends every registered package tool that does not collide with a name already spoken for.
+ *
+ * The collision map is the authority: `executeToolCalls` resolves a call built-in first, then
+ * custom, then package, so a package tool must lose the same way here. Otherwise the model would
+ * be shown one tool's schema and a different owner's handler would run.
+ */
+function appendPackageToolDefs(
+  allToolDefs: LLMToolDefinition[],
+  registeredToolSources: Map<string, "built-in" | "custom" | "package">,
+  nativeToolsAvailable: boolean,
+): LLMToolDefinition[] {
+  if (!nativeToolsAvailable || currentRoomGeneration()) return [];
+  const packageToolDefs = capabilityToolDefs().filter((tool) => {
+    const existingSource = registeredToolSources.get(tool.function.name);
+    if (existingSource) {
+      logger.warn(
+        '[tools] Skipping package tool "%s" because it collides with existing %s tool',
+        tool.function.name,
+        existingSource,
+      );
+      return false;
+    }
+    registeredToolSources.set(tool.function.name, "package");
+    return true;
+  });
+  allToolDefs.push(...packageToolDefs);
+  return packageToolDefs;
+}
+
 async function loadToolDefinitions(args: {
   customToolsStore: CustomToolsStore;
   resolveTools: boolean;
   enableChatTools: boolean;
+  nativeToolsAvailable: boolean;
   activeToolIds: string[];
   autoAttachToolNames: readonly string[];
 }): Promise<{
@@ -467,11 +519,31 @@ async function loadToolDefinitions(args: {
   const allToolDefs: LLMToolDefinition[] = [];
   const customToolDefs: CustomToolDef[] = [];
 
-  if (!args.resolveTools) return { toolDefs, allToolDefs, customToolDefs };
+  const registeredToolSources = new Map<string, "built-in" | "custom" | "package">();
+  if (!args.resolveTools && (!args.nativeToolsAvailable || capabilityToolDefs().length === 0)) {
+    return { toolDefs, allToolDefs, customToolDefs };
+  }
+  const enabledCustomTools = currentRoomGeneration() ? [] : await args.customToolsStore.listEnabled();
 
-  const registeredToolSources = new Map<string, "built-in" | "custom">();
+  // A package's tools are attached even when every built-in and custom tool is switched off: the
+  // user's tool switches are about the Engine's tools, not about whether an installed package can
+  // do its job. Built-in names are still reserved here so the definition the model is shown always
+  // belongs to whoever will actually execute the call.
+  if (!args.resolveTools) {
+    for (const tool of BUILT_IN_TOOLS) registeredToolSources.set(tool.name, "built-in");
+    for (const tool of enabledCustomTools) {
+      if (!registeredToolSources.has(tool.name)) registeredToolSources.set(tool.name, "custom");
+    }
+    const packageOnlyToolDefs = appendPackageToolDefs(allToolDefs, registeredToolSources, args.nativeToolsAvailable);
+    return {
+      toolDefs: packageOnlyToolDefs.length > 0 ? packageOnlyToolDefs : toolDefs,
+      allToolDefs,
+      customToolDefs,
+    };
+  }
 
   for (const tool of BUILT_IN_TOOLS) {
+    if (!roomToolAllowed(tool.name)) continue;
     const existingSource = registeredToolSources.get(tool.name);
     if (existingSource) {
       throw new Error(
@@ -489,7 +561,6 @@ async function loadToolDefinitions(args: {
     });
   }
 
-  const enabledCustomTools = await args.customToolsStore.listEnabled();
   for (const customTool of enabledCustomTools) {
     const existingSource = registeredToolSources.get(customTool.name);
     if (existingSource) {
@@ -528,7 +599,8 @@ async function loadToolDefinitions(args: {
         },
       });
     } catch (error) {
-      registeredToolSources.delete(customTool.name);
+      // Keep enabled custom names reserved even if their schema needs repair.
+      // Fixing a schema must not silently switch this name to a package handler.
       logger.warn(
         error,
         '[tools] Skipping custom tool "%s" with invalid parameter schema: %s',
@@ -544,6 +616,11 @@ async function loadToolDefinitions(args: {
     activeToolIds: args.activeToolIds,
     autoAttachToolNames: args.autoAttachToolNames,
   });
+
+  const packageToolDefs = appendPackageToolDefs(allToolDefs, registeredToolSources, args.nativeToolsAvailable);
+  if (packageToolDefs.length > 0) {
+    toolDefs = [...(toolDefs ?? []), ...packageToolDefs];
+  }
 
   return { toolDefs, allToolDefs, customToolDefs };
 }
@@ -565,14 +642,33 @@ function resolveAgentWritableLorebookId(agentSettings: Record<string, unknown>):
   return null;
 }
 
+/**
+ * Fallback for callers without a generation target. Main generation and retries
+ * supply their captured source refs, including the assistant's immutable swipe.
+ */
+function resolveLorebookWriterSourceRefs(agentContext: AgentContext): SourceMessageRef[] {
+  for (let i = agentContext.recentMessages.length - 1; i >= 0; i--) {
+    const message = agentContext.recentMessages[i];
+    if (!message) continue;
+    if (message.role === "user" && message.id) return [{ id: message.id, swipeIndex: null }];
+  }
+  return [];
+}
+
 function createLorebookEntryWriter(
   lorebooksStore: LorebooksStore,
   agent: ResolvedAgent,
   agentSettings: Record<string, unknown>,
-  options: { requireApproval: boolean; chatId: string },
+  options: {
+    requireApproval: boolean;
+    chatId: string;
+    sourceMessageRefs: () => SourceMessageRef[];
+    onWrite: (entry: any) => void;
+  },
 ) {
   const writableLorebookId = resolveAgentWritableLorebookId(agentSettings);
   if (!writableLorebookId) return undefined;
+  const writtenEntryIds = new Set<string>();
 
   return async (entry: {
     name: string;
@@ -607,6 +703,8 @@ function createLorebookEntryWriter(
           preferredTargetLorebookId: writableLorebookId,
           writableLorebookIds: [writableLorebookId],
           existingEntries,
+          sourceAgentId: agent.id,
+          sourceMessageRefs: options.sourceMessageRefs(),
         }),
       };
     }
@@ -650,7 +748,11 @@ function createLorebookEntryWriter(
         position: 0,
         depth: 4,
         role: "system",
+        sourceAgentId: agent.id,
+        sourceMessageRefs: options.sourceMessageRefs(),
       });
+      options.onWrite(created);
+      if (created?.id) writtenEntryIds.add(created.id);
       return {
         applied: true,
         action: "created",
@@ -678,7 +780,12 @@ function createLorebookEntryWriter(
       keys: Array.from(new Set([...existingKeys, ...keys])),
       ...(entry.tag !== undefined ? { tag: entry.tag } : {}),
       enabled: true,
+      sourceAgentId: agent.id,
+      sourceMessageRefs: options.sourceMessageRefs(),
+      preserveProvenanceSnapshot: writtenEntryIds.has(existing.id),
     });
+    options.onWrite(updated);
+    if (updated?.id) writtenEntryIds.add(updated.id);
     return {
       applied: true,
       action: entry.mode === "append" ? "appended" : "replaced",
@@ -761,6 +868,8 @@ async function resolveToolRuntime(
     emitMetadataPatch,
     observeSpotifyPlaybackBeforePlay,
     lorebookEmbeddingOptions,
+    nativeToolsAvailable = true,
+    getLorebookSourceMessageRefs,
   }: ResolveAgentGenerationToolsArgs,
   options: {
     enableChatTools: boolean;
@@ -792,6 +901,7 @@ async function resolveToolRuntime(
     customToolsStore,
     resolveTools: enableChatTools || enableAgentTools || autoAttachToolNames.length > 0,
     enableChatTools,
+    nativeToolsAvailable,
     activeToolIds,
     autoAttachToolNames,
   });
@@ -922,7 +1032,9 @@ async function resolveToolRuntime(
       return patch;
     });
     const hasUpdatedMetadata = updatedChat && Object.prototype.hasOwnProperty.call(updatedChat, "metadata");
-    const updatedMeta = hasUpdatedMetadata ? parseExtra(updatedChat.metadata) : { ...chatMetadata, ...emittedPatch };
+    const updatedMeta = roomGenerationMetadata(
+      hasUpdatedMetadata ? parseExtra(updatedChat.metadata) : { ...chatMetadata, ...emittedPatch },
+    );
     if (hasUpdatedMetadata) {
       for (const key of Object.keys(chatMetadata)) {
         if (!(key in updatedMeta)) {
@@ -963,6 +1075,7 @@ async function resolveToolRuntime(
   };
 
   const baseToolExecutionContext: ToolExecutionContext = {
+    chatId,
     gameState: gameState ? (gameState as Record<string, unknown>) : undefined,
     hiddenContext: buildCustomToolHiddenContext({
       requestBody,
@@ -989,26 +1102,72 @@ async function resolveToolRuntime(
     });
   }
 
+  const pendingLorebookWrites = new Map<string, () => Promise<unknown>>();
   for (const agent of resolvedAgents) {
     if (agent.toolContext) continue;
 
     const agentSettings = parseSettings(agent.settings);
     const agentEnabledNames = Array.isArray(agentSettings.enabledTools) ? (agentSettings.enabledTools as string[]) : [];
-    if (agentEnabledNames.length === 0) continue;
+    const widgetDefinitions = agent.isCustomAgent
+      ? homeAgentWidgetsSchema.safeParse(agentSettings.homeWidgets ?? [])
+      : null;
+    const mayPublishWidget = widgetDefinitions?.success && widgetDefinitions.data.length > 0;
+    if (agentEnabledNames.length === 0 && !mayPublishWidget) continue;
 
     const allowSpotifyAgentTools = agent.type === "spotify";
-    const agentTools = allToolDefs.filter(
+    const agentTools: LLMToolDefinition[] = allToolDefs.filter(
       (toolDef) =>
+        (!mayPublishWidget || toolDef.function.name !== HOME_WIDGET_PUBLISH_TOOL_NAME) &&
         agentEnabledNames.includes(toolDef.function.name) &&
         (toolDef.function.name !== "edit_chat_message" || customAgentHasCapability(agentSettings, "edit_messages")) &&
         (spotifyToolsAvailable || !spotifyToolNames.has(toolDef.function.name) || allowSpotifyAgentTools),
     );
+    if (mayPublishWidget) {
+      agentTools.push({
+        type: "function",
+        function: {
+          name: HOME_WIDGET_PUBLISH_TOOL_NAME,
+          description:
+            "Publish short text to one of this agent's Home widgets. This changes data only, not the widget definition or layout.",
+          parameters: {
+            type: "object",
+            properties: {
+              widgetId: { type: "string", enum: widgetDefinitions.data.map((widget) => widget.id) },
+              text: { type: "string", maxLength: 500 },
+            },
+            required: ["widgetId", "text"],
+            additionalProperties: false,
+          },
+        },
+      });
+    }
     if (agentTools.length === 0) continue;
 
     const allowedToolNames = new Set(agentTools.map((toolDef) => toolDef.function.name));
+    const sourceMessageRefs = () =>
+      getLorebookSourceMessageRefs?.(agent) ?? resolveLorebookWriterSourceRefs(agentContext);
     const saveLorebookEntry = createLorebookEntryWriter(lorebooksStore, agent, agentSettings, {
       requireApproval: agentWriteApprovalRequired(chatMetadata),
       chatId,
+      sourceMessageRefs,
+      onWrite: (entry) => {
+        if (!entry?.id || typeof entry.updatedAt !== "string") return;
+        pendingLorebookWrites.set(entry.id, () =>
+          lorebooksStore.updateEntry(
+            entry.id,
+            {
+              sourceAgentId: agent.id,
+              sourceMessageRefs: sourceMessageRefs(),
+            },
+            {
+              sourceAgentId: agent.id,
+              sourceMessageRefs: entry.sourceMessageRefs,
+              updatedAt: entry.updatedAt,
+              content: entry.content,
+            },
+          ),
+        );
+      },
     });
     const replaceChatMessageContentForAgent = customAgentHasCapability(agentSettings, "edit_messages")
       ? replaceChatMessageContent
@@ -1028,6 +1187,22 @@ async function resolveToolRuntime(
             error: `Tool not allowed for agent ${agent.type}: ${call.function.name}`,
             allowed: Array.from(allowedToolNames),
           });
+        }
+        if (mayPublishWidget && call.function.name === HOME_WIDGET_PUBLISH_TOOL_NAME) {
+          try {
+            const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+            if (
+              typeof args.widgetId !== "string" ||
+              !widgetDefinitions?.success ||
+              !widgetDefinitions.data.some((widget) => widget.id === args.widgetId) ||
+              typeof args.text !== "string" ||
+              args.text.length > 500
+            )
+              throw new Error("Invalid widget publication");
+            return JSON.stringify(await agentsStore.publishHomeWidgetState(agent.id, args.widgetId, args.text));
+          } catch {
+            return JSON.stringify({ error: "Widget publication rejected" });
+          }
         }
         const executionContext = {
           ...baseToolExecutionContext,
@@ -1103,6 +1278,12 @@ async function resolveToolRuntime(
     toolDefs,
     baseToolExecutionContext,
     updateChatMetadataForTools,
+    async finalizeLorebookWrites() {
+      // Pre/parallel tools can write before the assistant exists. Bind them after save,
+      // conditionally, so a later human edit or another agent's write keeps ownership.
+      for (const write of pendingLorebookWrites.values()) await write();
+      pendingLorebookWrites.clear();
+    },
   };
 }
 

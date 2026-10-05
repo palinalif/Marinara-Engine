@@ -1,3 +1,4 @@
+import { embedCharacterBookImages, LOREBOOK_EXPORT_IMAGE_MAX_BYTES } from "../services/lorebook/lorebook-images.js";
 // ──────────────────────────────────────────────
 // Routes: Characters, Personas & Groups
 // ──────────────────────────────────────────────
@@ -21,6 +22,10 @@ import {
   findImageStyleProfile,
   type ImageStyleProfile,
   MAX_FILE_SIZES,
+  findDuplicateCharacters,
+  applyCharacterTagEdit,
+  normalizeCharacterTagEdit,
+  isEmptyCharacterTagEdit,
 } from "@marinara-engine/shared";
 import type { CharacterData, ConversationCallCharacterVideoClipKind, ExportEnvelope } from "@marinara-engine/shared";
 import { createCharactersStorage, type PersonaStorageRow } from "../services/storage/characters.storage.js";
@@ -84,6 +89,7 @@ import {
   clearEmbeddedLorebookFromCharacter,
   embedLorebookIntoCharacter,
   getEmbeddedLorebookId,
+  syncCharacterBookFromLorebook,
 } from "../services/lorebook/character-book-sync.js";
 import AdmZip from "adm-zip";
 import { extname } from "path";
@@ -855,6 +861,10 @@ function canonicalizePersonaForExport(persona: Record<string, unknown>): {
   // Export the public boolean contract rather than the storage-only text flag
   // so compatible and native Persona payloads can be imported unchanged.
   row.versioningEnabled = parsed.data.versioningEnabled ?? true;
+  // Same text-column-to-boolean conversion for the image-appearance toggle
+  // (#7053): `row` is spread from the raw row above, so without this the export
+  // carries "false" and the re-import fails schema validation.
+  row.imageAppearanceEnabled = parsed.data.imageAppearanceEnabled ?? false;
   // Never restore raw rejected top-level paint over the repaired export copy.
   for (const field of topLevelPaintFields) if (!Object.hasOwn(parsed.data, field)) delete row[field];
   return { row, usesFallbackName };
@@ -959,6 +969,109 @@ export async function charactersRoutes(app: FastifyInstance) {
   app.post<{ Body: { ids?: unknown } }>("/summaries", async (req) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((id): id is string => typeof id === "string") : [];
     return storage.listSummariesByIds(ids);
+  });
+
+  // ── Library maintenance: duplicate finder and bulk tag edits ──
+
+  /** Read-only similarity suggestions; cards are never modified or deleted here. */
+  app.get("/duplicates", async () => {
+    const rows = (await storage.list()).filter((row) => row.id !== PROFESSOR_MARI_ID);
+    const cards = rows.map((row) => ({ row, data: parseCharacterDataRecord(row.data) as Partial<CharacterData> }));
+    const groups = findDuplicateCharacters(
+      cards.map(({ row, data }) => ({
+        id: row.id,
+        name: typeof data.name === "string" ? data.name : "",
+        description: typeof data.description === "string" ? data.description : "",
+        personality: typeof data.personality === "string" ? data.personality : "",
+      })),
+    );
+    const cardById = new Map(cards.map((card) => [card.row.id, card]));
+    const preview = (value: unknown, length: number) =>
+      typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, length) : "";
+    return {
+      scanned: cards.length,
+      groups: groups.map((group) => ({
+        ...group,
+        characters: group.ids.flatMap((id) => {
+          const card = cardById.get(id);
+          if (!card) return [];
+          const { row, data } = card;
+          return [
+            {
+              id,
+              name: typeof data.name === "string" ? data.name : "",
+              comment: row.comment ?? "",
+              avatarPath: row.avatarPath ?? null,
+              creator: typeof data.creator === "string" ? data.creator : "",
+              version: typeof data.character_version === "string" ? data.character_version : "",
+              tags: Array.isArray(data.tags) ? data.tags.filter((tag): tag is string => typeof tag === "string") : [],
+              description: preview(data.description, 280),
+              personality: preview(data.personality, 160),
+              descriptionLength: typeof data.description === "string" ? data.description.length : 0,
+              createdAt: row.createdAt ?? null,
+              updatedAt: row.updatedAt ?? null,
+            },
+          ];
+        }),
+      })),
+    };
+  });
+
+  app.post("/bulk-tags", async (req, reply) => {
+    const body = req.body as Record<string, unknown> | null;
+    const rawIds = body && Array.isArray(body.ids) ? body.ids : [];
+    const ids = [
+      ...new Set(
+        rawIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()),
+      ),
+    ];
+    if (ids.length === 0 || ids.length > 5000)
+      return reply.status(400).send({ error: "Select between 1 and 5,000 characters" });
+    if (ids.some((id) => id.length > 256)) return reply.status(400).send({ error: "Character ID is too long" });
+    const edit = normalizeCharacterTagEdit({
+      add: Array.isArray(body?.add) ? body.add.filter((tag): tag is string => typeof tag === "string") : [],
+      remove: Array.isArray(body?.remove) ? body.remove.filter((tag): tag is string => typeof tag === "string") : [],
+      rename: Array.isArray(body?.rename)
+        ? body.rename.filter(
+            (item): item is { from: string; to: string } =>
+              !!item &&
+              typeof item === "object" &&
+              typeof (item as Record<string, unknown>).from === "string" &&
+              typeof (item as Record<string, unknown>).to === "string",
+          )
+        : [],
+    });
+    if (isEmptyCharacterTagEdit(edit)) return reply.status(400).send({ error: "Provide at least one tag change" });
+    const result = { updatedIds: [] as string[], unchangedIds: [] as string[], failedIds: [] as string[] };
+    for (const id of ids) {
+      if (id === PROFESSOR_MARI_ID) {
+        result.failedIds.push(id);
+        continue;
+      }
+      try {
+        const outcome = await enqueueUpdate(characterUpdateQueues, id, () =>
+          app.db.transaction(async () => {
+            const current = await storage.getById(id);
+            if (!current) return "missing" as const;
+            const data = parseCharacterDataRecord(current.data) as Partial<CharacterData>;
+            const tags = Array.isArray(data.tags)
+              ? data.tags.filter((tag): tag is string => typeof tag === "string")
+              : [];
+            const nextTags = applyCharacterTagEdit(tags, edit);
+            if (tags.length === nextTags.length && tags.every((tag, index) => tag === nextTags[index]))
+              return "unchanged" as const;
+            return (await storage.update(id, { tags: nextTags })) ? ("updated" as const) : ("missing" as const);
+          }),
+        );
+        if (outcome === "updated") result.updatedIds.push(id);
+        else if (outcome === "unchanged") result.unchangedIds.push(id);
+        else result.failedIds.push(id);
+      } catch (error) {
+        req.log.error(error, "Failed to edit tags for character %s", id);
+        result.failedIds.push(id);
+      }
+    }
+    return result;
   });
 
   app.post<{
@@ -1985,7 +2098,7 @@ export async function charactersRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string }; Querystring: { format?: ExportFormat } }>("/:id/export", async (req, reply) => {
     const char = await storage.getById(req.params.id);
     if (!char) return reply.status(404).send({ error: "Character not found" });
-    const charData = JSON.parse(char.data);
+    const charData = await embedCharacterBookImages(JSON.parse(char.data));
     const compatible = req.query.format === "compatible";
     const payload = compatible
       ? buildCompatibleCharacterExport(charData)
@@ -2005,11 +2118,12 @@ export async function charactersRoutes(app: FastifyInstance) {
     }
 
     const zip = new AdmZip();
+    const exportBudget = { remainingBytes: LOREBOOK_EXPORT_IMAGE_MAX_BYTES };
     let exportedCount = 0;
     for (const id of ids) {
       const char = await storage.getById(id);
       if (!char) continue;
-      const charData = JSON.parse(char.data);
+      const charData = await embedCharacterBookImages(JSON.parse(char.data), exportBudget);
       const payload =
         format === "compatible"
           ? buildCompatibleCharacterExport(charData)
@@ -2067,6 +2181,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       app.db,
       {
         characterId: req.params.id,
+        allowLocalImagePaths: true,
         namePrefix: String(charData.name ?? "Character"),
         existingLorebookId:
           typeof embeddedLorebookMetadata.lorebookId === "string" ? embeddedLorebookMetadata.lorebookId : null,
@@ -2090,6 +2205,7 @@ export async function charactersRoutes(app: FastifyInstance) {
       extensions: extensions as any,
     });
 
+    await syncCharacterBookFromLorebook(app.db, result.lorebookId);
     return {
       success: true,
       lorebookId: result.lorebookId,
@@ -2187,7 +2303,7 @@ export async function charactersRoutes(app: FastifyInstance) {
     const char = await storage.getById(req.params.id);
     if (!char) return reply.status(404).send({ error: "Character not found" });
 
-    const charData = JSON.parse(char.data);
+    const charData = await embedCharacterBookImages(JSON.parse(char.data));
     const sprites = await readSpritesForId(char.id, true);
     if (!sprites) {
       return reply.status(413).send({ error: "Sprite collection exceeds compatible PNG export limits" });

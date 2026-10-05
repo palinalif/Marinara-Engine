@@ -306,7 +306,7 @@ export function InlineEdit({
       {!(lockMode || locked) && (
         <Pencil
           className={cn(
-            "pointer-events-none absolute right-0.5 top-1/2 h-2.5 w-2.5 -translate-y-1/2 shrink-0 text-[color:var(--tracker-inline-muted,var(--muted-foreground))] opacity-0 transition-opacity group-hover/inline:opacity-60",
+            "pointer-events-none absolute right-0.5 top-1/2 h-2.5 w-2.5 -translate-y-1/2 shrink-0 text-[color:var(--tracker-inline-muted,var(--muted-foreground))] opacity-0 transition-opacity group-hover/inline:opacity-60 max-md:hidden",
             (!showEditHint || fullPreview) && "hidden",
           )}
         />

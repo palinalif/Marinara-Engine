@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 import {
   BaseLLMProvider,
+  ASSISTANT_CONTINUATION_PROMPT,
   llmFetch,
   llmHttpErrorFromResponse,
   sanitizeApiError,
@@ -17,13 +18,17 @@ import {
 import { parseTextualToolCalls } from "../textual-tool-call-parser.js";
 import {
   isClaudeAdaptiveOnlyNoSamplingModel,
+  isClaudeStrictRequestModel,
   isOpenAIGpt56Model,
   isOpenAIGpt56SolProAlias,
-  isOpenAIGpt6AstraModel,
+  isOpenAIGpt6AlwaysReasoningModel,
+  isOpenAIGpt6Model,
   isXaiAutoReasoningModel,
   isXaiConfigurableReasoningModel,
   resolveOpenAIGpt56ModelForRequest,
+  resolveProviderReasoningEffort,
   shouldSuppressUnknownModelParameters,
+  supportsXhighReasoningEffort,
 } from "@marinara-engine/shared";
 import { logger } from "../../../lib/logger.js";
 import { isLocalInferenceBaseUrl } from "../../../middleware/ip-allowlist.js";
@@ -35,8 +40,8 @@ import {
 
 /**
  * Models routed through the Responses API (`/responses`).
- * GPT-5.6, GPT-5.5, GPT-5.4 variants and Codex use these lists. Astra is routed
- * separately by isOpenAIGpt6AstraModel in useResponsesAPI because its tools require Responses.
+ * GPT-5.6, GPT-5.5, GPT-5.4 variants and Codex use these lists. GPT-6 is routed
+ * separately in useResponsesAPI because reasoning with tools requires Responses.
  * Matching is case-insensitive.
  */
 const RESPONSES_ONLY_PREFIXES = ["gpt-5.6", "gpt-5.5", "gpt-5.4", "codex-"];
@@ -628,7 +633,9 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   private isOpenAINoSamplingModel(model: string): boolean {
     const normalized = model.toLowerCase();
-    return normalized.startsWith("gpt-5.5") || isOpenAIGpt56Model(normalized) || isOpenAIGpt6AstraModel(normalized);
+    return (
+      normalized.startsWith("gpt-5.5") || isOpenAIGpt56Model(normalized) || isOpenAIGpt6AlwaysReasoningModel(normalized)
+    );
   }
 
   private isResponsesStreamingUnsupportedModel(model: string): boolean {
@@ -640,15 +647,16 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   /** Check if a model ID represents an OpenAI reasoning model */
   private isReasoningModel(model: string): boolean {
+    if (isOpenAIGpt6Model(model)) return true;
     if (this.isGenericCustomProvider() && !this.isOpenAINoSamplingModel(model)) return false;
     const m = model.toLowerCase();
-    return /^(o1|o3|o4)/.test(m) || m.startsWith("gpt-5") || isOpenAIGpt6AstraModel(m);
+    return /^(o1|o3|o4)/.test(m) || m.startsWith("gpt-5") || isOpenAIGpt6AlwaysReasoningModel(m);
   }
 
   private isXAIEndpoint(): boolean {
     if (this.isGenericCustomProvider()) return false;
     const baseUrl = this.baseUrl.toLowerCase();
-    return baseUrl.includes("api.x.ai") || baseUrl.includes("x.ai/");
+    return this.providerKind === "xai" || baseUrl.includes("api.x.ai") || baseUrl.includes("x.ai/");
   }
 
   private isOpenRouterXAIModel(model: string): boolean {
@@ -679,7 +687,10 @@ export class OpenAIProvider extends BaseLLMProvider {
     );
   }
 
-  private resolveXAIReasoningEffort(reasoningEffort?: string | null): "none" | "low" | "medium" | "high" | null {
+  private resolveXAIReasoningEffort(
+    model: string,
+    reasoningEffort?: string | null,
+  ): "none" | "low" | "medium" | "high" | "xhigh" | null {
     switch (reasoningEffort) {
       case "none":
       case "low":
@@ -689,7 +700,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       case "xhigh":
       case "max":
       case "maximum":
-        return "high";
+        return supportsXhighReasoningEffort(model) ? "xhigh" : "high";
       default:
         return null;
     }
@@ -706,11 +717,15 @@ export class OpenAIProvider extends BaseLLMProvider {
   /**
    * Check if a model/config does NOT support temperature/topP.
    * o-series models never do.
-   * Astra and GPT-5.6/GPT-5.5 reject sampling params entirely; older GPT-5.x models only
+   * GPT-6 Astra, GPT-6.1 Sol and GPT-5.6/GPT-5.5 reject sampling params entirely; older GPT-5.x models only
    * reject them when reasoning effort is active.
+   * GPT-6 Sol and GPT-6 Luna allow sampling only when reasoning effort is explicitly "none";
+   * an omitted effort uses the model's reasoning default and rejects sampling.
    */
   private isNoTemperatureModel(model: string, reasoningEffort?: string): boolean {
-    if (this.isGenericCustomProvider() && !this.isOpenAINoSamplingModel(model)) return false;
+    if (isOpenAIGpt6Model(model)) return isOpenAIGpt6AlwaysReasoningModel(model) || reasoningEffort !== "none";
+    if (this.isGenericCustomProvider() && !this.isOpenAINoSamplingModel(model) && !isClaudeStrictRequestModel(model))
+      return false;
     const m = model.toLowerCase();
     if (/^(o1|o3|o4)/.test(m)) return true;
     if (this.isOpenAINoSamplingModel(m)) return true;
@@ -721,8 +736,20 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   private stripUnsupportedSamplerParameters(body: Record<string, unknown>, options: ChatOptions): void {
-    if (!this.isNoTemperatureModel(options.model, options.reasoningEffort)) return;
-    const explicitCustomParameters = this.isGenericCustomProvider() ? options.customParameters : undefined;
+    // GPT-6 Sol/Luna allow sampling only when the dispatched request explicitly
+    // disables reasoning; an omitted/disabled parameter uses the model default.
+    const effort = isOpenAIGpt6Model(options.model)
+      ? typeof body.reasoning_effort === "string"
+        ? body.reasoning_effort
+        : body.reasoning && typeof body.reasoning === "object" && "effort" in body.reasoning
+          ? String(body.reasoning.effort)
+          : undefined
+      : options.reasoningEffort;
+    if (!this.isNoTemperatureModel(options.model, effort)) return;
+    const explicitCustomParameters =
+      this.isGenericCustomProvider() && !isClaudeStrictRequestModel(options.model)
+        ? options.customParameters
+        : undefined;
     const removeUnlessExplicit = (key: string) => {
       if (!explicitCustomParameters || !Object.prototype.hasOwnProperty.call(explicitCustomParameters, key)) {
         delete body[key];
@@ -734,7 +761,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     removeUnlessExplicit("min_p");
     removeUnlessExplicit("frequency_penalty");
     removeUnlessExplicit("presence_penalty");
-    if (isOpenAIGpt6AstraModel(options.model)) {
+    if (isOpenAIGpt6Model(options.model)) {
       removeUnlessExplicit("logprobs");
       removeUnlessExplicit("top_logprobs");
       if (!this.isGenericCustomProvider() && Array.isArray(body.include)) {
@@ -769,6 +796,7 @@ export class OpenAIProvider extends BaseLLMProvider {
   ): void {
     if (
       suppressModelParameters ||
+      isClaudeStrictRequestModel(options.model) ||
       !this.isGenericCustomProvider() ||
       !this.shouldSendParameter(options, "reasoningEffort") ||
       !this.hasExplicitReasoningDisable(options.reasoningEffort) ||
@@ -788,6 +816,7 @@ export class OpenAIProvider extends BaseLLMProvider {
   private supportsOpenAIReasoningDisable(model: string): boolean {
     const normalized = model.toLowerCase().replace(/^openai\//, "");
     if (normalized.includes("-pro")) return false;
+    if (isOpenAIGpt6Model(normalized)) return !isOpenAIGpt6AlwaysReasoningModel(normalized);
     const version = normalized.match(/^gpt-5\.(\d+)/)?.[1];
     return version !== undefined && Number(version) >= 1;
   }
@@ -800,6 +829,7 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   private supportsOpenRouterReasoningDisable(model: string): boolean {
+    if (isClaudeStrictRequestModel(model)) return false;
     const normalized = model.toLowerCase();
     return (
       this.supportsOpenAIReasoningDisable(normalized) ||
@@ -851,12 +881,21 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   private applyChatCompletionsReasoning(body: Record<string, unknown>, options: ChatOptions): void {
-    if (isOpenAIGpt6AstraModel(options.model) && this.hasExplicitReasoningDisable(options.reasoningEffort)) {
-      body.reasoning_effort = "low";
+    if (isClaudeStrictRequestModel(options.model)) {
+      const effort = options.reasoningEffort === "none" ? "low" : options.reasoningEffort;
+      if (effort) {
+        if (this.isOpenRouterEndpoint()) body.reasoning = { effort };
+        else body.reasoning_effort = effort;
+      }
+      return;
+    }
+    if (isOpenAIGpt6AlwaysReasoningModel(options.model) && this.hasExplicitReasoningDisable(options.reasoningEffort)) {
+      if (this.isOpenRouterEndpoint()) body.reasoning = { effort: "low" };
+      else body.reasoning_effort = "low";
       return;
     }
     if (this.isNativeXAIConfigurableReasoningModel(options.model)) {
-      const effort = this.resolveXAIReasoningEffort(options.reasoningEffort);
+      const effort = this.resolveXAIReasoningEffort(options.model, options.reasoningEffort);
       if (effort && (effort !== "none" || this.supportsXAIReasoningDisable(options.model))) {
         body.reasoning_effort = effort;
       }
@@ -913,7 +952,8 @@ export class OpenAIProvider extends BaseLLMProvider {
       this.hasExplicitReasoningDisable(options.reasoningEffort) &&
       !isGlm53MandatoryReasoningModel(options.model)
     ) {
-      body.reasoning_effort = "none";
+      // NanoGPT Kimi K3 always reasons; use its lightest supported effort for JSON agents requesting "none".
+      body.reasoning_effort = /(?:^|\/)kimi-k3(?:$|[-:])/iu.test(options.model) ? "low" : "none";
       return;
     }
 
@@ -952,6 +992,28 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
   }
 
+  private normalizeStrictClaudeRequest(body: Record<string, unknown>, options: ChatOptions): void {
+    if (!isClaudeStrictRequestModel(options.model)) return;
+    if (body.reasoning_effort === "none") body.reasoning_effort = "low";
+    if (body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)) {
+      const reasoning = body.reasoning as Record<string, unknown>;
+      if (reasoning.effort === "none") reasoning.effort = "low";
+      if (reasoning.enabled === false) delete reasoning.enabled;
+    }
+    if (body.tool_choice === "required" || (body.tool_choice && typeof body.tool_choice === "object")) {
+      body.tool_choice = "auto";
+    }
+    if (Array.isArray(body.messages)) {
+      const last = body.messages.at(-1);
+      if (last?.role === "assistant" && !last.tool_calls?.length) {
+        body.messages.push({
+          role: "user",
+          content: ASSISTANT_CONTINUATION_PROMPT,
+        });
+      }
+    }
+  }
+
   private applyResponsesReasoning(body: Record<string, unknown>, options: ChatOptions): void {
     if (this.isXAIMultiAgentModel(options.model)) {
       if (this.hasActiveReasoningEffort(options.reasoningEffort)) {
@@ -961,7 +1023,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
 
     if (this.isNativeXAIConfigurableReasoningModel(options.model)) {
-      const effort = this.resolveXAIReasoningEffort(options.reasoningEffort);
+      const effort = this.resolveXAIReasoningEffort(options.model, options.reasoningEffort);
       if (effort && (effort !== "none" || this.supportsXAIReasoningDisable(options.model))) {
         body.reasoning = { effort };
       }
@@ -988,7 +1050,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
 
     const reasoning: Record<string, unknown> = {};
-    if (isOpenAIGpt6AstraModel(options.model) && this.hasExplicitReasoningDisable(options.reasoningEffort)) {
+    if (isOpenAIGpt6AlwaysReasoningModel(options.model) && this.hasExplicitReasoningDisable(options.reasoningEffort)) {
       reasoning.effort = "low";
     }
     if (
@@ -1008,7 +1070,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       reasoning.mode = "pro";
     }
     if (
-      (isOpenAIGpt56Model(normalizedModel) || isOpenAIGpt6AstraModel(normalizedModel)) &&
+      (isOpenAIGpt56Model(normalizedModel) || isOpenAIGpt6Model(normalizedModel)) &&
       options.excludePastReasoning !== undefined
     ) {
       reasoning.context = options.excludePastReasoning ? "current_turn" : "all_turns";
@@ -1029,7 +1091,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     // (max_completion_tokens, temperature suppression) still apply via
     // isReasoningModel / isNoTemperatureModel which have their own GPT-5.5 gates.
     if (this.isGenericCustomProvider()) return false;
-    if (this.isGpt55Model(model) || isOpenAIGpt6AstraModel(model)) return true;
+    if (this.isGpt55Model(model) || (isOpenAIGpt6Model(model) && !this.isOpenRouterEndpoint())) return true;
     const m = model.toLowerCase();
     return (
       this.isXAIMultiAgentModel(model) ||
@@ -1055,7 +1117,7 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   private supportsGpt5Verbosity(model: string): boolean {
     if (this.isOpenAIChatGPTProvider()) return false;
-    return this.isGenericCustomProvider() || model.toLowerCase().startsWith("gpt-5") || isOpenAIGpt6AstraModel(model);
+    return this.isGenericCustomProvider() || model.toLowerCase().startsWith("gpt-5") || isOpenAIGpt6Model(model);
   }
 
   private applyResponsesTextOptions(body: Record<string, unknown>, options: ChatOptions): void {
@@ -1124,11 +1186,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     if (this.isGenericCustomProvider()) return false;
     const m = model.toLowerCase();
     return (
-      m.startsWith("gpt-5") ||
-      isOpenAIGpt6AstraModel(m) ||
-      m.startsWith("o1") ||
-      m.startsWith("o3") ||
-      m.startsWith("o4")
+      m.startsWith("gpt-5") || isOpenAIGpt6Model(m) || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")
     );
   }
 
@@ -1303,6 +1361,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     // parameters so an explicit Reasoning Effort: Off choice remains authoritative.
     this.enforceLocalInferenceThinkingDisable(body, options, suppressModelParameters);
     this.stripUnsupportedSamplerParameters(body, options);
+    this.normalizeStrictClaudeRequest(body, options);
 
     logger.debug(
       "[OpenAI chat()] stream=%s model=%s reasoning=%s enableThinking=%s verbosity=%s max_completion_tokens=%s max_tokens=%s temperature=%s top_p=%s tools=%s",
@@ -1456,6 +1515,8 @@ export class OpenAIProvider extends BaseLLMProvider {
       }
     } finally {
       if (options.signal) options.signal.removeEventListener("abort", onAbort);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
     this.emitChatCompletionsReasoning(options, reasoningMetadata);
     if (streamUsage) return finishReason ? { ...streamUsage, finishReason } : streamUsage;
@@ -1588,6 +1649,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     this.applyCustomParameters(body, options);
     this.enforceLocalInferenceThinkingDisable(body, options, suppressModelParameters);
     this.stripUnsupportedSamplerParameters(body, options);
+    this.normalizeStrictClaudeRequest(body, options);
 
     logger.debug(
       "[OpenAI chatComplete()] stream=%s model=%s reasoning=%s enableThinking=%s verbosity=%s onToken=%s",
@@ -1696,7 +1758,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const providerContentBlockToolCallIndexes = new Map<string, number>();
 
     try {
-      while (true) {
+      stream: while (true) {
         const { done, value } = await reader.read();
 
         buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
@@ -1707,7 +1769,7 @@ export class OpenAIProvider extends BaseLLMProvider {
           const trimmed = line.trim();
           const data = OpenAIProvider.extractSseData(trimmed);
           if (data == null) continue;
-          if (data === "[DONE]") break;
+          if (data === "[DONE]") break stream;
 
           let parsed: Record<string, unknown>;
           try {
@@ -1842,6 +1904,8 @@ export class OpenAIProvider extends BaseLLMProvider {
       }
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
 
     // Collect tool calls in order
@@ -2120,8 +2184,19 @@ export class OpenAIProvider extends BaseLLMProvider {
       if (topP != null) body.top_p = topP;
     }
 
-    if (!isOpenAIChatGPT && !suppressModelParameters && this.shouldSendParameter(options, "reasoningEffort")) {
-      this.applyResponsesReasoning(body, options);
+    if (!suppressModelParameters && this.shouldSendParameter(options, "reasoningEffort")) {
+      if (!isOpenAIChatGPT) {
+        this.applyResponsesReasoning(body, options);
+      } else if (this.isReasoningModel(options.model)) {
+        // Codex takes the same thinking levels as its own client, so a level the model lacks (max on GPT-5.5) is
+        // stepped down. It has no "none" level, so sending nothing keeps the model's default level.
+        const effort = resolveProviderReasoningEffort({
+          provider: "openai_chatgpt",
+          model: options.model,
+          reasoningEffort: options.reasoningEffort,
+        });
+        if (effort) body.reasoning = { effort };
+      }
     }
 
     // GPT-5+ verbosity and Responses structured output / JSON mode.
@@ -2391,7 +2466,7 @@ export class OpenAIProvider extends BaseLLMProvider {
               const resp = parsed.response as Record<string, unknown> | undefined;
               const error = resp?.error as Record<string, unknown> | undefined;
               const msg = (error?.message as string) ?? "unknown error";
-              logger.error(new Error(msg), "[OpenAI Responses] Stream ended with response.failed");
+              // Thrown, not logged: the caller writes the one line for this failure.
               throw new Error(`OpenAI Responses stream failed: ${msg}`);
             }
             case "response.incomplete": {
@@ -2706,7 +2781,7 @@ export class OpenAIProvider extends BaseLLMProvider {
               const resp = parsed.response as Record<string, unknown> | undefined;
               const error = resp?.error as Record<string, unknown> | undefined;
               const msg = (error?.message as string) ?? "unknown error";
-              logger.error(new Error(msg), "[OpenAI Responses] chatCompleteResponses stream failed");
+              // Thrown, not logged: the caller writes the one line for this failure.
               throw new Error(`OpenAI Responses stream failed: ${msg}`);
             }
             case "response.incomplete": {

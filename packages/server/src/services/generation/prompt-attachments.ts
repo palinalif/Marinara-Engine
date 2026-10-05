@@ -10,6 +10,8 @@ export type PromptAttachment = {
   imageCaptionConnectionId?: string | null;
   imageCaptionModel?: string | null;
   imageCaptionProvider?: string | null;
+  /** Short hash of the prompt the caption was made with; missing on captions made before prompts were editable. */
+  imageCaptionPromptKey?: string | null;
   imageCaptionedAt?: string | null;
 };
 

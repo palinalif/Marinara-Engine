@@ -1,3 +1,5 @@
+import { clickTopbarPanel } from "./topbar-navigation.js";
+import { prepareViteFixtureDependencies } from "./vite-fixture-dependencies.js";
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { seedUIState } from "./ui-state-fixture.js";
@@ -43,16 +45,14 @@ test("chat page-size changes while disabled restart from the newest cursor when 
     return route.fulfill({ json: fixtureMessages.slice(Math.max(0, end - limit), end) });
   });
   await page.goto("/");
+  await prepareViteFixtureDependencies(page);
   await page.evaluate(async () => {
     // Mount the real hook with an isolated cache so chat-detail loading can be
     // paused independently of the app shell and its own query observers.
     const { useChatMessages } = await import("/src/hooks/use-chats.ts" as string);
     // Reuse the app's exact versioned module URLs, including Vite's cache hash,
     // so the harness and hook share the same React Query context.
-    const dependencyUrl = (name: string) =>
-      performance
-        .getEntriesByType("resource")
-        .find((entry) => new URL(entry.name).pathname.endsWith(`/deps/${name}.js`))!.name;
+    const dependencyUrl = window.__viteFixtureDependencyUrl;
     const { default: React } = await import(dependencyUrl("react"));
     const { default: ReactDOM } = await import(dependencyUrl("react-dom_client"));
     const { QueryClient, QueryClientProvider } = await import(dependencyUrl("@tanstack_react-query"));
@@ -194,6 +194,9 @@ for (const mode of ["conversation", "roleplay"] as const) {
   });
 
   test(`${mode} issue sweep: goto loads history and page-size changes refetch`, async ({ page, request }, testInfo) => {
+    // Three history jumps and three full page-size refetches exceed the default
+    // minute on hosted desktop runners; keep the individual assertions bounded.
+    test.setTimeout(90_000);
     const transcript = [
       JSON.stringify({ user_name: "You", character_name: "Guide", chat_metadata: {} }),
       ...Array.from({ length: 120 }, (_, index) =>
@@ -237,7 +240,7 @@ for (const mode of ["conversation", "roleplay"] as const) {
       }
       await testInfo.attach(`${mode}-goto-history`, { body: await page.screenshot(), contentType: "image/png" });
 
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       const pageSize = page.locator("#settings-control-messages-per-page input");
       const refetched = page.waitForResponse(
         (response) => response.url().includes(`/chats/${chatId}/messages?limit=100`) && response.ok(),
@@ -246,17 +249,17 @@ for (const mode of ["conversation", "roleplay"] as const) {
       await pageSize.pressSequentially("100");
       await pageSize.press("Tab");
       await refetched;
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await expect(messages).toHaveCount(100);
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await pageSize.fill("0");
       await pageSize.press("Tab");
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await expect(messages).toHaveCount(120);
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await pageSize.fill("20");
       await pageSize.press("Tab");
-      await page.locator('[data-tour="panel-settings"]').click();
+      await clickTopbarPanel(page, "settings");
       await expect(messages).toHaveCount(20);
       await expect(page.getByText(/^Sweep transcript message 120\./)).toBeVisible();
     } finally {

@@ -137,10 +137,13 @@ const semanticSummaryMetadata = {
   summaryEntries: semanticSummaryEntries,
   semanticSummaryRetrievalEnabled: true,
 };
+let semanticSummaryDocumentEmbeddings = 0;
 const semanticSummaryEmbeddingSource: MemoryRecallEmbeddingSource = {
   label: "roleplay summary regression",
+  spaceId: "roleplay-summary-regression-model-v1",
   embed: async (texts, _signal, inputType) =>
     texts.map((text) => {
+      if (inputType === "document") semanticSummaryDocumentEmbeddings += 1;
       if (inputType === "query") {
         if (text.includes("dragon pact")) return [1, 0];
         if (text.includes("recipe")) return [0, 1];
@@ -166,6 +169,52 @@ assert.equal(
     semanticSummaryEntries[5]!.content,
   ].join("\n\n"),
   "semantic Roleplay summaries must retrieve relevant manual and backfilled entries while retaining recent entries",
+);
+const coldDocumentEmbeddingCount = semanticSummaryDocumentEmbeddings;
+await resolveRoleplayChatSummaryForPrompt({
+  chatMode: "roleplay",
+  chatMetadata: semanticSummaryMetadata,
+  messages: [{ role: "user", content: "What did the dragon pact require?" }],
+  vectorizerAvailable: true,
+  embeddingOptions: { embeddingSource: semanticSummaryEmbeddingSource },
+});
+assert.equal(
+  semanticSummaryDocumentEmbeddings,
+  coldDocumentEmbeddingCount,
+  "warm summaries must reuse document vectors",
+);
+const changedSpaceEmbeddingSource: MemoryRecallEmbeddingSource = {
+  ...semanticSummaryEmbeddingSource,
+  spaceId: "roleplay-summary-regression-model-v2",
+};
+await resolveRoleplayChatSummaryForPrompt({
+  chatMode: "roleplay",
+  chatMetadata: semanticSummaryMetadata,
+  messages: [{ role: "user", content: "What did the dragon pact require?" }],
+  vectorizerAvailable: true,
+  embeddingOptions: { embeddingSource: changedSpaceEmbeddingSource },
+});
+assert.equal(
+  semanticSummaryDocumentEmbeddings,
+  coldDocumentEmbeddingCount * 2,
+  "changing embedding space must rebuild cached summary vectors",
+);
+const adjustedSemanticSummary = await resolveRoleplayChatSummaryForPrompt({
+  chatMode: "roleplay",
+  chatMetadata: {
+    ...semanticSummaryMetadata,
+    semanticSummaryRecentCount: 1,
+    semanticSummaryOlderCount: 1,
+    semanticSummaryMinSimilarity: 0.99,
+  },
+  messages: [{ role: "user", content: "What did the dragon pact require?" }],
+  vectorizerAvailable: true,
+  embeddingOptions: { embeddingSource: changedSpaceEmbeddingSource },
+});
+assert.equal(
+  adjustedSemanticSummary,
+  [semanticSummaryEntries[1]!.content, semanticSummaryEntries[5]!.content].join("\n\n"),
+  "per-chat summary counts and threshold must control recent and older Roleplay recall",
 );
 assert.equal(
   await resolveRoleplayChatSummaryForPrompt({

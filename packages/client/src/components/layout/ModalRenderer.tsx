@@ -5,6 +5,7 @@ import { lazy, Suspense } from "react";
 import { useUIStore } from "../../stores/ui.store";
 import {
   normalizeAvatarCrop,
+  type APIProvider,
   type LorebookCategory,
   type LorebookScope,
   type ScenePromptPreferences,
@@ -68,6 +69,15 @@ const StartCharacterChatModal = lazy(() =>
     default: module.StartCharacterChatModal,
   })),
 );
+const GlobalSearchModal = lazy(() =>
+  import("../modals/GlobalSearchModal").then((module) => ({ default: module.GlobalSearchModal })),
+);
+const ChatStatsModal = lazy(() =>
+  import("../modals/ChatStatsModal").then((module) => ({ default: module.ChatStatsModal })),
+);
+const ActivityOverviewModal = lazy(() =>
+  import("../modals/ActivityOverviewModal").then((module) => ({ default: module.ActivityOverviewModal })),
+);
 
 export function ModalRenderer() {
   const modal = useUIStore((s) => s.modal);
@@ -109,7 +119,13 @@ export function ModalRenderer() {
       content = <ImportPersonaModal open onClose={closeModal} />;
       break;
     case "create-connection":
-      content = <CreateConnectionModal open onClose={closeModal} />;
+      content = (
+        <CreateConnectionModal
+          open
+          onClose={closeModal}
+          initialProvider={(modal?.props?.provider as APIProvider | undefined) ?? undefined}
+        />
+      );
       break;
     case "import-connection":
       content = <ImportConnectionModal open onClose={closeModal} />;
@@ -160,9 +176,11 @@ export function ModalRenderer() {
     case "scene-prompt-preferences":
       content = (
         <ScenePromptPreferencesModal
+          key={modal?.props?.chatId as string | undefined}
           open
           onClose={closeModal}
           initialPreferences={modal?.props?.initialPreferences as ScenePromptPreferences}
+          chatId={modal?.props?.chatId as string | undefined}
           sourceLabel={(modal?.props?.sourceLabel as string | null) ?? null}
           onSubmit={modal?.props?.onSubmit as (preferences: ScenePromptPreferences) => void}
           onCancel={modal?.props?.onCancel as (() => void) | undefined}
@@ -188,6 +206,17 @@ export function ModalRenderer() {
           characterName={(modal?.props?.characterName as string) ?? ""}
         />
       );
+      break;
+    case "global-chat-search":
+      content = (
+        <GlobalSearchModal open onClose={closeModal} initialQuery={(modal?.props?.initialQuery as string) ?? ""} />
+      );
+      break;
+    case "chat-stats":
+      content = <ChatStatsModal open onClose={closeModal} chatId={(modal?.props?.chatId as string) ?? ""} />;
+      break;
+    case "activity-overview":
+      content = <ActivityOverviewModal open onClose={closeModal} />;
       break;
     default:
       content = null;

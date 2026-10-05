@@ -12,6 +12,8 @@ import {
   lorebookSimilarityBaseline,
 } from "../../services/lorebook/embeddings.js";
 import { embedMemoryRecallTexts, type MemoryRecallEmbeddingOptions } from "../../services/memory-recall.js";
+import { embedSummaryDocuments } from "../../services/generation/summary-document-embeddings.js";
+import { normalizeSemanticSummaryRetrievalSettings } from "@marinara-engine/shared";
 import {
   formatConversationDateKey,
   generateMissingConversationSummaries,
@@ -74,9 +76,6 @@ type ConversationSummaryConnection = {
 type BucketMsg = { role: string; content: string; author: string; ts: Date };
 type Bucket = { date: string; msgs: BucketMsg[] };
 
-const SEMANTIC_SUMMARY_RECENT_WEEK_COUNT = 2;
-const SEMANTIC_SUMMARY_TOP_K = 3;
-const SEMANTIC_SUMMARY_MIN_SIMILARITY = 0.15;
 const SEMANTIC_SUMMARY_CALIBRATION_TEXTS = [
   "A recipe explains how to bake a loaf of bread.",
   "A spacecraft studies distant galaxies and nebulae.",
@@ -99,6 +98,7 @@ export async function selectConversationSummariesForPrompt(args: {
   query: string;
   enabled: boolean;
   vectorizerAvailable: boolean;
+  settings?: unknown;
   embeddingOptions?: MemoryRecallEmbeddingOptions;
 }): Promise<{
   daySummaries: Record<string, DaySummaryEntry>;
@@ -109,33 +109,56 @@ export async function selectConversationSummariesForPrompt(args: {
   const sortedWeekKeys = Object.keys(args.weekSummaries).sort(
     (left, right) => parseConversationDateKey(left).getTime() - parseConversationDateKey(right).getTime(),
   );
+  const settings = normalizeSemanticSummaryRetrievalSettings(args.settings);
   if (
     !args.enabled ||
     !args.vectorizerAvailable ||
     !args.query.trim() ||
-    sortedWeekKeys.length <= SEMANTIC_SUMMARY_RECENT_WEEK_COUNT
+    sortedWeekKeys.length <= settings.semanticSummaryRecentCount
   ) {
     return fallback;
   }
 
-  const recentKeys = sortedWeekKeys.slice(-SEMANTIC_SUMMARY_RECENT_WEEK_COUNT);
-  const olderKeys = sortedWeekKeys.slice(0, -SEMANTIC_SUMMARY_RECENT_WEEK_COUNT);
+  const recentKeys = sortedWeekKeys.slice(Math.max(0, sortedWeekKeys.length - settings.semanticSummaryRecentCount));
+  const olderKeys = sortedWeekKeys.slice(0, Math.max(0, sortedWeekKeys.length - settings.semanticSummaryRecentCount));
+  if (settings.semanticSummaryOlderCount === 0) {
+    const selectedKeys = new Set(recentKeys);
+    return {
+      daySummaries: args.daySummaries,
+      weekSummaries: Object.fromEntries(
+        sortedWeekKeys.filter((key) => selectedKeys.has(key)).map((key) => [key, args.weekSummaries[key]!]),
+      ),
+      semanticApplied: true,
+    };
+  }
   try {
     const [queryEmbeddings, summaryEmbeddings] = await Promise.all([
       embedMemoryRecallTexts([args.query, ...SEMANTIC_SUMMARY_CALIBRATION_TEXTS], {
         ...(args.embeddingOptions ?? {}),
         inputType: "query",
       }),
-      embedMemoryRecallTexts(
+      embedSummaryDocuments(
         olderKeys.map((key) => {
           const entry = args.weekSummaries[key]!;
           return [`Week of ${key}`, entry.summary, ...entry.keyDetails].filter(Boolean).join("\n");
         }),
-        { ...(args.embeddingOptions ?? {}), inputType: "document" },
+        args.embeddingOptions ?? {},
       ),
     ]);
     const queryEmbedding = queryEmbeddings[0];
     if (!queryEmbedding?.length || summaryEmbeddings.length !== olderKeys.length) return fallback;
+    if (summaryEmbeddings.some((embedding) => embedding.length !== queryEmbedding.length)) {
+      const refreshed = await embedSummaryDocuments(
+        olderKeys.map((key) => {
+          const entry = args.weekSummaries[key]!;
+          return [`Week of ${key}`, entry.summary, ...entry.keyDetails].filter(Boolean).join("\n");
+        }),
+        args.embeddingOptions ?? {},
+        queryEmbedding.length,
+      );
+      if (refreshed.length !== olderKeys.length) return fallback;
+      summaryEmbeddings.splice(0, summaryEmbeddings.length, ...refreshed);
+    }
     const baseline = lorebookSimilarityBaseline(queryEmbeddings.slice(1));
     const relevantOlderKeys = olderKeys
       .map((key, index) => {
@@ -147,9 +170,9 @@ export async function selectConversationSummariesForPrompt(args: {
         };
       })
       .filter((match): match is { key: string; similarity: number } => match !== null)
-      .filter((match) => match.similarity >= SEMANTIC_SUMMARY_MIN_SIMILARITY)
+      .filter((match) => match.similarity >= settings.semanticSummaryMinSimilarity)
       .sort((left, right) => right.similarity - left.similarity)
-      .slice(0, SEMANTIC_SUMMARY_TOP_K)
+      .slice(0, settings.semanticSummaryOlderCount)
       .map((match) => match.key);
     const selectedKeys = new Set([...recentKeys, ...relevantOlderKeys]);
     return {
@@ -208,7 +231,13 @@ export async function prepareConversationPromptHistory(args: {
   fallbackBaseUrl?: string;
   summaryEmbeddingOptions?: MemoryRecallEmbeddingOptions;
   summaryVectorizerAvailable?: boolean;
-}): Promise<{ finalMessages: GenerationPromptMessage[]; importantMemoryBlock: string | null }> {
+  /** Build a separate LTM input without changing the main prompt's provenance. */
+  includeRecallHistory?: boolean;
+}): Promise<{
+  finalMessages: GenerationPromptMessage[];
+  importantMemoryBlock: string | null;
+  recallHistoryMessages?: GenerationPromptMessage[];
+}> {
   const rolloverHour = Math.max(
     0,
     Math.min(11, Math.floor((args.chatMeta.dayRolloverHour as number | undefined) ?? 4)),
@@ -341,6 +370,7 @@ export async function prepareConversationPromptHistory(args: {
     query: buildConversationSummaryRetrievalQuery(summarySourceMessages),
     enabled: args.chatMeta.semanticSummaryRetrievalEnabled === true,
     vectorizerAvailable: args.summaryVectorizerAvailable === true,
+    settings: args.chatMeta,
     embeddingOptions: args.summaryEmbeddingOptions,
   });
   const daySummaries = selectedSummaries.daySummaries;
@@ -370,6 +400,7 @@ export async function prepareConversationPromptHistory(args: {
     daySummaries: allDaySummaries,
   });
 
+  const recallHistoryMessages: GenerationPromptMessage[] | undefined = args.includeRecallHistory ? [] : undefined;
   finalMessages = flattenConversationHistoryBuckets({
     buckets,
     tailEntries,
@@ -384,10 +415,11 @@ export async function prepareConversationPromptHistory(args: {
     promptTimeZone: args.promptTimeZone,
     personaName: args.personaName,
     wrapFormat: args.wrapFormat,
+    recallHistoryMessages,
   });
 
   const importantMemoryBlock = formatConversationImportantMemoryBlock(allKeyDetails, args.wrapFormat);
-  return { finalMessages, importantMemoryBlock };
+  return { finalMessages, importantMemoryBlock, ...(recallHistoryMessages ? { recallHistoryMessages } : {}) };
 }
 
 async function annotateConversationPromptReactions(args: {
@@ -626,6 +658,7 @@ function flattenConversationHistoryBuckets(args: {
   promptTimeZone?: string;
   personaName: string;
   wrapFormat: WrapFormat;
+  recallHistoryMessages?: GenerationPromptMessage[];
 }): GenerationPromptMessage[] {
   const weekBlocksEmitted = new Set<string>();
   const fmtTailPrefix = (ts: Date) => {
@@ -633,15 +666,19 @@ function flattenConversationHistoryBuckets(args: {
     return `[${date} ${formatZonedConversationTime(ts, args.promptTimeZone)}]`;
   };
   const buildTailTurns = (): GenerationPromptMessage[] =>
-    args.tailEntries.map((message) => ({
-      role: message.role as "user" | "assistant" | "system",
-      content: `${fmtTailPrefix(message.ts)} ${formatConversationPromptTurn(
-        message.content,
-        message.role,
-        args.personaName,
-        message.role === "assistant" ? message.author : null,
-      )}`,
-    }));
+    args.tailEntries.map((message) => {
+      const turn = {
+        role: message.role as "user" | "assistant" | "system",
+        content: `${fmtTailPrefix(message.ts)} ${formatConversationPromptTurn(
+          message.content,
+          message.role,
+          args.personaName,
+          message.role === "assistant" ? message.author : null,
+        )}`,
+      };
+      args.recallHistoryMessages?.push({ ...message, ...turn, contextKind: "history" });
+      return turn;
+    });
 
   const finalMessages = args.buckets.flatMap((bucket, bucketIndex): GenerationPromptMessage[] => {
     const prefix = bucketIndex === args.firstTodayIdx ? buildTailTurns() : [];
@@ -690,8 +727,12 @@ function flattenConversationHistoryBuckets(args: {
         bucket.date,
         args.wrapFormat,
       );
+      args.recallHistoryMessages?.push(
+        ...turns.map((turn, index) => ({ ...bucket.msgs[index]!, ...turn, contextKind: "history" as const })),
+      );
       return [...prefix, ...turns];
     }
+    if (bucket.contextKind === "history") args.recallHistoryMessages?.push({ ...bucket });
     return [...prefix, bucket];
   });
 

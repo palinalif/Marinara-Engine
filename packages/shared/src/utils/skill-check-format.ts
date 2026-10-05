@@ -43,7 +43,9 @@ export function formatSkillCheckResultSummary(result: SkillCheckResult): string 
   const arithmetic = skillCheckDiceSumToTotal(result)
     ? `[${result.rolls.join(", ")}]${modifier}${rollMode} = ${result.total}`
     : `[${result.rolls.join(", ")}]${result.resolution === "successes" ? "" : modifier}${rollMode} → ${result.total}${result.resolution === "successes" ? ` ${result.total === 1 ? "success" : "successes"}` : ""}`;
-  return `${result.skill} check (DC ${result.dc}): ${arithmetic}. ${getSkillCheckOutcomeLabel(result)}.`;
+  // A complication is alongside the outcome, never instead of it, so the outcome is still said first.
+  const complication = result.complication ? " Something went wrong on the side." : "";
+  return `${result.skill} check (DC ${result.dc}): ${arithmetic}. ${getSkillCheckOutcomeLabel(result)}.${complication}`;
 }
 
 function serializeSkillCheckAttribute(value: string): string {
@@ -80,6 +82,48 @@ export interface SkillCheckTagExtras {
   threshold?: number;
   /** `pool="d20:1"` — the slot the engine actually spent, never the one the model claimed. */
   pool?: string;
+  /** `who="Name"` — the party member a ruleset game rolled for. Written only by that path. */
+  who?: string;
+  /** `with="Ability"` — the ability a ruleset check rolled with instead of the skill's own. */
+  with?: string;
+  /** `bonus="+2"` — dice a pool ruleset added or took for this check. Written only by that path. */
+  bonus?: number;
+  /** `spend="willpower:1"` — what the check actually paid, never what the model asked to pay. */
+  spend?: string;
+  /** `auto="2"` — successes a spend added that nobody rolled, so a reader can tell them apart. */
+  auto?: number;
+  /** `use="Potence"` — the catalog entry the check actually applied, never one it could not. */
+  use?: string;
+  /** `rerolled="3"` — how many dice a bought re-throw replaced. */
+  rerolled?: number;
+  /** The wound penalty already applied by the Engine. */
+  penalty?: number;
+  /** `difficulty="Grim"` — the ladder step a sparse ask named. Only ever the ask: a rolled record
+   *  says the numbers the step stood for instead. */
+  difficulty?: string;
+  /** `explode="9"` / `double="9"` — the face a pool check moved the rule to, or the ask for it. */
+  explode?: number;
+  double?: number;
+  /** `complication="true"` — the roll went wrong on the side without botching outright. */
+  complication?: boolean;
+  /** `adjust="-2"` — what the sheet itself added to or took off the check. */
+  adjust?: number;
+  /** `reroll="rote"` — the standing re-throw the check applied, or the ask for one. */
+  reroll?: string;
+  /** `reason="untrained"` — the Engine did not roll the check, because the character cannot attempt
+   *  it untrained. Only ever on an ask. */
+  reason?: "untrained";
+  /** `effects="-1"` — what the character's conditions and worn or carried items added or took. */
+  effects?: number;
+  /** `from="Poisoned; Leather coat"` — the conditions and items that changed the check. */
+  from?: string[];
+  /** `automatic="true"` — the save failed without a roll. */
+  automatic?: boolean;
+}
+
+/** A name in `from=`: no brackets, which would end the tag, and no semicolons, which part the names. */
+function fromName(name: string): string {
+  return serializeSkillCheckAttribute(name.replace(/[[\];]/g, " ").replace(/\s+/g, " "));
 }
 
 function serializeSkillCheckExtras(extras: SkillCheckTagExtras | undefined): string {
@@ -87,13 +131,44 @@ function serializeSkillCheckExtras(extras: SkillCheckTagExtras | undefined): str
   const parts: string[] = [];
   if (extras.threshold != null && Number.isFinite(extras.threshold)) parts.push(`threshold="${extras.threshold}"`);
   if (extras.pool) parts.push(`pool="${serializeSkillCheckAttribute(extras.pool)}"`);
+  if (extras.who) parts.push(`who="${serializeSkillCheckAttribute(extras.who)}"`);
+  // Appended after everything a tag has always carried, so no shipped call site changes its bytes.
+  if (extras.with) parts.push(`with="${serializeSkillCheckAttribute(extras.with)}"`);
+  if (extras.bonus != null && Number.isFinite(extras.bonus)) {
+    parts.push(`bonus="${extras.bonus > 0 ? "+" : ""}${extras.bonus}"`);
+  }
+  if (extras.spend) parts.push(`spend="${serializeSkillCheckAttribute(extras.spend)}"`);
+  if (extras.auto != null && Number.isFinite(extras.auto) && extras.auto > 0) parts.push(`auto="${extras.auto}"`);
+  if (extras.use) parts.push(`use="${serializeSkillCheckAttribute(extras.use)}"`);
+  if (extras.rerolled != null && Number.isFinite(extras.rerolled) && extras.rerolled > 0) {
+    parts.push(`rerolled="${extras.rerolled}"`);
+  }
+  if (extras.penalty != null && Number.isFinite(extras.penalty) && extras.penalty < 0) {
+    parts.push(`penalty="${extras.penalty}"`);
+  }
+  if (extras.difficulty) parts.push(`difficulty="${serializeSkillCheckAttribute(extras.difficulty)}"`);
+  if (extras.explode != null && Number.isFinite(extras.explode)) parts.push(`explode="${extras.explode}"`);
+  if (extras.double != null && Number.isFinite(extras.double)) parts.push(`double="${extras.double}"`);
+  if (extras.complication) parts.push(`complication="true"`);
+  if (extras.adjust != null && Number.isFinite(extras.adjust) && extras.adjust !== 0) {
+    parts.push(`adjust="${extras.adjust > 0 ? "+" : ""}${extras.adjust}"`);
+  }
+  if (extras.reroll) parts.push(`reroll="${serializeSkillCheckAttribute(extras.reroll)}"`);
+  if (extras.reason) parts.push(`reason="${extras.reason}"`);
+  if (extras.effects != null && Number.isFinite(extras.effects) && extras.effects !== 0) {
+    parts.push(`effects="${extras.effects > 0 ? "+" : ""}${extras.effects}"`);
+  }
+  const from = (extras.from ?? []).map(fromName).filter(Boolean);
+  if (from.length > 0) parts.push(`from="${from.join("; ")}"`);
+  if (extras.automatic) parts.push(`automatic="true"`);
   return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 }
 
 export function serializeSparseSkillCheckTag(
   request: {
     skill: string;
-    dc: number;
+    /** Absent on an ask that named its difficulty with `difficulty=` instead; see the extras. */
+    dc?: number;
     advantage?: boolean;
     disadvantage?: boolean;
     preRolledD20?: number;
@@ -102,7 +177,8 @@ export function serializeSparseSkillCheckTag(
   },
   extras?: SkillCheckTagExtras,
 ): string {
-  const parts = [`[skill_check: skill="${serializeSkillCheckAttribute(request.skill)}"`, `dc="${request.dc}"`];
+  const parts = [`[skill_check: skill="${serializeSkillCheckAttribute(request.skill)}"`];
+  if (request.dc != null && Number.isFinite(request.dc)) parts.push(`dc="${request.dc}"`);
   if (request.preRolledD20 != null) parts.push(`rolls="${request.preRolledD20}"`);
   if (request.advantage && !request.disadvantage) parts.push(`mode="advantage"`);
   else if (request.disadvantage && !request.advantage) parts.push(`mode="disadvantage"`);
@@ -113,6 +189,30 @@ export function serializeSparseSkillCheckTag(
 }
 
 export function serializeResolvedSkillCheckTag(result: SkillCheckResult, extras?: SkillCheckTagExtras): string {
+  // A result that carries its own `who` or per-die threshold writes them without the caller
+  // repeating itself. An explicit extra still wins: a caller that passes one is the path that
+  // measured it, and the legacy pool path has always passed its own.
+  const merged: SkillCheckTagExtras = {
+    ...(result.threshold != null ? { threshold: result.threshold } : {}),
+    ...(result.who ? { who: result.who } : {}),
+    ...(result.withAbility ? { with: result.withAbility } : {}),
+    ...(result.bonusDice ? { bonus: result.bonusDice } : {}),
+    ...(result.spent ? { spend: `${result.spent.pool}:${result.spent.amount}` } : {}),
+    ...(result.autoSuccesses ? { auto: result.autoSuccesses } : {}),
+    ...(result.used ? { use: result.used } : {}),
+    ...(result.rerolled ? { rerolled: result.rerolled } : {}),
+    ...(result.penalty != null ? { penalty: result.penalty } : {}),
+    ...(result.explodeFrom != null ? { explode: result.explodeFrom } : {}),
+    ...(result.doubleFrom != null ? { double: result.doubleFrom } : {}),
+    ...(result.complication ? { complication: true } : {}),
+    ...(result.adjust ? { adjust: result.adjust } : {}),
+    ...(result.reroll ? { reroll: result.reroll } : {}),
+    ...(result.effects ? { effects: result.effects } : {}),
+    ...(result.from?.length ? { from: result.from } : {}),
+    ...(result.automatic ? { automatic: true } : {}),
+    // An extra a caller left undefined is absent, not an instruction to erase what the result says.
+    ...Object.fromEntries(Object.entries(extras ?? {}).filter(([, value]) => value !== undefined)),
+  };
   return `${[
     `[skill_check: skill="${serializeSkillCheckAttribute(result.skill)}"`,
     `dc="${result.dc}"`,
@@ -124,5 +224,5 @@ export function serializeResolvedSkillCheckTag(result: SkillCheckResult, extras?
     `mode="${result.rollMode}"`,
     `resolution="${result.resolution}"`,
     `dice="${serializeSkillCheckAttribute(result.dice ?? "1d20")}"`,
-  ].join(" ")}${serializeSkillCheckExtras(extras)}]`;
+  ].join(" ")}${serializeSkillCheckExtras(merged)}]`;
 }

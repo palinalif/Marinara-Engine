@@ -186,8 +186,13 @@ function buildMergedRewritePrompt(agents: ResolvedAgent[]): string {
   ].join("\n");
 }
 
+/** Built-in rewrite agents share one editor request unless the user turned sharing off for one (#6977). */
+export function sharesBuiltInRewriteRequest(agent: Pick<ResolvedAgent, "type" | "settings">): boolean {
+  return REWRITE_AGENT_TYPES.has(agent.type) && agent.settings.batchWithOtherAgents !== false;
+}
+
 export function mergePairedBuiltInRewriteAgents(agents: ResolvedAgent[]): ResolvedAgent[] {
-  const builtInRewriteAgents = agents.filter((agent) => REWRITE_AGENT_TYPES.has(agent.type));
+  const builtInRewriteAgents = agents.filter(sharesBuiltInRewriteRequest);
   if (builtInRewriteAgents.length <= 1) return agents;
 
   const firstMergeIndex = Math.min(...builtInRewriteAgents.map((agent) => agents.indexOf(agent)));
@@ -213,7 +218,7 @@ export function mergePairedBuiltInRewriteAgents(agents: ResolvedAgent[]): Resolv
   for (let index = 0; index < agents.length; index++) {
     const agent = agents[index]!;
     if (index === firstMergeIndex) merged.push(mergedAgent);
-    if (REWRITE_AGENT_TYPES.has(agent.type)) continue;
+    if (sharesBuiltInRewriteRequest(agent)) continue;
     merged.push(agent);
   }
   return merged;

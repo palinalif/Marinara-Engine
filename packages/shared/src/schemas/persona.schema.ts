@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { storedRulesetSheetsSchema } from "./ruleset.schema.js";
 import { avatarCropSchema } from "./avatar-crop.schema.js";
 import { convoBehaviorInsertionStrategySchema } from "./character.schema.js";
 import { normalizeStatIcon, SUPPORTED_STAT_ICONS } from "../constants/stat-icons.js";
@@ -248,7 +249,13 @@ const rpgStatsSchema = z
   .passthrough();
 
 const personaStatsSchema = z
-  .object({ enabled: z.boolean(), bars: z.array(personaStatBarSchema), rpgStats: rpgStatsSchema.optional() })
+  .object({
+    enabled: z.boolean(),
+    bars: z.array(personaStatBarSchema),
+    rpgStats: rpgStatsSchema.optional(),
+    /** Starting builds for Game Mode rulesets, keyed by ruleset id. Bounded, never shape-checked. */
+    rulesetSheets: storedRulesetSheetsSchema.optional(),
+  })
   .passthrough()
   .transform((value): PersonaStatsConfig => value);
 
@@ -273,6 +280,10 @@ const personaFields = {
   scenario: z.string().optional(),
   backstory: z.string().optional(),
   appearance: z.string().optional(),
+  /** Marinara Engine: use `imageAppearance` instead of `appearance` in image prompts. */
+  imageAppearanceEnabled: z.boolean().optional(),
+  /** Marinara Engine: appearance text used for image prompts when the override is enabled. */
+  imageAppearance: z.string().optional(),
   avatarCrop: avatarCropSchema.nullable().optional(),
   nameColor: personaLocalPaintSchema.optional(),
   dialogueColor: personaLocalPaintSchema.optional(),

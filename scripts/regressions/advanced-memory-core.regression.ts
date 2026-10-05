@@ -14,6 +14,7 @@ process.env.MARINARA_LITE = "true";
 
 const requests: Array<{ kind: string; text: string }> = [];
 let beforeSummary: (() => Promise<void>) | null = null;
+let beforeEmbedding: (() => Promise<void>) | null = null;
 let sceneFinishReason = "stop";
 const server = createServer(async (request, response) => {
   const chunks: Buffer[] = [];
@@ -26,6 +27,9 @@ const server = createServer(async (request, response) => {
   if (request.url?.endsWith("/embeddings")) {
     const input = Array.isArray(body.input) ? body.input : [body.input ?? ""];
     requests.push({ kind: "embedding", text: input.join("\n") });
+    const callback = beforeEmbedding;
+    beforeEmbedding = null;
+    if (callback) await callback();
     response.end(
       JSON.stringify({
         data: input.map((text, index) => ({ index, embedding: [1, text.includes("compass") ? 1 : 0, 0.5] })),
@@ -39,17 +43,23 @@ const server = createServer(async (request, response) => {
   requests.push({ kind: classification ? "classify" : "summary", text });
   let content: string;
   if (classification) {
-    const source = JSON.parse(messages[1]!.content) as Array<{ messageId: string; content: string }>;
-    content = JSON.stringify({
-      starts: source
-        .filter((message) => message.content.startsWith("SCENE_CHANGE"))
-        .map((message) => ({ messageId: message.messageId })),
-    });
+    const source = JSON.parse(messages[1]!.content) as Array<{
+      messageId: string;
+      messageNumber: number;
+      content: string;
+    }>;
+    const transitions = source.filter((message) => message.content.startsWith("SCENE_CHANGE"));
+    content = JSON.stringify(
+      messages[0]!.content.includes('"ends"')
+        ? { ends: transitions.map((message) => ({ messageNumber: message.messageNumber - 1 })) }
+        : { starts: transitions.map((message) => ({ messageId: message.messageId })) },
+    );
   } else {
     const callback = beforeSummary;
     beforeSummary = null;
     if (callback) await callback();
     content = JSON.stringify({
+      audience: "all",
       summary: text.includes("CORRECTED_SILVER")
         ? "CORRECTED_SILVER compass."
         : text.includes("CORRECTED_GOLD")
@@ -106,6 +116,51 @@ db.select = ((...args: unknown[]) => {
 }) as typeof db.select;
 const chats = createChatsStorage(db);
 const memory = createAdvancedMemoryService(db);
+const createChat = chats.create.bind(chats);
+chats.create = async (input) => {
+  const chat = await createChat(input);
+  if (chat) await chats.patchMetadata(chat.id, { summaryMaxTokens: 512 });
+  return chat;
+};
+// Legacy continuity/temporary records remain importable and deletable, but are no
+// longer produced by prompt preparation or used instead of canonical Chat Summaries.
+async function seedLegacyRecord(
+  chatId: string,
+  kind: "continuity" | "temporary",
+  boundary: string,
+  template?: Awaited<ReturnType<typeof memory.status>>["records"][number],
+) {
+  const base =
+    template ??
+    (await memory.status(chatId)).records.find(
+      (record) => record.kind === "scene" && record.content && record.status === "closed",
+    );
+  assert(base);
+  const id = `legacy-${kind}-${chatId}`;
+  const { startIndex: _start, endIndex: _end, embeddingStatus: _embedding, ...stored } = base;
+  const dependencies = [
+    ...base.dependencies,
+    { id: "boundary", revision: boundary },
+    { id: "shared-start", revision: "" },
+    { id: "budget", revision: "512" },
+  ];
+  await db.insert(advancedMemoryRecords).values({
+    ...stored,
+    id,
+    kind,
+    sceneId: `${kind}-${boundary}`,
+    content: "Legacy continuity",
+    enabled: 1,
+    manualOverride: 0,
+    messageIds: JSON.stringify(base.messageIds),
+    audienceCharacterIds: JSON.stringify(base.audienceCharacterIds),
+    dependencies: JSON.stringify(dependencies),
+    embedding: null,
+    embeddingSpaceId: null,
+  });
+  return id;
+}
+
 try {
   const connection = await createConnectionsStorage(db).create(
     createConnectionSchema.parse({
@@ -114,7 +169,7 @@ try {
       model: "gpt-4o-mini",
       baseUrl,
       apiKey: "test-key",
-      maxContext: 4096,
+      maxContext: 16_384,
       defaultForAgents: true,
       embeddingBaseUrl: baseUrl,
       embeddingModel: "memory-proof",
@@ -132,7 +187,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
     },
   });
@@ -176,6 +231,7 @@ try {
   });
   assert.equal(requests.length, settledRequests, "preview makes no provider or embedding call");
   assert.equal(readonly.messageIds.length, 800);
+  const summariesBeforePrepare = requests.filter((request) => request.kind === "summary").length;
   const prepared = await memory.prepare({
     chatId: chat.id,
     messages: source,
@@ -183,9 +239,8 @@ try {
     budgetTokens: 1200,
   });
   assert(prepared.currentSceneSummary, "a large ongoing scene gets a temporary prefix summary");
-  assert(prepared.chatSummary?.includes("source timeframe (summary corrections take precedence): Spring 14"));
-  assert(prepared.currentSceneSummary.includes("story timeframe: Spring 15"));
-  assert(prepared.chatSummary.includes("Messages #1–#400"), "continuity retains canonical chronology");
+  assert.equal(prepared.chatSummary, null, "scene recaps do not populate a parallel constant-summary store");
+  assert(prepared.currentSceneSummary.includes("Spring 15"), "ongoing-source excerpts retain source dates");
   assert(prepared.messageIds.includes(source.at(-1)!.id), "the latest message remains exact history");
   assert(prepared.receipt.estimatedTokensAfter <= 1200);
   await memory.validatePrepared(chat.id, source, prepared.receipt);
@@ -194,87 +249,17 @@ try {
     "prefix compression leaves the scene open",
   );
 
-  assert(prepared.receipt.checkpointId);
-  const originalCheckpointId = prepared.receipt.checkpointId;
-  const oversizedCorrection = "CORRECTED_GOLD compass. ".repeat(500);
-  await memory.updateRecord(chat.id, originalCheckpointId, { content: oversizedCorrection });
-  const compactedCorrection = await memory.prepare({
-    chatId: chat.id,
-    messages: source,
-    audienceCharacterIds: [],
-    budgetTokens: 1200,
-  });
   assert(
-    compactedCorrection.chatSummary?.includes("CORRECTED_GOLD"),
-    "oversized user correction supplies the derived summary",
-  );
-  assert.notEqual(compactedCorrection.receipt.checkpointId, originalCheckpointId);
-  assert.equal(
-    (await memory.status(chat.id)).records.find((record) => record.id === originalCheckpointId)?.content,
-    oversizedCorrection.trim(),
-    "the original user edit is preserved exactly",
-  );
-  const beforeCachedCorrection = requests.length;
-  await memory.prepare({
-    chatId: chat.id,
-    messages: source,
-    audienceCharacterIds: [],
-    budgetTokens: 1200,
-    readOnly: true,
-  });
-  assert.equal(requests.length, beforeCachedCorrection, "derived correction is reusable in read-only preparation");
-  await memory.updateRecord(chat.id, originalCheckpointId, { enabled: false });
-  const disabledCorrection = await memory.prepare({
-    chatId: chat.id,
-    messages: source,
-    audienceCharacterIds: [],
-    budgetTokens: 1200,
-  });
-  assert(
-    !disabledCorrection.chatSummary?.includes("CORRECTED_GOLD"),
-    "disabled correction is excluded from rebuilt required continuity",
-  );
-  assert.notEqual(disabledCorrection.receipt.checkpointId, originalCheckpointId);
-  assert.equal(
-    (await memory.status(chat.id)).records.find((record) => record.id === originalCheckpointId)?.enabled,
-    false,
-  );
-  await memory.validatePrepared(chat.id, source, disabledCorrection.receipt);
-  const temporaryOriginal = (await memory.status(chat.id)).records.find(
-    (record) => record.kind === "temporary" && record.id in disabledCorrection.receipt.recordRevisions,
-  );
-  assert(temporaryOriginal);
-  await memory.updateRecord(chat.id, temporaryOriginal.id, { content: oversizedCorrection });
-  const temporaryCorrected = await memory.prepare({
-    chatId: chat.id,
-    messages: source,
-    audienceCharacterIds: [],
-    budgetTokens: 1200,
-  });
-  assert(
-    temporaryCorrected.currentSceneSummary?.includes("CORRECTED_GOLD"),
-    "oversized open-scene corrections supply a smaller derivative",
+    !(await memory.status(chat.id)).records.some(
+      (record) => record.kind === "continuity" || record.kind === "temporary",
+    ),
+    "reading memory never saves a new summary",
   );
   assert.equal(
-    (await memory.status(chat.id)).records.find((record) => record.id === temporaryOriginal.id)?.content,
-    oversizedCorrection.trim(),
+    requests.filter((request) => request.kind === "summary").length,
+    summariesBeforePrepare,
+    "prompt fitting adds no summary calls",
   );
-  await memory.updateRecord(chat.id, temporaryOriginal.id, { enabled: false });
-  const temporaryDisabled = await memory.prepare({
-    chatId: chat.id,
-    messages: source,
-    audienceCharacterIds: [],
-    budgetTokens: 1200,
-  });
-  assert(
-    !temporaryDisabled.currentSceneSummary?.includes("CORRECTED_GOLD"),
-    "a disabled temporary correction is not silently injected",
-  );
-  assert.equal(
-    (await memory.status(chat.id)).records.find((record) => record.id === temporaryOriginal.id)?.enabled,
-    false,
-  );
-  await memory.validatePrepared(chat.id, source, temporaryDisabled.receipt);
 
   const historicalSource = source.slice(0, 80);
   const historicalStart = requests.length;
@@ -371,7 +356,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
       narratorCharacterId: "narrator",
       knowledgeStarts: { alice: null, bob: privateSource[6]!.id },
@@ -408,6 +393,181 @@ try {
   });
   await memory.validatePrepared(privateChat.id, beforeHistoricalPolicy, alicePast.receipt);
 
+  const hiddenSceneChat = await chats.create({
+    name: "Pantalone-only hidden scene",
+    mode: "roleplay",
+    characterIds: ["maukie", "pantalone", "narrator"],
+    connectionId: connection!.id,
+  });
+  assert(hiddenSceneChat);
+  await chats.patchMetadata(hiddenSceneChat.id, {
+    groupChatMode: "individual",
+    advancedMemory: {
+      ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
+      enabled: true,
+      narratorCharacterId: "narrator",
+      knowledgeStarts: { maukie: null, pantalone: null },
+    },
+  });
+  await chats.createMessagesBatch(hiddenSceneChat.id, [
+    {
+      role: "user",
+      content: "Pantalone enters the private office alone.",
+      extra: { hiddenFromAICharacterIds: ["maukie"] },
+    },
+    {
+      role: "assistant",
+      characterId: "pantalone",
+      content: "PANTALONE_PRIVATE_SECRET: The ledger belongs to Pantalone.",
+      extra: { hiddenFromAICharacterIds: ["maukie"] },
+    },
+    { role: "user", content: "SCENE_CHANGE Everyone meets at the compass shop." },
+  ]);
+  await memory.initialize(hiddenSceneChat.id);
+  const hiddenSceneSource = await chats.listMessages(hiddenSceneChat.id);
+  const privateRecaps = (await memory.status(hiddenSceneChat.id)).records.filter(
+    (record) => record.kind === "scene" && record.content && record.status === "closed",
+  );
+  assert(privateRecaps.some((record) => record.audienceCharacterIds.includes("pantalone")));
+  assert(
+    privateRecaps.every((record) => !record.audienceCharacterIds.includes("maukie")),
+    "initial processing must never assign a fully hidden Pantalone scene to Maukie",
+  );
+  const maukieRecall = await memory.prepare({
+    chatId: hiddenSceneChat.id,
+    messages: hiddenSceneSource,
+    audienceCharacterIds: ["maukie"],
+    budgetTokens: 3000,
+    readOnly: true,
+  });
+  assert.equal(maukieRecall.recalledScenes, null);
+  assert.equal(maukieRecall.recalledMessages, null);
+  assert.deepEqual(maukieRecall.messageIds, [hiddenSceneSource[2]!.id]);
+
+  await assert.rejects(
+    memory.updateRecord(
+      hiddenSceneChat.id,
+      privateRecaps.find((record) => record.audienceCharacterIds.includes("pantalone"))!.id,
+      { audienceCharacterIds: ["maukie"] },
+    ),
+    /hidden from a selected character/,
+    "manual scene access cannot bypass hidden source messages",
+  );
+  const audienceChat = await chats.create({
+    name: "POV shifts preserve editable memories",
+    mode: "roleplay",
+    characterIds: ["maukie", "pantalone", "narrator"],
+    connectionId: connection!.id,
+  });
+  assert(audienceChat);
+  await chats.createMessagesBatch(
+    audienceChat.id,
+    Array.from({ length: 9 }, (_, index) => ({
+      role: "user" as const,
+      content: `${index === 2 || index === 6 ? "SCENE_CHANGE " : ""}The brass compass promise ${index}.`,
+      extra:
+        index === 6
+          ? { isConversationStart: true }
+          : index === 7
+            ? { conversationStartForCharacterIds: ["pantalone"] }
+            : undefined,
+    })),
+  );
+  const audienceSource = await chats.listMessages(audienceChat.id);
+  await chats.patchMetadata(audienceChat.id, {
+    groupChatMode: "individual",
+    advancedMemory: {
+      ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
+      enabled: true,
+      narratorCharacterId: "narrator",
+      knowledgeStarts: { maukie: null, pantalone: audienceSource[2]!.id },
+      retrieveMinMessages: 1,
+      retrieveMaxMessages: 3,
+    },
+  });
+  await memory.initialize(audienceChat.id);
+  const editable = (await memory.status(audienceChat.id)).records.find(
+    (record) =>
+      record.kind === "scene" &&
+      record.content &&
+      record.messageIds.includes(audienceSource[3]!.id) &&
+      record.audienceCharacterIds.includes("pantalone"),
+  )!;
+  assert(editable, "the initial archive includes scenes between confirmed knowledge and a later personal cutoff");
+  const requestCount = requests.length;
+  await memory.updateRecord(audienceChat.id, editable.id, { audienceCharacterIds: ["maukie"] });
+  const repaired = await memory.updateRecord(audienceChat.id, editable.id, { audienceCharacterIds: ["pantalone"] });
+  assert.equal(requests.length, requestCount, "audience corrections make no model or embedding calls");
+  const repairedScene = repaired.records.find((record) => record.id === editable.id)!;
+  assert.deepEqual(repairedScene.audienceCharacterIds, ["pantalone"]);
+  assert.equal(repairedScene.content, editable.content);
+  assert.equal(repairedScene.embeddingStatus, "vectorized", "audience-only edits reuse the existing vector");
+  const recallFor = (id: string) =>
+    memory.prepare({
+      chatId: audienceChat.id,
+      messages: audienceSource,
+      audienceCharacterIds: [id],
+      budgetTokens: 4000,
+      readOnly: true,
+    });
+  const pantaloneRecall = await recallFor("pantalone");
+  assert.deepEqual(
+    pantaloneRecall.messageIds,
+    audienceSource.slice(7).map((message) => message.id),
+    "personal flags still trim live messages",
+  );
+  assert(pantaloneRecall.receipt.recalledSceneIds.includes(editable.sceneId));
+  assert(
+    pantaloneRecall.receipt.recalledMessageIds.some((id) => editable.messageIds.includes(id)),
+    "existing indexed excerpts are reusable for a corrected, eligible audience",
+  );
+  assert(
+    !(await recallFor("maukie")).receipt.recalledSceneIds.includes(editable.sceneId),
+    "removed audience loses access immediately",
+  );
+  assert(
+    (await recallFor("narrator")).receipt.recalledSceneIds.includes(editable.sceneId),
+    "narrator retains the shared scene",
+  );
+  const beforeMaintenance = requests.filter((request) => request.kind === "summary").length;
+  await memory.initialize(audienceChat.id, { detectScenes: false });
+  assert.equal(
+    requests.filter((request) => request.kind === "summary").length,
+    beforeMaintenance,
+    "maintenance preserves the correction without generating replacement summaries",
+  );
+  assert(!(await recallFor("maukie")).receipt.recalledSceneIds.includes(editable.sceneId));
+  assert((await recallFor("pantalone")).receipt.recalledSceneIds.includes(editable.sceneId));
+  await memory.updateRecord(audienceChat.id, editable.id, {
+    audienceCharacterIds: ["maukie", "pantalone"],
+    content: "CORRECTED_GOLD compass promise.",
+  });
+  assert(
+    (await recallFor("maukie")).receipt.recalledSceneIds.includes(editable.sceneId),
+    "granting access again clears the earlier exclusion",
+  );
+  await assert.rejects(
+    memory.updateRecord(audienceChat.id, editable.id, { audienceCharacterIds: ["stranger"] }),
+    /Choose characters/,
+  );
+  await assert.rejects(
+    memory.updateRecord(audienceChat.id, editable.id, { audienceCharacterIds: ["narrator"] }),
+    /narrator already has access/,
+  );
+
+  const editedContent = "CORRECTED_GOLD compass promise.\nThe road continues.";
+  await memory.updateRecord(audienceChat.id, editable.id, { content: editedContent });
+  const beforeReindexRequests = requests.length;
+  await memory.reindex(audienceChat.id);
+  const reindexedScene = (await memory.status(audienceChat.id)).records.find((record) => record.id === editable.id);
+  assert.equal(reindexedScene?.content, editedContent, "reindex preserves manual summary text");
+  assert.deepEqual(reindexedScene?.audienceCharacterIds, ["maukie", "pantalone"]);
+  assert.equal(reindexedScene?.embeddingStatus, "vectorized");
+  assert(
+    requests.slice(beforeReindexRequests).every((request) => request.kind === "embedding"),
+    "reindexing existing edited memories only makes embedding calls",
+  );
+
   const recallChat = await chats.create({
     name: "Exact recall proof",
     mode: "roleplay",
@@ -419,7 +579,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 256,
       retrieveMinMessages: 1,
       retrieveMaxMessages: 3,
@@ -527,17 +687,14 @@ try {
     "optional recall exposes actual persisted record IDs separately from mandatory summary revisions",
   );
   assert(
-    exactRecall.recalledMessages?.includes("returns on Tuesday"),
+    exactRecall.recalledScenes?.includes("returns on Tuesday"),
     "lexical recall includes the later correction exactly",
   );
-  assert(exactRecall.recalledMessages?.includes("on Sunday"), "lexical recall includes the original promise exactly");
+  assert.equal(exactRecall.receipt.recalledMessageIds.length, 3, "the scene contributes one bounded excerpt");
+  assert.equal(exactRecall.recalledMessages, null, "the scene recap and excerpt use the same scene section");
   assert(exactRecall.recalledScenes?.includes("story timeframe: Spring 14 → The following morning"));
-  assert(exactRecall.recalledMessages.includes("story timeframe: Spring 14"));
-  assert(exactRecall.recalledMessages.includes("story timeframe: The following morning"));
-  assert(
-    exactRecall.recalledMessages.indexOf("#6") < exactRecall.recalledMessages.indexOf("#26"),
-    "recalled excerpts preserve chronological source order",
-  );
+  assert(exactRecall.recalledScenes.includes("story timeframe: The following morning"));
+  assert(exactRecall.recalledScenes.includes("Excerpt:\nMessages #25–#27"));
   const { estimateChatSummaryTokens } = await import("../../packages/shared/src/index.ts");
   assert(
     estimateChatSummaryTokens(exactRecall.chatSummary ?? "") <= 256,
@@ -616,12 +773,12 @@ try {
       .map((message) => message.content)
       .join("\n");
     assert.doesNotMatch(withoutExcerpts, /Below is a small excerpt|Recalled Messages|recalled_messages/);
-    assert.match(withoutExcerpts, /Below is a summary|Below are earlier scenes/);
+    assert.match(withoutExcerpts, /Below is a summary|Included below are recalled memories/);
     assert.match(
       resolveAdvancedMemoryPrompt(messages, placements, exactRecall)
         .map((message) => message.content)
         .join("\n"),
-      /Below is a small excerpt/,
+      /Excerpt:\s+Messages #/,
       "nonzero limits retain historical excerpt prompt placement",
     );
   }
@@ -633,7 +790,7 @@ try {
     budgetTokens: 1800,
     readOnly: true,
   });
-  assert(optionalExcerpts.recalledMessages?.includes("returns on Tuesday"), "0/N can still recall relevant excerpts");
+  assert(optionalExcerpts.recalledScenes?.includes("returns on Tuesday"), "0/N can still recall relevant excerpts");
   assert(optionalExcerpts.receipt.recalledMessageIds.length > 0);
   assert.deepEqual(
     (await memory.status(recallChat.id)).records.filter((record) => record.kind === "excerpt"),
@@ -675,7 +832,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
     },
   });
@@ -719,8 +876,10 @@ try {
     audienceCharacterIds: [],
     budgetTokens: 1000,
   });
-  assert(resumePrepared.receipt.checkpointId && resumePrepared.currentSceneSummary);
-  await memory.updateRecord(resumeChat.id, resumePrepared.receipt.checkpointId, {
+  assert(resumePrepared.currentSceneSummary);
+  const legacyId = await seedLegacyRecord(resumeChat.id, "continuity", resumeSource[449]!.id);
+  await seedLegacyRecord(resumeChat.id, "temporary", resumeSource[449]!.id);
+  await memory.updateRecord(resumeChat.id, legacyId, {
     content: "IMPORTED_CONTINUITY_CORRECTION",
   });
   const memoryExport = await memory.exportMemory(resumeChat.id);
@@ -735,7 +894,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
     },
   });
@@ -769,17 +928,7 @@ try {
     audienceCharacterIds: [],
     budgetTokens: 1000,
   });
-  assert(importedPrepared.chatSummary?.endsWith("\nIMPORTED_CONTINUITY_CORRECTION"));
-  assert(
-    importedPrepared.chatSummary.includes(
-      "source timeframe (summary corrections take precedence): unknown (use message order)",
-    ),
-  );
-  assert.equal(
-    importedPrepared.receipt.checkpointId,
-    importedContinuity.id,
-    "preparation reuses the imported correction without a duplicate checkpoint",
-  );
+  assert.equal(importedPrepared.chatSummary, null, "legacy continuity cannot replace Chat Summaries");
   assert.equal(
     (await memory.importMemory(importChat.id, memoryExport)).imported,
     0,
@@ -801,10 +950,7 @@ try {
     audienceCharacterIds: [],
     budgetTokens: 1000,
   });
-  assert(
-    reorderedPrepared.chatSummary?.endsWith("\nIMPORTED_CONTINUITY_CORRECTION"),
-    "an imported dependent before duplicate sources resolves their final local IDs",
-  );
+  assert.equal(reorderedPrepared.chatSummary, null, "import order cannot re-enable the retired continuity store");
 
   const dependencySource = await chats.create({
     name: "Standalone dependency source",
@@ -818,13 +964,14 @@ try {
     Array.from({ length: 4 }, (_, index) => ({
       role: "user" as const,
       content: `${index === 3 ? "SCENE_CHANGE " : ""}Dependency source turn ${index}: the compass promise.`,
+      extra: index === 3 ? { isConversationStart: true } : undefined,
     })),
   );
   const dependencyMessages = await chats.listMessages(dependencySource.id);
   const dependencySettings = {
     ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
     enabled: true,
-    maxContextTokens: 4096,
+    maxContextTokens: 16_384,
     summaryBudgetTokens: 512,
     knowledgeStarts: { alice: null },
   };
@@ -850,6 +997,13 @@ try {
     ],
   });
   await memory.initialize(dependencySource.id);
+  const sourceManualScene = (await memory.status(dependencySource.id)).records.find(
+    (record) => record.kind === "scene" && record.content,
+  );
+  assert(sourceManualScene);
+  await memory.updateRecord(dependencySource.id, sourceManualScene.id, {
+    content: "IMPORTED_DISABLED_SCENE_CORRECTION",
+  });
   const dependencyPrepared = await memory.prepare({
     chatId: dependencySource.id,
     messages: dependencyMessages,
@@ -857,24 +1011,113 @@ try {
     audienceMode: "owner",
     budgetTokens: 3000,
   });
-  assert(dependencyPrepared.receipt.checkpointId);
-  await memory.updateRecord(dependencySource.id, dependencyPrepared.receipt.checkpointId, {
+  assert(dependencyPrepared.chatSummary?.includes("CORRECTED_GOLD"));
+  const legacyDependencyId = await seedLegacyRecord(
+    dependencySource.id,
+    "continuity",
+    dependencyMessages[2]!.id,
+    sourceManualScene,
+  );
+  await memory.updateRecord(dependencySource.id, legacyDependencyId, {
     content: "IMPORTED_MISSING_SUMMARY_CORRECTION",
   });
-  const sourceManualScene = (await memory.status(dependencySource.id)).records.find(
-    (record) => record.kind === "scene" && record.content && !record.audienceCharacterIds.length,
-  );
-  assert(sourceManualScene);
-  await memory.updateRecord(dependencySource.id, sourceManualScene.id, {
-    content: "IMPORTED_DISABLED_SCENE_CORRECTION",
-  });
   const dependencyExport = await memory.exportMemory(dependencySource.id);
-  const exportedDependency = dependencyExport.records.find(
-    (entry) => entry.record.id === dependencyPrepared.receipt.checkpointId,
-  );
+  // Older releases kept generated-summary dependencies on manually edited scenes.
+  // Preserve that legacy fixture to test unsupported import and explicit recovery.
+  dependencyExport.records.find((entry) => entry.record.id === sourceManualScene.id)!.record.dependencies =
+    sourceManualScene.dependencies;
+  const exportedDependency = dependencyExport.records.find((entry) => entry.record.id === legacyDependencyId);
   assert(
     exportedDependency?.valid &&
       exportedDependency.record.dependencies.some((dependency) => dependency.id === "summary:required-manual-summary"),
+  );
+
+  const sourceMetadata = JSON.parse((await chats.getById(dependencySource.id))!.metadata);
+  await chats.patchMetadata(dependencySource.id, {
+    summaryEntries: sourceMetadata.summaryEntries.map((entry: Record<string, unknown>) => ({
+      ...entry,
+      title: "Renamed constant summary",
+      updatedAt: new Date(Date.now() + 1_000).toISOString(),
+    })),
+  });
+  const savedCorrection = await memory.updateRecord(dependencySource.id, sourceManualScene.id, {
+    content: "IMPORTED_DISABLED_SCENE_CORRECTION\nBlank lines removed.",
+  });
+  assert.equal(
+    savedCorrection.records.find((record) => record.id === sourceManualScene.id)?.embeddingStatus,
+    "pending",
+    "saving a scene correction accepts its text independently of old generated-summary dependencies",
+  );
+  const reindexRequests = requests.length;
+  await memory.reindex(dependencySource.id);
+  const reindexedCorrection = await memory.status(dependencySource.id);
+  assert.equal(reindexedCorrection.job.status, "ready");
+  assert.equal(
+    reindexedCorrection.records.find((record) => record.id === sourceManualScene.id)?.embeddingStatus,
+    "vectorized",
+  );
+  assert(requests.slice(reindexRequests).every((request) => request.kind === "embedding"));
+
+  const accessCorrectionChat = await chats.create({
+    name: "Correcting a scene from Maukie to Pantalone",
+    mode: "roleplay",
+    characterIds: ["maukie", "pantalone"],
+    connectionId: connection!.id,
+  });
+  assert(accessCorrectionChat);
+  await chats.createMessagesBatch(
+    accessCorrectionChat.id,
+    dependencyMessages.map((message) => ({ role: "user" as const, content: message.content })),
+  );
+  const accessSource = await chats.listMessages(accessCorrectionChat.id);
+  await chats.patchMetadata(accessCorrectionChat.id, {
+    groupChatMode: "individual",
+    advancedMemory: {
+      ...dependencySettings,
+      knowledgeStarts: { maukie: null, pantalone: accessSource[3]!.id },
+    },
+    summaryEntries: sourceMetadata.summaryEntries.map((entry: Record<string, unknown>) => ({
+      ...entry,
+      messageIds: accessSource.slice(0, 2).map((message) => message.id),
+    })),
+  });
+  await memory.initialize(accessCorrectionChat.id);
+  const accessScene = (await memory.status(accessCorrectionChat.id)).records.find(
+    (record) => record.kind === "scene" && record.content && record.audienceCharacterIds.includes("maukie"),
+  )!;
+  assert(accessScene.dependencies.length > 0);
+  await memory.updateSettings(accessCorrectionChat.id, { knowledgeStarts: { maukie: null, pantalone: null } });
+  const accessMetadata = JSON.parse((await chats.getById(accessCorrectionChat.id))!.metadata);
+  await chats.patchMetadata(accessCorrectionChat.id, {
+    summaryEntries: accessMetadata.summaryEntries.map((entry: Record<string, unknown>) => ({
+      ...entry,
+      enabled: false,
+    })),
+  });
+  await memory.updateRecord(accessCorrectionChat.id, accessScene.id, { audienceCharacterIds: ["pantalone"] });
+  const beforeAccessReindex = requests.length;
+  await memory.reindex(accessCorrectionChat.id);
+  const indexedAccessScene = (await memory.status(accessCorrectionChat.id)).records.find(
+    (record) => record.id === accessScene.id,
+  )!;
+  assert.equal(indexedAccessScene.content, accessScene.content, "an audience-only correction preserves summary text");
+  assert.deepEqual(indexedAccessScene.audienceCharacterIds, ["pantalone"]);
+  assert.equal(indexedAccessScene.embeddingStatus, "vectorized");
+  assert(requests.slice(beforeAccessReindex).every((request) => request.kind === "embedding"));
+  await memory.initialize(accessCorrectionChat.id);
+  assert.equal(
+    (await memory.status(accessCorrectionChat.id)).records.find((record) => record.id === accessScene.id)?.content,
+    accessScene.content,
+    "later preparation also preserves the corrected scene",
+  );
+  await chats.updateMessageExtra(accessSource[0]!.id, { hiddenFromAICharacterIds: ["pantalone"] });
+  await memory.updateRecord(accessCorrectionChat.id, accessScene.id, { content: accessScene.content });
+  for (const messageId of accessScene.messageIds)
+    await chats.updateMessageExtra(messageId, { hiddenFromAICharacterIds: ["pantalone"] });
+  await assert.rejects(
+    memory.updateRecord(accessCorrectionChat.id, accessScene.id, { content: accessScene.content }),
+    /no longer available to its selected characters/,
+    "saving a correction cannot grant access to an entirely hidden scene",
   );
 
   const dependencyTarget = await chats.create({
@@ -895,7 +1138,7 @@ try {
   });
   await memory.initialize(dependencyTarget.id);
   const localScene = (await memory.status(dependencyTarget.id)).records.find(
-    (record) => record.kind === "scene" && record.content && !record.audienceCharacterIds.length,
+    (record) => record.kind === "scene" && record.content,
   );
   assert(localScene);
   await memory.updateRecord(dependencyTarget.id, localScene.id, {
@@ -906,7 +1149,11 @@ try {
   const importWithMissingDependencies = {
     ...dependencyExport,
     records: [
-      ...dependencyExport.records,
+      ...dependencyExport.records.map((transfer) =>
+        transfer.record.kind === "excerpt"
+          ? { ...transfer, record: { ...transfer.record, audienceCharacterIds: ["alice"] } }
+          : transfer,
+      ),
       {
         ...exportedDependency,
         record: {
@@ -925,7 +1172,7 @@ try {
           ...exportedDependency.record,
           id: "missing-record-control",
           kind: "continuity",
-          sceneId: `continuity-${dependencyMessages[2]!.id}`,
+          sceneId: `continuity-${dependencyMessages[1]!.id}`,
           audienceCharacterIds: [],
           content: "MISSING_RECORD_CORRECTION",
           dependencies: [{ id: "record:unavailable-record", revision: "unknown" }],
@@ -946,11 +1193,7 @@ try {
     ],
   };
   const dependencyImport = await memory.importMemory(dependencyTarget.id, importWithMissingDependencies);
-  for (const content of [
-    "IMPORTED_MISSING_SUMMARY_CORRECTION",
-    "MISSING_RECORD_CORRECTION",
-    "INCOMPATIBLE_MACRO_CORRECTION",
-  ]) {
+  for (const content of ["MISSING_RECORD_CORRECTION", "INCOMPATIBLE_MACRO_CORRECTION"]) {
     const imported = dependencyImport.records.find((record) => record.content === content);
     assert(
       imported && !imported.enabled,
@@ -1034,13 +1277,36 @@ try {
   await memory.updateRecord(maintenanceTarget.id, disabledImportedScene.id, { enabled: true });
   await assert.rejects(
     memory.initialize(maintenanceTarget.id),
-    /manually corrected memory.*changed source messages/iu,
+    /manually corrected memory.*changed sources/iu,
     "enabled stale manual corrections still require explicit review",
   );
+  const blockedCorrection = (await memory.status(maintenanceTarget.id)).job;
+  assert.equal(blockedCorrection.reviewRecordId, disabledImportedScene.id);
+  assert.match(blockedCorrection.error!, /messages #1–#3 \(alice\)/u);
   assert.equal(
     (await memory.status(maintenanceTarget.id)).records.find((record) => record.id === disabledImportedScene.id)
       ?.content,
     "IMPORTED_DISABLED_SCENE_CORRECTION",
+  );
+
+  const beforeStaleReindex = requests.length;
+  await memory.reindex(maintenanceTarget.id);
+  assert(requests.slice(beforeStaleReindex).every((request) => request.kind === "embedding"));
+  assert.equal(
+    (await memory.status(maintenanceTarget.id)).records.find((record) => record.id === disabledImportedScene.id)
+      ?.embeddingStatus,
+    "stale",
+    "reindex keeps an unreviewed legacy correction excluded instead of approving or regenerating it",
+  );
+  await memory.updateRecord(maintenanceTarget.id, disabledImportedScene.id, {
+    content: disabledImportedScene.content,
+  });
+  await memory.reindex(maintenanceTarget.id);
+  assert.equal(
+    (await memory.status(maintenanceTarget.id)).records.find((record) => record.id === disabledImportedScene.id)
+      ?.embeddingStatus,
+    "vectorized",
+    "saving the unchanged correction recovers a legacy stale scene without regeneration",
   );
 
   await memory.updateRecord(maintenanceTarget.id, disabledImportedScene.id, { enabled: false });
@@ -1072,10 +1338,11 @@ try {
     "the disabled excerpt remains unchanged and inspectable",
   );
   await memory.updateRecord(maintenanceTarget.id, editedExcerpt.id, { enabled: true });
-  await assert.rejects(
-    memory.initialize(maintenanceTarget.id),
-    /manually corrected memory.*changed source messages/iu,
-    "re-enabled stale excerpt corrections retain the explicit-review guard",
+  await memory.initialize(maintenanceTarget.id);
+  assert.equal(
+    (await memory.status(maintenanceTarget.id)).job.status,
+    "ready",
+    "editing source text does not invalidate an existing excerpt",
   );
   assert.equal(
     (await memory.status(maintenanceTarget.id)).records.find((record) => record.id === editedExcerpt.id)?.content,
@@ -1093,7 +1360,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
     },
   });
@@ -1131,6 +1398,76 @@ try {
     "cancelling a joined caller does not stop shared preparation",
   );
 
+  // An archive edit must not wait for a slow background model response.
+  const editableScene = (await memory.status(joinedChat.id)).records.find(
+    (record) => record.kind === "scene" && record.content,
+  )!;
+  for (const action of ["toggle", "delete"] as const) {
+    if (action === "delete") await memory.updateRecord(joinedChat.id, editableScene.id, { enabled: true });
+    // Changed derived inputs still require new work; a source typo no longer does.
+    await db
+      .update(advancedMemoryRecords)
+      .set({ dependencies: JSON.stringify([{ id: "macro-variables", revision: "previous-input" }]) })
+      .where(eq(advancedMemoryRecords.id, editableScene.id));
+    const waiting = new Promise<void>((resolve) => {
+      summaryEntered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      releaseSummary = resolve;
+    });
+    beforeSummary = async () => {
+      summaryEntered();
+      await held;
+    };
+    const background = memory.initialize(joinedChat.id, { blocking: false }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await waiting;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await assert.rejects(memory.updateRecord(joinedChat.id, "missing", { enabled: false }), /not found/);
+      await assert.rejects(memory.updateRecord(joinedChat.id, editableScene.id, { content: " " }), /Memory text/);
+      await assert.rejects(
+        memory.updateRecord(joinedChat.id, editableScene.id, {}),
+        /must include content, timeframe, enabled or audience/,
+      );
+      await assert.rejects(memory.deleteRecord(joinedChat.id, editableScene.sceneId), /Only a saved summary/);
+      assert.equal((await memory.status(joinedChat.id)).job.status, "running", "invalid edits do not cancel paid work");
+      const mutation =
+        action === "toggle"
+          ? memory.updateRecord(joinedChat.id, editableScene.id, { enabled: false })
+          : memory.deleteRecord(joinedChat.id, editableScene.id);
+      const changed = await Promise.race([
+        mutation,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`${action} waited for the background model`)), 2000);
+        }),
+      ]);
+      assert.notEqual(changed.job.status, "running", "the response includes settled cancellation progress");
+      const saved = changed.records.find((record) => record.id === editableScene.id);
+      if (action === "toggle") assert.equal(saved?.enabled, false);
+      else assert.equal(saved, undefined);
+      assert(await background, "the interrupted model operation cannot overwrite the user's edit");
+    } finally {
+      clearTimeout(timeout);
+      releaseSummary();
+      await background;
+    }
+  }
+  const callsBeforeDeletedResume = requests.length;
+  await memory.initialize(joinedChat.id);
+  assert(
+    !requests.slice(callsBeforeDeletedResume).some((request) => request.kind === "summary"),
+    "resume keeps the deleted scene suppressed while refreshing changed source excerpts",
+  );
+  assert(!(await memory.status(joinedChat.id)).records.some((record) => record.id === editableScene.id));
+  assert.equal(
+    (await memory.status(joinedChat.id)).unpreparedScenes?.filter((scene) => scene.deleted).length,
+    1,
+    "deleted scene summaries are offered only for explicit recovery",
+  );
+
   const requireServer = createRequire(new URL("../../packages/server/package.json", import.meta.url));
   const Fastify = requireServer("fastify") as typeof import("fastify").default;
   const { advancedMemoryRoutes } = await import("../../packages/server/src/routes/advanced-memory.routes.js");
@@ -1138,6 +1475,13 @@ try {
   routeApp.decorate("db", db);
   await routeApp.register(advancedMemoryRoutes, { prefix: "/api/chats" });
   try {
+    const hiddenCorrection = await routeApp.inject({
+      method: "PATCH",
+      url: `/api/chats/${accessCorrectionChat.id}/advanced-memory/records/${accessScene.id}`,
+      payload: { content: accessScene.content },
+    });
+    assert.equal(hiddenCorrection.statusCode, 400, "inaccessible scene sources are a correction validation error");
+    assert.match(hiddenCorrection.json().error, /no longer available to its selected characters/);
     for (const limits of [
       { retrieveMinMessages: 0, retrieveMaxMessages: 0 },
       { retrieveMinMessages: 0, retrieveMaxMessages: 3 },
@@ -1166,6 +1510,59 @@ try {
       /debugMode/,
       "reindex exposes the same validation detail as initialization",
     );
+    let releaseEmbedding = () => {};
+    const heldEmbedding = new Promise<void>((resolve) => {
+      releaseEmbedding = resolve;
+    });
+    beforeEmbedding = () => heldEmbedding;
+    const beforeRouteReindex = requests.length;
+    try {
+      const reindexResponse = await routeApp.inject({
+        method: "POST",
+        url: `/api/chats/${audienceChat.id}/advanced-memory/reindex`,
+        payload: {},
+      });
+      assert.equal(reindexResponse.statusCode, 202);
+      assert.equal(reindexResponse.json().job.status, "running", "reindex acknowledges persisted progress before 202");
+      assert.equal(reindexResponse.json().job.stage, "indexing");
+      await memory.cancel(audienceChat.id);
+    } finally {
+      releaseEmbedding();
+      beforeEmbedding = null;
+    }
+    await memory.reindex(audienceChat.id);
+    assert.equal((await memory.status(audienceChat.id)).job.status, "ready");
+    assert(
+      requests.slice(beforeRouteReindex).every((request) => request.kind === "embedding"),
+      "cancel/retry reindex never starts scene or summary generation",
+    );
+    let releaseFirstIndex = () => {};
+    let firstIndexEntered = () => {};
+    const firstIndexReady = new Promise<void>((resolve) => {
+      firstIndexEntered = resolve;
+    });
+    const firstIndexGate = new Promise<void>((resolve) => {
+      releaseFirstIndex = resolve;
+    });
+    beforeEmbedding = async () => {
+      firstIndexEntered();
+      await firstIndexGate;
+    };
+    const firstIndex = memory.reindex(audienceChat.id, { blocking: false });
+    await firstIndexReady;
+    const firstIndexId = (await memory.status(audienceChat.id)).job.id;
+    const queuedJobIds: Array<string | undefined> = [];
+    const queuedIndex = memory.reindex(audienceChat.id, {
+      blocking: true,
+      onProgress: (job) => queuedJobIds.push(job.id),
+    });
+    releaseFirstIndex();
+    await Promise.all([firstIndex, queuedIndex]);
+    assert(queuedJobIds.length > 0);
+    assert(
+      queuedJobIds.every((id) => id !== firstIndexId),
+      "queued reindex progress belongs to its own job, never the existing operation",
+    );
     const invalidSettings = { retrieveMinMessages: 10, retrieveMaxMessages: 2 };
     assert.equal(
       (
@@ -1191,7 +1588,7 @@ try {
       (
         await routeApp.inject({
           method: "PATCH",
-          url: `/api/chats/${importChat.id}/advanced-memory/records/${reorderedPrepared.receipt.checkpointId}`,
+          url: `/api/chats/${chat.id}/advanced-memory/records/${(await memory.status(chat.id)).records.find((record) => record.content)!.id}`,
           payload: { content: "   " },
         })
       ).statusCode,
@@ -1216,6 +1613,23 @@ try {
       ).statusCode,
       404,
     );
+    const legacyTemplate = (await memory.status(chat.id)).records.find((record) => record.content)!;
+    for (const kind of ["continuity", "temporary"] as const) {
+      const legacy = await seedLegacyRecord(chat.id, kind, source[449]!.id, legacyTemplate);
+      const beforeDelete = await chats.listMessages(chat.id);
+      const response = await routeApp.inject({
+        method: "DELETE",
+        url: `/api/chats/${chat.id}/advanced-memory/records/${legacy}`,
+      });
+      assert.equal(response.statusCode, 200, response.body);
+      assert(!response.json().records.some((record: { id: string }) => record.id === legacy));
+      assert.deepEqual(
+        await chats.listMessages(chat.id),
+        beforeDelete,
+        "deleting legacy summaries preserves source messages",
+      );
+      await seedLegacyRecord(chat.id, kind, source[449]!.id, legacyTemplate);
+    }
     const beforeReset = await memory.status(chat.id);
     assert.deepEqual(
       new Set(beforeReset.records.map((record) => record.kind)),
@@ -1282,7 +1696,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
       knowledgeStarts: { alice: null },
     },
@@ -1339,7 +1753,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
       knowledgeStarts: { alice: null, bob: null },
     },
@@ -1348,8 +1762,8 @@ try {
     hiddenMiddleChat.id,
     Array.from({ length: 300 }, (_, index) => ({
       role: "user" as const,
-      content: `${index === 250 ? "SCENE_CHANGE " : ""}${index === 50 ? "HIDDEN_MIDDLE_SECRET" : "Shared compass promise along the mountain path"} ${index}.`,
-      extra: index === 50 ? { hiddenFromAICharacterIds: ["bob"] } : undefined,
+      content: `${index === 250 ? "SCENE_CHANGE " : ""}${index === 50 ? "HIDDEN_MIDDLE_SECRET" : "Shared compass promise along the mountain path. ".repeat(2)} ${index}.`,
+      extra: index === 50 ? { hiddenFromAI: true } : index === 51 ? { hiddenFromAICharacterIds: ["bob"] } : undefined,
     })),
   );
   const privateController = new AbortController();
@@ -1369,7 +1783,7 @@ try {
     "a discontiguous scoped partial result can checkpoint before cancellation",
   );
   const firstPrivateBatch = requests.slice(beforePrivateCache).find((request) => request.kind === "summary");
-  assert(firstPrivateBatch && !firstPrivateBatch.text.includes("HIDDEN_MIDDLE_SECRET"));
+  assert(firstPrivateBatch?.text.includes("HIDDEN_MIDDLE_SECRET"), "global hides stay in resumable summary batches");
   const privateResumeStart = requests.length;
   await memory.initialize(hiddenMiddleChat.id);
   assert.notEqual(
@@ -1416,7 +1830,7 @@ try {
     advancedMemory: {
       ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
       enabled: true,
-      maxContextTokens: 4096,
+      maxContextTokens: 16_384,
       summaryBudgetTokens: 512,
     },
   });
@@ -1438,7 +1852,7 @@ try {
   assert(cadenceChat);
   await memory.updateSettings(cadenceChat.id, {
     enabled: true,
-    maxContextTokens: 4096,
+    maxContextTokens: 16_384,
     summaryBudgetTokens: 512,
     sceneCheckInterval: 5,
   });
@@ -1478,10 +1892,65 @@ try {
   );
   assert(
     await memory.commitSceneCheck(cadenceChat.id, sceneRequest, {
-      starts: [{ messageId: cadenceSource[2]!.id }, { messageId: cadenceSource[4]!.id }],
+      ends: [{ messageNumber: 2 }, { messageNumber: 4 }],
     }),
   );
+  const pendingScenes = (await memory.status(cadenceChat.id)).unpreparedScenes!;
+  assert.deepEqual(
+    pendingScenes.map(({ startIndex, endIndex }) => [startIndex, endIndex]),
+    [
+      [1, 2],
+      [3, 4],
+    ],
+    "closed scenes without summaries remain visible",
+  );
+  const repairRequests = requests.length;
+  const repairState = JSON.parse((await chats.getById(cadenceChat.id))!.metadata).advancedMemoryState;
+  await chats.patchMetadata(cadenceChat.id, {
+    advancedMemoryState: { ...repairState, status: "error", error: "The summary provider stopped responding." },
+  });
+  await memory.initialize(cadenceChat.id, { sceneId: pendingScenes[0]!.sceneId });
+  assert.equal(
+    (await memory.status(cadenceChat.id)).job.error,
+    null,
+    "successful recovery clears the previous summary failure",
+  );
+  assert.equal(
+    JSON.parse((await chats.getById(cadenceChat.id))!.metadata).advancedMemoryState.sceneCheckMessageId,
+    repairState.sceneCheckMessageId,
+    "targeted recovery preserves scene-check cadence",
+  );
+  const afterRepairJob = (await memory.status(cadenceChat.id)).job;
+  const beforeRepairRetry = requests.length;
+  await memory.initialize(cadenceChat.id, { sceneId: pendingScenes[0]!.sceneId });
+  assert.deepEqual((await memory.status(cadenceChat.id)).job, afterRepairJob);
+  assert.equal(requests.length, beforeRepairRetry, "retrying a completed repair is a no-op");
+  assert.equal(requests.slice(repairRequests).filter((request) => request.kind === "summary").length, 1);
+  assert(
+    !requests.slice(repairRequests).some((request) => request.kind === "classify"),
+    "targeted repair does not reclassify history",
+  );
+  assert.deepEqual(
+    (await memory.status(cadenceChat.id)).unpreparedScenes!.map(({ startIndex, endIndex }) => [startIndex, endIndex]),
+    [[3, 4]],
+  );
+  // A missing scaffold must not make the range disappear either.
+  await db.delete(advancedMemoryRecords).where(eq(advancedMemoryRecords.id, pendingScenes[1]!.sceneId));
+  const existingRecoveredRow = (
+    await db.select().from(advancedMemoryRecords).where(eq(advancedMemoryRecords.chatId, cadenceChat.id))
+  ).find((record) => record.kind === "scene" && record.content)!;
+  await db.insert(advancedMemoryRecords).values({
+    ...existingRecoveredRow,
+    id: "obsolete-overlapping-summary",
+    endMessageId: cadenceSource[3]!.id,
+    messageIds: JSON.stringify(cadenceSource.slice(0, 4).map((message) => message.id)),
+  });
+  assert.deepEqual(
+    (await memory.status(cadenceChat.id)).unpreparedScenes!.map(({ startIndex, endIndex }) => [startIndex, endIndex]),
+    [[3, 4]],
+  );
   await memory.maintain(cadenceChat.id);
+  assert.deepEqual((await memory.status(cadenceChat.id)).unpreparedScenes, []);
   const cadenceRecords = (await memory.status(cadenceChat.id)).records;
   assert.equal(
     cadenceRecords.filter((record) => record.kind === "scene" && record.status === "closed").length,
@@ -1494,6 +1963,85 @@ try {
     "tracker commits and archive maintenance do not launch another classifier",
   );
   const editedScene = cadenceRecords.find((record) => record.kind === "scene" && record.status === "closed")!;
+  await memory.updateRecord(cadenceChat.id, editedScene.id, { content: "CORRECTED_GOLD compass." });
+  await memory.reindex(cadenceChat.id);
+  await chats.updateMessageContent(cadenceSource[0]!.id, "A corrected compass promise.");
+  await chats.updateMessageExtra(cadenceSource[0]!.id, {
+    isConversationStart: true,
+    attachments: [{ type: "image", url: "/later-illustration.png" }],
+  });
+  const afterTypo = (await memory.status(cadenceChat.id)).records.find((record) => record.id === editedScene.id)!;
+  assert.equal(
+    await memory.getSceneCheck(cadenceChat.id),
+    null,
+    "old edits and illustrations do not restart scene checks",
+  );
+  assert.equal(afterTypo.embeddingStatus, "vectorized", "text edits and illustrations keep saved scene indexes");
+  assert.equal(afterTypo.content, "CORRECTED_GOLD compass.");
+  const typoRequests = requests.length;
+  await memory.maintain(cadenceChat.id);
+  assert.equal(requests.length, typoRequests, "unchanged scene ranges reuse completed summaries and vectors");
+  await chats.updateMessageExtra(cadenceSource[4]!.id, { isConversationStart: true });
+  const recallCurrent = async () =>
+    memory.prepare({
+      chatId: cadenceChat.id,
+      messages: await chats.listMessages(cadenceChat.id),
+      audienceCharacterIds: [],
+      budgetTokens: 3000,
+      readOnly: true,
+    });
+  assert(
+    (await recallCurrent()).recalledScenes?.includes("A corrected compass promise."),
+    "recall uses edited source text without reindexing",
+  );
+  const swipe = await chats.addSwipe(cadenceSource[1]!.id, "ACTIVE_SWIPE compass promise.");
+  const swipedRecall = await recallCurrent();
+  assert.equal(
+    await memory.getSceneCheck(cadenceChat.id),
+    null,
+    "switching swipes is not a new message for scene-check cadence",
+  );
+  assert(swipedRecall.recalledScenes?.includes("ACTIVE_SWIPE compass promise."));
+  assert(!swipedRecall.recalledScenes?.includes("Recent scene message 1."));
+  await chats.setActiveSwipe(cadenceSource[1]!.id, 0);
+  assert.equal(swipe.index, 1);
+  const restoredRecall = await recallCurrent();
+  assert(restoredRecall.recalledScenes?.includes("Recent scene message 1."));
+  assert(!restoredRecall.recalledScenes?.includes("ACTIVE_SWIPE compass promise."));
+  const beforeSwipeMaintenance = requests.length;
+  await memory.maintain(cadenceChat.id);
+  assert.equal(requests.length, beforeSwipeMaintenance, "switching swipes retains completed indexes");
+  assert.equal(
+    (await memory.status(cadenceChat.id)).records.filter((record) => record.kind === "scene" && record.content).length,
+    2,
+    "switching swipes does not duplicate scenes",
+  );
+  // Repairing a different gap must leave a genuinely blocked correction intact.
+  await db
+    .update(advancedMemoryRecords)
+    .set({ dependencies: JSON.stringify([{ id: "macro-variables", revision: "old-input" }]) })
+    .where(eq(advancedMemoryRecords.id, editedScene.id));
+  await db.delete(advancedMemoryRecords).where(eq(advancedMemoryRecords.sceneId, pendingScenes[1]!.sceneId));
+  const beforeIsolatedRepair = (await memory.status(cadenceChat.id)).records.find(
+    (record) => record.id === editedScene.id,
+  )!;
+  await chats.patchMetadata(cadenceChat.id, {
+    advancedMemoryState: {
+      ...JSON.parse((await chats.getById(cadenceChat.id))!.metadata).advancedMemoryState,
+      status: "error",
+      error: "Review the saved correction.",
+      reviewRecordId: editedScene.id,
+    },
+  });
+  await memory.initialize(cadenceChat.id, { sceneId: pendingScenes[1]!.sceneId });
+  const isolatedRepair = await memory.status(cadenceChat.id);
+  assert.deepEqual(
+    isolatedRepair.records.find((record) => record.id === editedScene.id),
+    beforeIsolatedRepair,
+  );
+  assert.equal(isolatedRepair.job.reviewRecordId, editedScene.id);
+  assert.equal(isolatedRepair.job.status, "error");
+  assert.deepEqual(isolatedRepair.unpreparedScenes, []);
   await memory.updateRecord(cadenceChat.id, editedScene.id, { content: "CORRECTED_GOLD compass." });
   await chats.createMessagesBatch(
     cadenceChat.id,
@@ -1527,7 +2075,7 @@ try {
   const olderCheck = await memory.getSceneCheck(cadenceChat.id, { force: true, asOfMessageId: cadenceSource[4]!.id });
   assert(olderCheck);
   assert.equal(
-    await memory.commitSceneCheck(cadenceChat.id, olderCheck, { starts: [] }),
+    await memory.commitSceneCheck(cadenceChat.id, olderCheck, { ends: [] }),
     false,
     "an older regenerated window cannot overwrite a later checked timeline",
   );
@@ -1539,22 +2087,23 @@ try {
   assert(staleCheck);
   await chats.updateMessageContent(latestSceneSource.at(-1)!.id, "A changed latest swipe opens a new room.");
   assert.equal(
-    await memory.commitSceneCheck(cadenceChat.id, staleCheck, { starts: [] }),
+    await memory.commitSceneCheck(cadenceChat.id, staleCheck, { ends: [] }),
     false,
     "a changed source cannot commit an old scene decision",
   );
-  const changedCheck = await memory.getSceneCheck(cadenceChat.id);
-  assert(changedCheck, "a changed checked source is due even without five new messages");
+  assert.equal(await memory.getSceneCheck(cadenceChat.id), null, "editing checked text does not advance the cadence");
+  const changedCheck = await memory.getSceneCheck(cadenceChat.id, { force: true });
+  assert(changedCheck);
   assert(
     await memory.commitSceneCheck(cadenceChat.id, changedCheck, {
-      starts: [{ messageId: latestSceneSource.at(-1)!.id }],
+      ends: [{ messageNumber: latestSceneSource.length - 1 }],
     }),
   );
   await memory.maintain(cadenceChat.id);
   await chats.updateMessageContent(latestSceneSource.at(-1)!.id, "The rerolled reply stays in the same room.");
-  const rerolledCheck = await memory.getSceneCheck(cadenceChat.id);
+  const rerolledCheck = await memory.getSceneCheck(cadenceChat.id, { force: true });
   assert(rerolledCheck);
-  assert(await memory.commitSceneCheck(cadenceChat.id, rerolledCheck, { starts: [] }));
+  assert(await memory.commitSceneCheck(cadenceChat.id, rerolledCheck, { ends: [] }));
   assert(
     !(await memory.status(cadenceChat.id)).records.some(
       (record) => record.id === `scene-${latestSceneSource.at(-1)!.id}`,
@@ -1576,14 +2125,17 @@ try {
     memory.commitSceneCheck(
       cadenceChat.id,
       { ...filteredNewCheck, messages: filteredNewCheck.messages.slice(1) },
-      { starts: [{ messageId: withheld.messageId }] },
+      { ends: [{ messageNumber: withheld.messageNumber }] },
     ),
     /invalid scene decision/,
     "tracker output cannot use an ID omitted from its character-scoped payload",
   );
-  const preservedBoundary = filteredNewCheck.messages[2]!.messageId;
+  const preservedEnd = filteredNewCheck.messages[2]!;
+  const preservedBoundary = (await chats.listMessages(cadenceChat.id))[preservedEnd.messageNumber]!.id;
   assert(
-    await memory.commitSceneCheck(cadenceChat.id, filteredNewCheck, { starts: [{ messageId: preservedBoundary }] }),
+    await memory.commitSceneCheck(cadenceChat.id, filteredNewCheck, {
+      ends: [{ messageNumber: preservedEnd.messageNumber }],
+    }),
   );
   await chats.createMessage({ chatId: cadenceChat.id, role: "assistant", content: "Another tracker-scoped reply." });
   const partialWindow = await memory.getSceneCheck(cadenceChat.id, { force: true });
@@ -1593,9 +2145,9 @@ try {
       cadenceChat.id,
       {
         ...partialWindow,
-        messages: partialWindow.messages.filter((message) => message.messageId !== preservedBoundary),
+        messages: partialWindow.messages.filter((message) => message.messageId !== preservedEnd.messageId),
       },
-      { starts: [] },
+      { ends: [] },
     ),
   );
   assert(
@@ -1610,7 +2162,11 @@ try {
     connectionId: connection!.id,
   });
   assert(deferredHistory);
-  await memory.updateSettings(deferredHistory.id, { enabled: true, maxContextTokens: 4096, summaryBudgetTokens: 512 });
+  await memory.updateSettings(deferredHistory.id, {
+    enabled: true,
+    maxContextTokens: 16_384,
+    summaryBudgetTokens: 512,
+  });
   await chats.createMessagesBatch(deferredHistory.id, [
     { role: "user", content: "An older scene." },
     { role: "assistant", content: "SCENE_CHANGE The party reaches another town." },
@@ -1618,11 +2174,16 @@ try {
   const beforeDeferred = classifyCount();
   await memory.maintain(deferredHistory.id);
   assert.equal(classifyCount(), beforeDeferred);
-  await memory.initialize(deferredHistory.id);
+  await memory.prepare({
+    chatId: deferredHistory.id,
+    messages: await chats.listMessages(deferredHistory.id),
+    audienceCharacterIds: [],
+    budgetTokens: 3000,
+  });
   assert.equal(
     classifyCount(),
-    beforeDeferred + 1,
-    "explicit initialization segments history previously refreshed without classification",
+    beforeDeferred,
+    "ordinary recall never backfills history or reruns the scene classifier",
   );
   await chats.createMessage({
     chatId: deferredHistory.id,
@@ -1677,8 +2238,8 @@ try {
       audienceCharacterIds: [],
       budgetTokens: 3000,
     });
-    const rejectedPreparation = assert.rejects(pendingPreparation, /being reset|changed|abort/iu);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    const preparationBeforeReset = await pendingPreparation;
+    await memory.validatePrepared(deferredHistory.id, pendingSource, preparationBeforeReset.receipt);
     releaseInitialSummary();
     await resetTransactionEntered;
     await assert.rejects(
@@ -1686,18 +2247,30 @@ try {
       /being reset/iu,
       "pending prepare cannot overwrite the reset operation after its initialization wait",
     );
-    const queuedPreview = memory.prepare({
+    await assert.rejects(
+      memory.prepare({
+        chatId: deferredHistory.id,
+        messages: pendingSource,
+        audienceCharacterIds: [],
+        budgetTokens: 3000,
+        readOnly: true,
+      }),
+      /being reset/iu,
+    );
+    releaseResetTransaction();
+    await pendingInitialization;
+    await queuedReset;
+    await assert.rejects(
+      memory.validatePrepared(deferredHistory.id, pendingSource, preparationBeforeReset.receipt),
+      /changed/iu,
+    );
+    const postResetPreview = await memory.prepare({
       chatId: deferredHistory.id,
       messages: pendingSource,
       audienceCharacterIds: [],
       budgetTokens: 3000,
       readOnly: true,
     });
-    releaseResetTransaction();
-    await pendingInitialization;
-    await queuedReset;
-    await rejectedPreparation;
-    const postResetPreview = await queuedPreview;
     await memory.validatePrepared(deferredHistory.id, pendingSource, postResetPreview.receipt);
     assert.deepEqual(
       (await memory.status(deferredHistory.id)).records,
@@ -1726,7 +2299,7 @@ try {
   const resetSettings = {
     ...DEFAULT_ADVANCED_MEMORY_SETTINGS,
     enabled: true,
-    maxContextTokens: 4096,
+    maxContextTokens: 16_384,
     summaryBudgetTokens: 512,
     knowledgeStarts: { alice: null },
   };
@@ -1791,6 +2364,54 @@ try {
   assert(restarted.records.some((record) => record.kind === "scene" && record.content));
   assert(restarted.records.some((record) => record.kind === "excerpt"));
   assert.deepEqual(await chats.listMessages(resetChat.id), preservedResetSource);
+  const backlog = await chats.create({
+    name: "Initial history behind a recent-only scene checkpoint",
+    mode: "roleplay",
+    characterIds: [],
+    connectionId: connection!.id,
+  });
+  assert(backlog);
+  await memory.updateSettings(backlog.id, { enabled: true, maxContextTokens: 16_384, summaryBudgetTokens: 512 });
+  await chats.createMessagesBatch(
+    backlog.id,
+    Array.from({ length: 120 }, (_, index) => ({
+      role: "user" as const,
+      content: `${[30, 75, 117].includes(index) ? "SCENE_CHANGE " : ""}Historical event ${index}. ${"The journey continued. ".repeat(20)}`,
+    })),
+  );
+  const backlogSource = await chats.listMessages(backlog.id);
+  const recentCheck = await memory.getSceneCheck(backlog.id);
+  assert(recentCheck);
+  assert(
+    await memory.commitSceneCheck(backlog.id, recentCheck, { ends: [{ messageNumber: 117 }] }),
+    "the recent-only checkpoint must be committed before backfill",
+  );
+  const beforeBackfill = requests.length;
+  const pauseBackfill = new AbortController();
+  await assert.rejects(
+    memory.initialize(backlog.id, {
+      signal: pauseBackfill.signal,
+      onProgress: (event) => {
+        if (event.stage === "classifying" && event.completed > 0) pauseBackfill.abort(new Error("pause backfill"));
+      },
+    }),
+  );
+  await memory.initialize(backlog.id);
+  await memory.prepare({ chatId: backlog.id, messages: backlogSource, audienceCharacterIds: [], budgetTokens: 50000 });
+  const historicalCalls = requests.slice(beforeBackfill).filter((request) => request.kind === "classify");
+  assert(historicalCalls.length > 1, "initial history spans multiple provider context windows");
+  assert(backlogSource.every((message) => historicalCalls.some((request) => request.text.includes(message.id))));
+  assert.deepEqual(
+    (await memory.status(backlog.id)).records
+      .filter((record) => record.kind === "scene" && record.status === "closed")
+      .map((record) => [record.startIndex, record.endIndex]),
+    [
+      [1, 30],
+      [31, 75],
+      [76, 117],
+    ],
+    "recent-only closed scaffolds must not cause initial preparation to skip older scenes",
+  );
   console.info(
     "Advanced Memory core regression passed (800 messages, resume, scope, compaction, previews, corrections and races).",
   );

@@ -1,0 +1,650 @@
+#!/usr/bin/env node
+// Writes docs/extending/ruleset.schema.json from the shared zod schema, so a ruleset author's
+// editor can flag a misspelled key or a wrong type while they type. `--check` fails when the
+// committed file is stale. Needs the shared package built first (`pnpm build:shared`).
+//
+// The JSON Schema is editor help, not the validator: the cross-reference checks (a skill naming an
+// ability that exists) only run in `parseRulesetDefinition`, which the import uses.
+import { readFile, writeFile } from "node:fs/promises";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import {
+  RULESET_CHECK_SCOPED_EFFECTS,
+  RULESET_COMBAT_CONDITION_EFFECTS,
+  RULESET_CREATURE_PLAIN_NEEDS,
+  RULESET_CREATURE_SHEET_REPLACES,
+  RULESET_LEVEL_REFUSED_EFFECTS,
+  RULESET_ROLLED_MODIFIER_TARGETS,
+  RULESET_SAVE_SCOPED_EFFECTS,
+  RULESET_SCALED_MAX_COLUMNS,
+  rulesetDefinitionSchema,
+} from "../packages/shared/dist/index.js";
+
+const target = new URL("../docs/extending/ruleset.schema.json", import.meta.url);
+
+// The Engine drops `$comment` from every object and `$schema` from the root before it validates
+// (`stripRulesetComments`), so the editor schema has to allow them or it would flag a valid file.
+function allowAnnotations(node, isRoot = true) {
+  if (Array.isArray(node)) {
+    for (const entry of node) allowAnnotations(entry, false);
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node)) {
+    // `properties` maps author-chosen names to schemas; its own keys are not schema keywords.
+    if (key === "properties") for (const child of Object.values(value)) allowAnnotations(child, false);
+    else allowAnnotations(value, false);
+  }
+  if (node.type === "object") {
+    // Any value, not just text: the Engine drops the key whatever it holds.
+    node.properties = { ...node.properties, $comment: {} };
+    if (isRoot) node.properties.$schema = {};
+  }
+}
+
+// "At least one of these keys" as its OWN constraint, kept in `allOf` rather than folded into the
+// node's `anyOf`. A node may already carry an `anyOf` from the zod schema, and adding branches to
+// that one would WIDEN it: a document matching an existing branch would satisfy the whole `anyOf`
+// without carrying any of these keys at all.
+function requireAnyOf(node, keys) {
+  node.allOf = [...(node.allOf ?? []), { anyOf: keys.map((key) => ({ required: [key] })) }];
+}
+
+// A catalog carries its entries inline or names a package asset, never both. The zod schema says
+// so in a refinement, which a JSON Schema generator cannot see, so the editor is told here.
+function requireOneCatalogSource(node) {
+  if (Array.isArray(node)) return node.forEach(requireOneCatalogSource);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireOneCatalogSource);
+  if (node.type === "object" && node.properties?.feeds && node.properties.entries && node.properties.asset) {
+    node.oneOf = [{ required: ["entries"] }, { required: ["asset"] }];
+  }
+}
+
+// An entry writes rows onto a sheet, is a creature or is an item: exactly one of the three. A
+// creature says what it does in its own actions and an item in its item block, so neither carries
+// `mechanics`. Refinements again, so the editor is told here. The node is found by its shape: `rows`
+// beside `creature` and `item`.
+function requireOneEntryContent(node) {
+  if (Array.isArray(node)) return node.forEach(requireOneEntryContent);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireOneEntryContent);
+  if (node.type === "object" && node.properties?.rows && node.properties.creature && node.properties.item) {
+    node.oneOf = [
+      { required: ["rows"] },
+      { required: ["creature"], not: { required: ["mechanics"] } },
+      { required: ["item"], not: { required: ["mechanics"] } },
+    ];
+  }
+}
+
+// And the header the entries sit in: a catalog of rows names the lists it feeds, a catalog of
+// creatures or of items names none. Found by its shape: `holds` beside `feeds`.
+function requireCatalogFeeds(node) {
+  if (Array.isArray(node)) return node.forEach(requireCatalogFeeds);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireCatalogFeeds);
+  if (node.type === "object" && node.properties?.holds && node.properties.feeds) {
+    node.if = { properties: { holds: { enum: ["creatures", "items"] } }, required: ["holds"] };
+    node.then = { not: { required: ["feeds"] } };
+    node.else = { required: ["feeds"] };
+  }
+}
+
+// How many columns of a row may be scaled is another refinement the generator cannot see. The node
+// is found by its shape (a map whose values carry `from`), so the editor counts what the Engine counts.
+function boundScaledColumns(node) {
+  if (Array.isArray(node)) return node.forEach(boundScaledColumns);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(boundScaledColumns);
+  const column = node.additionalProperties;
+  if (node.type === "object" && column?.properties?.from && column.properties.table) {
+    // `$comment` is allowed in every object and the Engine drops it before it counts, so a map
+    // that carries one may hold one key more.
+    node.if = { required: ["$comment"] };
+    node.then = { minProperties: 2, maxProperties: RULESET_SCALED_MAX_COLUMNS + 1 };
+    node.else = { minProperties: 1, maxProperties: RULESET_SCALED_MAX_COLUMNS };
+  }
+}
+
+// A layer's `hide` compares a catalog filter exactly one way. That too is a refinement, so the
+// editor is told here. The node is found by its shape: `filter` beside the four comparisons.
+function requireOneHideComparison(node) {
+  if (Array.isArray(node)) return node.forEach(requireOneHideComparison);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireOneHideComparison);
+  const keys = ["above", "below", "equals", "notIn"];
+  if (node.type === "object" && node.properties?.filter && keys.every((key) => node.properties[key])) {
+    node.oneOf = keys.map((key) => ({ required: [key] }));
+  }
+}
+
+// A sheet item's `hideWhen` compares its field exactly one way too: equals, notEquals or in. Found
+// by its shape: `field` beside all three.
+function requireOneHideWhenComparison(node) {
+  if (Array.isArray(node)) return node.forEach(requireOneHideWhenComparison);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireOneHideWhenComparison);
+  const keys = ["equals", "notEquals", "in"];
+  if (node.type === "object" && node.properties?.field && keys.every((key) => node.properties[key])) {
+    node.oneOf = keys.map((key) => ({ required: [key] }));
+  }
+}
+
+// A value reference's `read` says which number of a live track it reads, so it goes only beside
+// `liveTrack`. Found by its shape: the two side by side.
+function readOnlyWithLiveTrack(node) {
+  if (Array.isArray(node)) return node.forEach(readOnlyWithLiveTrack);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(readOnlyWithLiveTrack);
+  if (node.type === "object" && node.properties?.liveTrack && node.properties.read) {
+    node.dependencies = { ...(node.dependencies ?? {}), read: ["liveTrack"] };
+  }
+}
+
+// An enum table is keyed on exactly one of an enum field or a live state, and names one to forty
+// values. Both are refinements, so the editor is told here. Found by its shape: `from` and `table`
+// beside the op that names it.
+function enumTableShape(node) {
+  if (Array.isArray(node)) return node.forEach(enumTableShape);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(enumTableShape);
+  const properties = node.properties;
+  if (node.type !== "object" || properties?.op?.const !== "enumTable" || !properties.from || !properties.table) return;
+  properties.from.oneOf = [{ required: ["field"] }, { required: ["liveState"] }];
+  properties.table.minProperties = 1;
+  properties.table.maxProperties = 40;
+}
+
+// What winning a contest does is at least one thing: it applies, ends or pushes. A refinement, so the
+// editor is told here. Found by its shape: the three side by side.
+function contestDoesSomething(node) {
+  if (Array.isArray(node)) return node.forEach(contestDoesSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(contestDoesSomething);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.applies || !properties.ends || !properties.push) return;
+  requireAnyOf(node, ["applies", "ends", "push"]);
+}
+
+// A rest step's `to` is a word only on a state, where it is "default" or one of the state's values;
+// on a pool or a track it is "max", "min" or a number. A state step is set, never moved by an amount.
+// Refinements again, so the editor is told here. Found by its shape: `state` beside `track` and `to`.
+function restStepTo(node) {
+  if (Array.isArray(node)) return node.forEach(restStepTo);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(restStepTo);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.state || !properties.track || !properties.to) return;
+  node.allOf = [
+    ...(node.allOf ?? []),
+    {
+      if: { required: ["state"] },
+      then: { properties: { to: { type: "string" } }, required: ["to"], not: { required: ["by"] } },
+      else: { properties: { to: { anyOf: [{ enum: ["max", "min"] }, { type: "integer" }] } } },
+    },
+  ];
+}
+
+// A condition that lasts until a save needs the save that ends it, or nothing would ever take it
+// off. That is a refinement too, so the editor is told here. The node is found by its shape.
+function requireSaveEndsUntilSave(node) {
+  if (Array.isArray(node)) return node.forEach(requireSaveEndsUntilSave);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireSaveEndsUntilSave);
+  if (node.type === "object" && node.properties?.condition && node.properties.duration && node.properties.saveEnds) {
+    node.if = { properties: { duration: { const: "until-save" } }, required: ["duration"] };
+    node.then = { required: ["saveEnds"] };
+  }
+}
+
+// Only a reaction that waits for something ABOUT to happen may call it off: a moment that has
+// already happened cannot be undone. That is a refinement as well, so the editor is told here. The
+// node is found by its shape, which is the three keys a named moment carries and nothing else.
+function cancelOnlyWhenAimed(node) {
+  if (Array.isArray(node)) return node.forEach(cancelOnlyWhenAimed);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(cancelOnlyWhenAimed);
+  const keys = Object.keys(node.properties ?? {}).filter((key) => key !== "$comment");
+  if (node.type === "object" && ["on", "at", "cancels", "against"].every((key) => keys.includes(key))) {
+    // Only a moment BEFORE something resolves may call it off.
+    node.if = { required: ["cancels"] };
+    node.then = { properties: { on: { enum: ["aimed", "used"] } }, required: ["on"] };
+  }
+}
+
+// A condition's modifier changes its number by something: a flat amount that is not 0, dice (only on
+// a number that is rolled, and `minus` only with dice), `times` (only on speed), or a `mode` (only on
+// checks and saves). Its own `skills` narrow a change to checks and its own `saves` one to saves.
+// Refinements, so the editor is told here. The node is found by its shape: `to` beside `flat`, `dice`
+// and `times`.
+function modifierSaysSomething(node) {
+  if (Array.isArray(node)) return node.forEach(modifierSaysSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(modifierSaysSomething);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.to || !properties.flat || !properties.dice || !properties.times) return;
+  requireAnyOf(node, ["flat", "dice", "times", "mode"]);
+  properties.flat = { ...properties.flat, not: { const: 0 } };
+  node.allOf = [
+    ...(node.allOf ?? []),
+    { if: { required: ["dice"] }, then: { properties: { to: { enum: [...RULESET_ROLLED_MODIFIER_TARGETS] } } } },
+    { if: { required: ["times"] }, then: { properties: { to: { const: "speed" } } } },
+    { if: { required: ["minus"] }, then: { required: ["dice"] } },
+    { if: { required: ["mode"] }, then: { properties: { to: { enum: ["checks", "saves"] } } } },
+    { if: { required: ["skills"] }, then: { properties: { to: { const: "checks" } } } },
+    { if: { required: ["saves"] }, then: { properties: { to: { const: "saves" } } } },
+  ];
+}
+
+// `saves` on a condition or a level narrows the save effects and the modifiers to saves, so it needs
+// one of them beside it; and a level does something and never has an effect that needs a source or
+// ends by itself. Refinements, so the editor is told here. Found by shape: `saves` beside `effects`
+// and `modifiers`, with `track` beside them for a level.
+function conditionSavesAndLevels(node) {
+  if (Array.isArray(node)) return node.forEach(conditionSavesAndLevels);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(conditionSavesAndLevels);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.saves || !properties.effects || !properties.modifiers) return;
+  // And `skills` narrows the check effects and the modifiers to checks, so it needs one of those.
+  const narrows = (key, effects, to) => ({
+    if: { required: [key] },
+    then: {
+      anyOf: [
+        { required: ["effects"], properties: { effects: { contains: { enum: [...effects] } } } },
+        { required: ["modifiers"], properties: { modifiers: { contains: { properties: { to: { const: to } } } } } },
+      ],
+    },
+  });
+  node.allOf = [
+    ...(node.allOf ?? []),
+    narrows("saves", RULESET_SAVE_SCOPED_EFFECTS, "saves"),
+    ...(properties.skills ? [narrows("skills", RULESET_CHECK_SCOPED_EFFECTS, "checks")] : []),
+  ];
+  // An item's worn or carried effect (no `condition`, no `track`) does something.
+  if (!properties.condition && !properties.track) {
+    node.allOf.push({
+      anyOf: [
+        { required: ["effects"] },
+        { required: ["modifiers"] },
+        { required: ["failsSaves"] },
+        { required: ["abilities"] },
+        { required: ["resist"] },
+        { required: ["vulnerable"] },
+        { required: ["immune"] },
+        { required: ["conditionImmunities"] },
+      ],
+    });
+    return;
+  }
+  if (!properties.track) return;
+  // A level reads a live track or a derived value, one of them.
+  node.allOf.push({ oneOf: [{ required: ["track"] }, { required: ["derived"] }] });
+  const refused = new Set(RULESET_LEVEL_REFUSED_EFFECTS);
+  properties.effects = {
+    ...properties.effects,
+    items: { type: "string", enum: RULESET_COMBAT_CONDITION_EFFECTS.filter((effect) => !refused.has(effect)) },
+  };
+  node.allOf.push({
+    anyOf: [
+      { required: ["effects"], properties: { effects: { minItems: 1 } } },
+      { required: ["modifiers"] },
+      { required: ["failsSaves"] },
+    ],
+  });
+}
+
+// What an unmet requirement applies cannot change an ability, since what it asks may read one. A
+// refinement, so the editor is told here. Found by shape: `value` beside `atLeast` and `otherwise`.
+function requirementChangesNoAbility(node) {
+  if (Array.isArray(node)) return node.forEach(requirementChangesNoAbility);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requirementChangesNoAbility);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.value || !properties.atLeast || !properties.otherwise) return;
+  properties.otherwise = { ...properties.otherwise, not: { required: ["abilities"] } };
+}
+
+// A creature's action: a sequence carries nothing of its own, one that lands on the creature itself
+// takes no other target, and a reaction is not also bought between turns. Refinements, so the editor
+// is told here. Found by shape: `sequence` beside `signature`, `reaction` and `self`.
+const SEQUENCE_CARRIES_NOTHING = [
+  "toHit",
+  "autoHit",
+  "damage",
+  "save",
+  "saveDifficulty",
+  "applies",
+  "targetCount",
+  "area",
+  "reaction",
+  "self",
+];
+function creatureActionShape(node) {
+  if (Array.isArray(node)) return node.forEach(creatureActionShape);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(creatureActionShape);
+  const properties = node.properties;
+  if (
+    node.type !== "object" ||
+    !properties?.sequence ||
+    !properties.signature ||
+    !properties.reaction ||
+    !properties.self
+  )
+    return;
+  node.allOf = [
+    ...(node.allOf ?? []),
+    {
+      if: { required: ["sequence"] },
+      then: { not: { anyOf: SEQUENCE_CARRIES_NOTHING.map((key) => ({ required: [key] })) } },
+    },
+    { if: { required: ["self"] }, then: { not: { anyOf: [{ required: ["targetCount"] }, { required: ["area"] }] } } },
+    { if: { required: ["reaction"] }, then: { not: { required: ["signature"] } } },
+  ];
+}
+
+// A creature either carries a sheet in the ruleset's own terms, and then takes its health, defense,
+// initiative, speed, scores and saves from it and gives none of them here, or carries no sheet and
+// gives the three numbers a fight cannot do without, and at least one action. Zod refines that; the
+// editor is told here. The node is found by its shape: `sheet` beside `actions` and `tier`.
+const CREATURE_SHEET_REPLACES = [...RULESET_CREATURE_SHEET_REPLACES];
+const CREATURE_PLAIN_NEEDS = [...RULESET_CREATURE_PLAIN_NEEDS];
+function oneSourceForCreature(node) {
+  if (Array.isArray(node)) return node.forEach(oneSourceForCreature);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(oneSourceForCreature);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.sheet || !properties.actions || !properties.tier) return;
+  node.allOf = [
+    ...(node.allOf ?? []),
+    {
+      if: { required: ["sheet"] },
+      then: { not: { anyOf: CREATURE_SHEET_REPLACES.map((key) => ({ required: [key] })) } },
+      else: { required: [...CREATURE_PLAIN_NEEDS, "actions"], properties: { actions: { minItems: 1 } } },
+    },
+  ];
+}
+
+// A creature action's damage, and every clause beside it, names dice, a flat amount, or both: an
+// empty one is refused by the Engine, and that too is a refinement. The node is found by its shape:
+// `dice`, `flat` and `type`, and nothing but the keys a blow or a clause carries.
+const DAMAGE_KEYS = ["dice", "flat", "type", "plus", "save"];
+function requireDamageAmount(node) {
+  if (Array.isArray(node)) return node.forEach(requireDamageAmount);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireDamageAmount);
+  const keys = Object.keys(node.properties ?? {}).filter((key) => key !== "$comment");
+  const damageShaped =
+    ["dice", "flat", "type"].every((key) => keys.includes(key)) && keys.every((key) => DAMAGE_KEYS.includes(key));
+  // A rider's amount carries no type of its own, so its keys alone look like every other pair of
+  // dice and flat in the file, a creature's health included. The schema marks it by name instead.
+  const riderAmountShaped = node.description === "rider-amount";
+  if (node.type === "object" && (damageShaped || riderAmountShaped)) {
+    requireAnyOf(node, ["dice", "flat"]);
+  }
+}
+
+// Everything a combat block measures in cells needs the block to say what a cell is worth. The
+// Engine refuses one without it, which is a cross-check the generator cannot see, so the editor is
+// told here. The node is found by its shape: `distance` beside `opportunity` and `attacks`.
+function requireDistanceForMeasured(node) {
+  if (Array.isArray(node)) return node.forEach(requireDistanceForMeasured);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireDistanceForMeasured);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.distance || !properties.opportunity || !properties.attacks) return;
+  node.dependencies = {
+    ...(node.dependencies ?? {}),
+    ranged: ["distance"],
+    cover: ["distance"],
+    opportunity: ["distance"],
+  };
+  // A weapon list that gives its rows a reach or a range is measured in cells too.
+  node.allOf = [
+    ...(node.allOf ?? []),
+    {
+      if: {
+        required: ["attacks"],
+        properties: { attacks: { contains: { anyOf: [{ required: ["reach"] }, { required: ["range"] }] } } },
+      },
+      then: { required: ["distance"] },
+    },
+  ];
+}
+
+// Each combat kind rolls with its own block and never the other's: `attack-vs-defense` says what an
+// attack rolls in `attackRoll`, and `dice-pool` throws the ruleset's own pools and says how damage and
+// soak are thrown in `pool`. Refinements, so the editor is told here. Found by its shape: `kind`
+// beside `attackRoll` and `pool`.
+function oneRollBlockPerKind(node) {
+  if (Array.isArray(node)) return node.forEach(oneRollBlockPerKind);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(oneRollBlockPerKind);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.kind || !properties.attackRoll || !properties.pool) return;
+  node.allOf = [
+    ...(node.allOf ?? []),
+    {
+      if: { required: ["kind"], properties: { kind: { const: "dice-pool" } } },
+      then: { required: ["pool"], not: { required: ["attackRoll"] } },
+      // Initiative thrown as a pool, or moved by attacks, is a pool fight's too.
+      else: {
+        required: ["attackRoll"],
+        not: { required: ["pool"] },
+        properties: { initiative: { not: { anyOf: [{ required: ["pool"] }, { required: ["resource"] }] } } },
+      },
+    },
+  ];
+}
+
+// Initiative is dice added up with a modifier, or a pool whose successes and `plus` are the number,
+// and a number attacks move opens as a pool and is never thrown again. Found by its shape: `dice` beside `pool` and
+// `resource`.
+function initiativeOneWay(node) {
+  if (Array.isArray(node)) return node.forEach(initiativeOneWay);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(initiativeOneWay);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.dice || !properties.pool || !properties.resource) return;
+  node.oneOf = [{ required: ["dice"] }, { required: ["pool"] }];
+  node.allOf = [
+    ...(node.allOf ?? []),
+    { if: { required: ["modifier"] }, then: { required: ["dice"] } },
+    { if: { required: ["plus"] }, then: { required: ["pool"] } },
+    { if: { required: ["resource"] }, then: { required: ["pool"], not: { required: ["each"] } } },
+  ];
+}
+
+// An attack's style either takes the number or spends it, never both, and at least one of them takes,
+// so a crashed combatant always has one to attack in. Found by its shape: `takes` beside `spends`, and
+// the `styles` list beside `base`.
+function styleTakesOrSpends(node) {
+  if (Array.isArray(node)) return node.forEach(styleTakesOrSpends);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(styleTakesOrSpends);
+  const properties = node.properties;
+  if (node.type !== "object") return;
+  if (properties?.takes && properties.spends) node.oneOf = [{ required: ["takes"] }, { required: ["spends"] }];
+  if (properties?.styles && properties.base) properties.styles.contains = { required: ["takes"] };
+}
+
+// Soak soaks something: a number for every kind of harm, one per kind, or both. Found by its shape:
+// `roll` beside `all` and `byKind`.
+function soakSaysSomething(node) {
+  if (Array.isArray(node)) return node.forEach(soakSaysSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(soakSaysSomething);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.roll || !properties.all || !properties.byKind) return;
+  requireAnyOf(node, ["all", "byKind"]);
+}
+
+/**
+ * Two rules a catalog entry's mechanics keep that the shape alone does not say: an entry of the
+ * kind `rider` has to carry the `rider` that describes it, and something `free` spends no budget so
+ * it names none. Zod refuses both at import; an author's editor should refuse them while typing.
+ */
+function requireMechanicsPairs(node) {
+  if (Array.isArray(node)) return node.forEach(requireMechanicsPairs);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireMechanicsPairs);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.kind || !properties.rider || !properties.free) return;
+  node.allOf = [
+    ...(node.allOf ?? []),
+    { if: { properties: { kind: { const: "rider" } }, required: ["kind"] }, then: { required: ["rider"] } },
+    { not: { required: ["free", "budget"] } },
+  ];
+}
+
+// A track's `kinds` say what a mark may BE, so they need the `levels` a mark sits on, and the other
+// way round a track with levels needs kinds. That is a cross-check the generator cannot see, so the
+// editor is told here. The node is found by its shape: `levels` beside `kinds` and `min`.
+function requireLevelsWithKinds(node) {
+  if (Array.isArray(node)) return node.forEach(requireLevelsWithKinds);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireLevelsWithKinds);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.levels || !properties.kinds || !properties.min) return;
+  // A wound track has kinds beside exactly one of levels or boxes; fill, onFull and extra are only
+  // for one, and extra only beside levels.
+  node.dependencies = {
+    ...(node.dependencies ?? {}),
+    levels: ["kinds"],
+    boxes: ["kinds"],
+    extra: ["levels"],
+    fill: ["kinds"],
+    onFull: ["kinds"],
+  };
+  node.allOf = [
+    ...(node.allOf ?? []),
+    { not: { required: ["levels", "boxes"] } },
+    { if: { required: ["kinds"] }, then: { anyOf: [{ required: ["levels"] }, { required: ["boxes"] }] } },
+    // An indexed track never moves a mark, so it has no lightest one to upgrade: it refuses when full.
+    {
+      if: { properties: { fill: { const: "indexed" } }, required: ["fill"] },
+      then: { properties: { onFull: { const: "refuse" } }, required: ["onFull"] },
+    },
+  ];
+}
+
+/**
+ * A purchase on a check buys successes, dice or a throw again, so an entry that names none of them
+ * buys nothing. Zod refuses that at import; the published schema has to say it too, or an author's
+ * editor calls a useless entry valid.
+ */
+function requireSpendBuysSomething(node) {
+  if (Array.isArray(node)) return node.forEach(requireSpendBuysSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireSpendBuysSomething);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.pool || !properties.perCheck) return;
+  if (!properties.successes && !properties.dice) return;
+  requireAnyOf(
+    node,
+    ["successes", "dice", "reroll"].filter((key) => properties[key]),
+  );
+}
+
+/**
+ * And the other half of that: a charm's `check` throws dice again, adds dice, adds successes, moves
+ * the target or moves a face rule, so one that says none of them spends a resource for nothing. Zod
+ * refuses it at import; without this the editor calls the empty object valid. Found by its shape:
+ * the four keys it has always had, and every one of the six counts toward "says something".
+ */
+function requireCheckEffectDoesSomething(node) {
+  if (Array.isArray(node)) return node.forEach(requireCheckEffectDoesSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireCheckEffectDoesSomething);
+  const shape = ["reroll", "dice", "successes", "threshold"];
+  if (node.type !== "object" || !shape.every((key) => node.properties?.[key])) return;
+  requireAnyOf(
+    node,
+    [...shape, "explode", "double"].filter((key) => node.properties[key]),
+  );
+}
+
+/**
+ * A pool's `explode` or `double` names the face it fires on, the lowest face a check may move it
+ * to, or both; an empty one says nothing. Zod refuses that at import. Found by its shape: exactly
+ * `from` and `min`.
+ */
+function requireFaceRuleSaysSomething(node) {
+  if (Array.isArray(node)) return node.forEach(requireFaceRuleSaysSomething);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(requireFaceRuleSaysSomething);
+  const keys = Object.keys(node.properties ?? {});
+  if (node.type !== "object" || keys.length !== 2 || !node.properties.from || !node.properties.min) return;
+  requireAnyOf(node, ["from", "min"]);
+}
+
+/**
+ * Only a pool counts successes, so only a `dice-pool` resolution may declare a `spend`. Zod refuses
+ * it on a sum at import; the published schema must not offer it there.
+ */
+function spendOnlyOnAPool(node) {
+  if (Array.isArray(node)) return node.forEach(spendOnlyOnAPool);
+  if (!node || typeof node !== "object") return;
+  Object.values(node).forEach(spendOnlyOnAPool);
+  const properties = node.properties;
+  if (node.type !== "object" || !properties?.spend || !properties.kind) return;
+  const kind = properties.kind.const ?? properties.kind.enum?.[0];
+  if (kind !== undefined && kind !== "dice-pool") delete properties.spend;
+}
+
+const schema = zodToJsonSchema(rulesetDefinitionSchema, { $refStrategy: "none", target: "jsonSchema7" });
+requireLevelsWithKinds(schema);
+requireSpendBuysSomething(schema);
+requireCheckEffectDoesSomething(schema);
+requireFaceRuleSaysSomething(schema);
+spendOnlyOnAPool(schema);
+requireMechanicsPairs(schema);
+requireOneCatalogSource(schema);
+requireOneEntryContent(schema);
+requireCatalogFeeds(schema);
+requireSaveEndsUntilSave(schema);
+cancelOnlyWhenAimed(schema);
+modifierSaysSomething(schema);
+creatureActionShape(schema);
+conditionSavesAndLevels(schema);
+requirementChangesNoAbility(schema);
+oneSourceForCreature(schema);
+requireDamageAmount(schema);
+requireDistanceForMeasured(schema);
+oneRollBlockPerKind(schema);
+initiativeOneWay(schema);
+styleTakesOrSpends(schema);
+soakSaysSomething(schema);
+boundScaledColumns(schema);
+requireOneHideComparison(schema);
+requireOneHideWhenComparison(schema);
+readOnlyWithLiveTrack(schema);
+enumTableShape(schema);
+restStepTo(schema);
+contestDoesSomething(schema);
+allowAnnotations(schema);
+const text = `${JSON.stringify(
+  {
+    $schema: schema.$schema,
+    title: "Marinara Engine Game Mode ruleset",
+    description:
+      "Generated by scripts/generate-ruleset-schema.mjs from packages/shared/src/schemas/ruleset.schema.ts. Do not edit by hand.",
+    ...schema,
+  },
+  null,
+  2,
+)}\n`;
+
+if (process.argv.includes("--check")) {
+  // A Windows checkout may hold the file with CRLF line endings; that is not staleness.
+  const current = (await readFile(target, "utf8").catch(() => "")).replaceAll("\r\n", "\n");
+  if (current !== text) {
+    console.error("docs/extending/ruleset.schema.json is stale. Run: pnpm ruleset:schema");
+    process.exit(1);
+  }
+  console.log("docs/extending/ruleset.schema.json is up to date.");
+} else {
+  await writeFile(target, text);
+  console.log("Wrote docs/extending/ruleset.schema.json");
+}

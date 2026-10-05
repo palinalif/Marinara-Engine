@@ -10,20 +10,26 @@ export function useEditorSections<T extends string>(
   const contentRef = useRef<HTMLDivElement>(null);
   const navigationTargetRef = useRef<HTMLElement | null>(null);
 
+  /** Scroll to an element and keep it anchored while content around it grows, until the user scrolls. */
+  const scrollToElement = useCallback((target: HTMLElement, smooth = true) => {
+    const root = contentRef.current;
+    if (!root?.contains(target)) return;
+    navigationTargetRef.current = target;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    root.scrollTo({
+      top: root.scrollTop + target.getBoundingClientRect().top - root.getBoundingClientRect().top - 16,
+      behavior: smooth && !reducedMotion ? "smooth" : "auto",
+    });
+  }, []);
+
   const scrollToSection = useCallback(
     (section: T, smooth = true) => {
-      const root = contentRef.current;
-      const target = root?.querySelector<HTMLElement>(`[data-editor-section="${section}"]`);
-      if (!root || !target) return;
-      navigationTargetRef.current = target;
+      const target = contentRef.current?.querySelector<HTMLElement>(`[data-editor-section="${section}"]`);
+      if (!target) return;
       onSectionChange(section);
-      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      root.scrollTo({
-        top: root.scrollTop + target.getBoundingClientRect().top - root.getBoundingClientRect().top - 16,
-        behavior: smooth && !reducedMotion ? "smooth" : "auto",
-      });
+      scrollToElement(target, smooth);
     },
-    [onSectionChange],
+    [onSectionChange, scrollToElement],
   );
 
   useEffect(() => {
@@ -74,5 +80,5 @@ export function useEditorSections<T extends string>(
     };
   }, [editorKey, ready, initialSection, onSectionChange, scrollToSection]);
 
-  return { contentRef, scrollToSection };
+  return { contentRef, scrollToSection, scrollToElement };
 }

@@ -40,6 +40,8 @@ interface ExpressionSpriteSettingsProps {
   onToggleDisplayMode: (mode: SpriteDisplayMode) => void;
   expressionAvatarsEnabled: boolean;
   onToggleExpressionAvatars: () => void;
+  onlyActiveSprites: boolean;
+  onToggleOnlyActiveSprites?: () => void;
   ownerCount: number;
   ownersLoading: boolean;
   choicesLoading: boolean;
@@ -74,6 +76,8 @@ export function ExpressionSpriteSettings({
   onToggleDisplayMode,
   expressionAvatarsEnabled,
   onToggleExpressionAvatars,
+  onlyActiveSprites,
+  onToggleOnlyActiveSprites,
   ownerCount,
   ownersLoading,
   choicesLoading,
@@ -106,6 +110,15 @@ export function ExpressionSpriteSettings({
   return (
     <>
       <SpriteDisplayModeToggle modes={displayModes} onToggle={onToggleDisplayMode} />
+
+      {onToggleOnlyActiveSprites && (
+        <AgentSettingsToggle
+          label={localizeUi("ui.chat.expressionSprites.onlyActive")}
+          description={localizeUi("ui.chat.expressionSprites.onlyActiveDescription")}
+          enabled={onlyActiveSprites}
+          onToggle={onToggleOnlyActiveSprites}
+        />
+      )}
 
       <AgentSettingsToggle
         label={localizeUi("ui.chat.expressionsetupfields.expressionAvatars")}
@@ -215,7 +228,7 @@ export function ExpressionSpriteSettings({
             </AgentSettingsActionButton>
           </div>
 
-          <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="mt-2 flex flex-col gap-2 @lg:flex-row @lg:items-center">
             <label
               htmlFor={`sprite-layout-apply-to-${chatId}`}
               className="text-[0.625rem] font-medium text-[var(--muted-foreground)]"
@@ -263,7 +276,7 @@ export function ExpressionSpriteSettings({
             </div>
           </div>
 
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div className="mt-3 grid gap-3 @lg:grid-cols-2">
             <SpriteRangeSlider
               label={localizeUi("ui.chat.expressionsetupfields.expressionSize")}
               value={expressionSpriteScalePercent}

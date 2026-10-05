@@ -18,12 +18,14 @@ import { dirname, join, resolve, sep } from "node:path";
 import {
   UTILITY_SIDECAR_DEFAULT_CONFIG,
   UTILITY_SIDECAR_LIMITS,
+  type DecisionThinkingMode,
   type UtilitySidecarConfig,
   type UtilitySidecarHardwareSettings,
   type UtilitySidecarModelSource,
   type UtilitySidecarStatus,
   type UtilitySidecarUpdateCheck,
 } from "@marinara-engine/shared";
+import { runWithRootLogContext } from "../../lib/log-context.js";
 import { logger } from "../../lib/logger.js";
 import { getDataDir } from "../../utils/data-dir.js";
 import { buildLlamaArgs, buildLlamaStartupPlans } from "../sidecar/sidecar-launch-plan.js";
@@ -167,6 +169,11 @@ export class UtilitySidecarService {
     return { ...this.config, models: { ...this.config.models } };
   }
 
+  /** This slot's llama-server process id, for measured rather than estimated memory. */
+  getProcessId(): number | null {
+    return this.child?.pid ?? null;
+  }
+
   getStatus(): UtilitySidecarStatus {
     return {
       configured: Object.keys(this.config.models).length > 0,
@@ -182,6 +189,7 @@ export class UtilitySidecarService {
         gpuLayers: this.config.gpuLayers,
         maxParallelJobs: this.config.maxParallelJobs,
       },
+      decisionThinking: this.config.decisionThinking,
     };
   }
 
@@ -343,6 +351,19 @@ export class UtilitySidecarService {
   }
 
   /**
+   * Record how this slot's model may answer an activation question.
+   *
+   * The operator's own choice, and only theirs: when Auto finds that the loaded model
+   * cannot answer in one token, that verdict goes in the decision backend's per-model
+   * cache rather than being written back over this setting.
+   */
+  setDecisionThinking(decisionThinking: DecisionThinkingMode): void {
+    if (this.config.decisionThinking === decisionThinking) return;
+    this.config = { ...this.config, decisionThinking };
+    this.writeConfig();
+  }
+
+  /**
    * Choose which model this slot serves.
    *
    * Stops a process that is serving something else first. Otherwise the running child
@@ -407,7 +428,10 @@ export class UtilitySidecarService {
         continue;
       }
 
-      this.starting = this.start().finally(() => {
+      // Root log context: the process outlives the request that started it and is
+      // shared by later callers, so its startup and exit lines must not carry the
+      // first requester's requestId.
+      this.starting = runWithRootLogContext({}, () => this.start()).finally(() => {
         this.starting = null;
       });
       await this.starting;

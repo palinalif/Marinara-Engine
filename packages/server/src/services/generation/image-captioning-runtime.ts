@@ -1,5 +1,10 @@
+import { createHash } from "node:crypto";
 import { allowsDefaultChatModel } from "../llm/local-context-limit.js";
-import { LOCAL_SIDECAR_CONNECTION_ID, parseConnectionImageCaptioningDefaults } from "@marinara-engine/shared";
+import {
+  DEFAULT_IMAGE_CAPTIONING_PROMPT,
+  LOCAL_SIDECAR_CONNECTION_ID,
+  parseConnectionImageCaptioningDefaults,
+} from "@marinara-engine/shared";
 
 import { isDebugAgentsEnabled } from "../../config/runtime-config.js";
 import { logger, logDebugOverride } from "../../lib/logger.js";
@@ -44,6 +49,10 @@ export type ImageCaptioningRuntime = {
   connectionId: string | null;
   connection: ImageCaptionConnection | null;
   provider: BaseLLMProvider | null;
+  /** The chat's own captioning prompt. Blank means the built-in default. */
+  prompt?: string | null;
+  /** Why captioning is on but can't run. Turns with images then fail instead of sending the raw image. */
+  unavailableReason?: string;
 };
 
 export type PromptAttachmentResolution = {
@@ -78,6 +87,10 @@ export const DISABLED_IMAGE_CAPTIONING: ImageCaptioningRuntime = {
   provider: null,
 };
 
+function unavailableImageCaptioning(reason: string): ImageCaptioningRuntime {
+  return { ...DISABLED_IMAGE_CAPTIONING, enabled: true, unavailableReason: reason };
+}
+
 const IMAGE_CAPTION_MAX_TOKENS = 700;
 const IMAGE_CAPTION_MAX_CHARS = 4_000;
 const IMAGE_CAPTION_MAX_GENERATIONS = 8;
@@ -95,6 +108,8 @@ export async function resolveImageCaptioningRuntime(args: {
   admissionMode?: ConnectionAdmissionMode;
 }): Promise<ImageCaptioningRuntime> {
   const { chatMeta, connections } = args;
+  // An explicit "on" in the chat counts even if loading a connection below throws, so that error is shown.
+  let captioningEnabled = chatMeta.imageCaptioningEnabled === true;
   try {
     const hasChatEnabledOverride = typeof chatMeta.imageCaptioningEnabled === "boolean";
     const hasChatConnectionOverride = Object.prototype.hasOwnProperty.call(chatMeta, "imageCaptioningConnectionId");
@@ -108,7 +123,7 @@ export async function resolveImageCaptioningRuntime(args: {
       activeConnection = await connections.getWithKey(args.fallbackConnectionId);
     }
     const connectionDefaults = parseConnectionImageCaptioningDefaults(activeConnection?.defaultParameters);
-    const captioningEnabled = hasChatEnabledOverride
+    captioningEnabled = hasChatEnabledOverride
       ? chatMeta.imageCaptioningEnabled === true
       : connectionDefaults.imageCaptioningEnabled === true;
     if (!captioningEnabled) return DISABLED_IMAGE_CAPTIONING;
@@ -123,18 +138,18 @@ export async function resolveImageCaptioningRuntime(args: {
         : null
       : inheritedConnectionId;
     const fallbackCaptionConnectionId = configuredConnectionId ?? args.fallbackConnectionId;
-    if (!fallbackCaptionConnectionId) return DISABLED_IMAGE_CAPTIONING;
+    if (!fallbackCaptionConnectionId) return unavailableImageCaptioning("no captioning connection is selected");
     let captionConnectionId = fallbackCaptionConnectionId;
     if (captionConnectionId === "random") {
       const pool = await connections.listRandomPool();
       if (!pool.length) {
         logger.warn("[image-captioning] Random captioning connection requested but random pool is empty");
-        return DISABLED_IMAGE_CAPTIONING;
+        return unavailableImageCaptioning("the random connection pool is empty");
       }
       const randomCaptionConnectionId = pool[Math.floor(Math.random() * pool.length)]?.id;
       if (!randomCaptionConnectionId) {
         logger.warn("[image-captioning] Random captioning connection resolved without an id");
-        return DISABLED_IMAGE_CAPTIONING;
+        return unavailableImageCaptioning("the random connection pool is empty");
       }
       captionConnectionId = randomCaptionConnectionId;
     }
@@ -147,7 +162,9 @@ export async function resolveImageCaptioningRuntime(args: {
           : await connections.getWithKey(captionConnectionId);
     if (!captionConnection || (!captionConnection.model && !allowsDefaultChatModel(captionConnection))) {
       logger.warn("[image-captioning] Captioning connection %s was not found", captionConnectionId);
-      return DISABLED_IMAGE_CAPTIONING;
+      return unavailableImageCaptioning(
+        captionConnection ? "the captioning connection has no model" : "the captioning connection was not found",
+      );
     }
 
     let captionProvider: BaseLLMProvider;
@@ -157,7 +174,7 @@ export async function resolveImageCaptioningRuntime(args: {
       const captionBaseUrl = resolveBaseUrl(captionConnection);
       if (!captionBaseUrl) {
         logger.warn("[image-captioning] Captioning connection %s has no base URL", captionConnectionId);
-        return DISABLED_IMAGE_CAPTIONING;
+        return unavailableImageCaptioning("the captioning connection has no base URL");
       }
       captionProvider = createLLMProvider(
         captionConnection.provider,
@@ -196,10 +213,13 @@ export async function resolveImageCaptioningRuntime(args: {
       connectionId: captionConnectionId,
       connection: captionConnection,
       provider: captionProvider,
+      prompt: typeof chatMeta.imageCaptioningPrompt === "string" ? chatMeta.imageCaptioningPrompt : null,
     };
   } catch (error) {
-    logger.warn(error, "[image-captioning] Failed to resolve captioning connection; sending images normally");
-    return DISABLED_IMAGE_CAPTIONING;
+    logger.warn(error, "[image-captioning] Failed to resolve captioning connection");
+    return captioningEnabled
+      ? unavailableImageCaptioning(error instanceof Error ? error.message : String(error))
+      : DISABLED_IMAGE_CAPTIONING;
   }
 }
 
@@ -223,12 +243,24 @@ function normalizeImageCaptionText(value: unknown): string | null {
   return text.length > IMAGE_CAPTION_MAX_CHARS ? `${text.slice(0, IMAGE_CAPTION_MAX_CHARS).trim()}...` : text;
 }
 
+function effectiveCaptionPrompt(imageCaptioning: ImageCaptioningRuntime): string {
+  return imageCaptioning.prompt?.trim() || DEFAULT_IMAGE_CAPTIONING_PROMPT;
+}
+
+function captionPromptKey(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+}
+
 function readCachedImageCaption(attachment: PromptAttachment, imageCaptioning: ImageCaptioningRuntime): string | null {
   const caption = normalizeImageCaptionText(attachment.imageCaption);
   if (!caption || !imageCaptioning.connection) return null;
   if (attachment.imageCaptionConnectionId !== imageCaptioning.connectionId) return null;
   if (attachment.imageCaptionModel !== imageCaptioning.connection.model) return null;
   if (attachment.imageCaptionProvider !== imageCaptioning.connection.provider) return null;
+  // A changed prompt makes a new caption. Captions from before prompts were editable used the default.
+  const prompt = effectiveCaptionPrompt(imageCaptioning);
+  const cachedKey = attachment.imageCaptionPromptKey ?? captionPromptKey(DEFAULT_IMAGE_CAPTIONING_PROMPT);
+  if (cachedKey !== captionPromptKey(prompt)) return null;
   return caption;
 }
 
@@ -255,28 +287,23 @@ export async function generateImageCaptionForDataUrl(
   debugMode = false,
 ): Promise<string | null> {
   if (!imageCaptioning.provider || !imageCaptioning.connection) return null;
-  try {
-    const messages = [
-      {
-        role: "system" as const,
-        content:
-          "You describe image attachments for a downstream chat model that may not support vision. " +
-          "Write a faithful, concise description of the visible content, including readable text, subjects, setting, style, and any details important for conversation continuity. " +
-          "Do not answer the chat and do not add speculation beyond what is visible.",
-      },
-      {
-        role: "user" as const,
-        content: `Describe this image attachment named "${filename}" for use inside a chat prompt. Return only the description.`,
-        images: [imageDataUrl],
-      },
-    ];
-    const messagesForLog = redactImageCaptionMessagesForLog(messages);
-    logDebugOverride(
-      debugMode || isDebugAgentsEnabled(),
-      "[debug/image-captioning] Final provider messages:\n%s",
-      JSON.stringify(messagesForLog, null, 2),
-    );
-    const result = await imageCaptioning.provider.chatComplete(messages, {
+  const messages = [
+    { role: "system" as const, content: effectiveCaptionPrompt(imageCaptioning) },
+    {
+      role: "user" as const,
+      content: `Describe this image attachment named "${filename}" for use inside a chat prompt. Return only the description.`,
+      images: [imageDataUrl],
+    },
+  ];
+  const messagesForLog = redactImageCaptionMessagesForLog(messages);
+  logDebugOverride(
+    debugMode || isDebugAgentsEnabled(),
+    "[debug/image-captioning] Final provider messages:\n%s",
+    JSON.stringify(messagesForLog, null, 2),
+  );
+  // Failures stop the turn: sending the raw image instead would quietly ignore the user's captioning setting.
+  const result = await imageCaptioning.provider
+    .chatComplete(messages, {
       model: imageCaptioning.connection.model,
       temperature: 0.2,
       maxTokens: applyProviderMaxTokensOverride(imageCaptioning.provider, IMAGE_CAPTION_MAX_TOKENS),
@@ -285,13 +312,14 @@ export async function generateImageCaptionForDataUrl(
       cachingAtDepth: imageCaptioning.connection.cachingAtDepth ?? 5,
       stream: false,
       signal,
+    })
+    .catch((error: unknown) => {
+      if (signal.aborted) throw error;
+      throw new Error(`Image captioning failed for "${filename}"`, { cause: error });
     });
-    return normalizeImageCaptionText(result.content);
-  } catch (error) {
-    if (signal.aborted) throw error;
-    logger.warn(error, "[image-captioning] Failed to caption image attachment %s", filename);
-    return null;
-  }
+  const caption = normalizeImageCaptionText(result.content);
+  if (!caption) throw new Error(`Image captioning failed for "${filename}": the captioning model sent back no text`);
+  return caption;
 }
 
 export async function generateImageCaptionsForDataUrls<T extends { filename: string; imageDataUrl: string }>(
@@ -334,13 +362,19 @@ export async function resolvePromptAttachmentInputs(args: {
   const files = extractFileAttachmentInputs(attachments);
   let content = appendReadableAttachmentsToContent(args.content, attachments);
 
-  if (!imageCaptioning.enabled || !imageCaptioning.provider || !imageCaptioning.connection) {
+  if (!imageCaptioning.enabled) {
     return {
       content,
       images: extractImageAttachmentDataUrls(attachments),
       files,
       updatedAttachments: null,
     };
+  }
+  if (!imageCaptioning.provider || !imageCaptioning.connection) {
+    if (extractImageAttachmentDataUrls(attachments).length) {
+      throw new Error(`Image captioning failed: ${imageCaptioning.unavailableReason ?? "no captioning connection"}`);
+    }
+    return { content, images: [], files, updatedAttachments: null };
   }
 
   const captionBlocks: string[] = [];
@@ -387,6 +421,7 @@ export async function resolvePromptAttachmentInputs(args: {
         imageCaptionConnectionId: imageCaptioning.connectionId,
         imageCaptionModel: captionConnection.model,
         imageCaptionProvider: captionConnection.provider,
+        imageCaptionPromptKey: captionPromptKey(effectiveCaptionPrompt(imageCaptioning)),
         imageCaptionedAt: new Date().toISOString(),
       };
     }

@@ -101,6 +101,8 @@ The **Apply To** field decides which side of the chat a script watches. At least
 
 Use **AI Output** to clean up what the model writes. Use **User Input** to fix or reshape your own text.
 
+For **Only Prompt** and **Both** in a **Roleplay** chat with **Individual** group mode, placement follows the character receiving the prompt: your messages and other characters' messages use **User Input**, while the responding character's own replies use **AI Output**. This also applies to replies earlier in the same group turn. Character restrictions still select who receives the rewritten prompt, so a narrator excluded from a thought-hiding script keeps the original thoughts. Use **Only Prompt** to keep the saved chat text intact.
+
 ## Apply Mode: Only Display, Only Prompt, or Both
 
 The **Apply Mode** selector lives inside **Advanced Options**. It decides when the rewrite takes effect. This is separate from placement. A new script starts on **Only Display**.
@@ -155,6 +157,10 @@ Marinara can read regex scripts that come bundled inside a SillyTavern character
 - **Global**: the scripts are added to **Presets** and run in every chat.
 
 This choice appears both in the single-character import dialog and in the bulk **Import from SillyTavern Folder** flow. Bundled scripts with an empty pattern, or a pattern that fails the safety check, are skipped during import. You can also import a plain JSON file of scripts with the **Import regexes from JSON** button in the **Regexes** section. For the full import walkthrough, see [Importing from SillyTavern](../data/importing-from-sillytavern.md).
+
+## Replacing a regex pack
+
+In the **Presets → Regexes** section, choose **Select regex scripts**, then check the old pack's entries or use **Select all regex scripts**. The existing action bar lets you **Export** or **Delete** the selection. Deletion asks once for confirmation; it cannot be undone. Failed deletions stay selected so you can retry, and unselected scripts stay in place. Import the updated pack after removing the old one. Folders are not needed for this workflow; preset assignments remain available in the regex editor.
 
 ## Safety and performance
 

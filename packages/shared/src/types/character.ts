@@ -40,6 +40,10 @@ export interface CharacterExtensions {
   backstory: string;
   /** Marinara Engine extension: physical appearance description */
   appearance: string;
+  /** Marinara Engine: use `imageAppearance` instead of `appearance` in image prompts. */
+  imageAppearanceEnabled?: boolean;
+  /** Marinara Engine: appearance text used for image prompts when the override is enabled. */
+  imageAppearance?: string;
   /** Marinara Engine: Name display color/gradient (CSS value, e.g. "linear-gradient(90deg, #ff6b6b, #ffd93d)" or "#ff6b6b") */
   nameColor?: string;
   /** Marinara Engine: Dialogue highlight color — text in quotation marks is bold + colored with this */
@@ -52,6 +56,9 @@ export interface CharacterExtensions {
   nameAliases?: string[];
   /** Marinara Engine: RPG stats toggle + custom attributes */
   rpgStats?: RPGStatsConfig;
+  /** Marinara Engine: starting builds for Game Mode rulesets, keyed by ruleset id. A game copies
+   *  the one it needs; a sheet for a ruleset that is not installed is kept dormant. */
+  rulesetSheets?: Record<string, unknown>;
   /** Marinara Engine: per-character Tracker fields copied into each new Roleplay chat. */
   trackerCustomFieldDefaults?: CharacterTrackerCustomFieldDefault[];
   /** Marinara Engine: Conversation-mode availability status */
@@ -157,18 +164,7 @@ export interface CharacterBook {
 }
 
 export type CharacterBookEntryPosition =
-  | "before_char"
-  | "after_char"
-  | "at_depth"
-  | "depth"
-  | 0
-  | 1
-  | 2
-  | 3
-  | 4
-  | 5
-  | 6
-  | 7;
+  "before_char" | "after_char" | "at_depth" | "depth" | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type CharacterBookEntryRole = "system" | "user" | "assistant" | 0 | 1 | 2;
 
 /** A single entry in a character book. */
@@ -237,6 +233,10 @@ export interface PersonaCardSnapshot {
   scenario: string;
   backstory: string;
   appearance: string;
+  /** Marinara Engine: image-prompt override flag, stored as a string like its siblings. */
+  imageAppearanceEnabled?: string;
+  /** Marinara Engine: appearance text used for image prompts while the override is on. */
+  imageAppearance?: string;
   characterSheetImageId: string;
   useCharacterSheetAsReference: string;
   avatarCrop: string;

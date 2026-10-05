@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { api } from "../../packages/client/src/lib/api-client.js";
 import {
   getSlashCommandUsage,
@@ -52,6 +53,61 @@ const context: SlashCommandContext = {
 };
 
 try {
+  const illustrate = matchSlashCommand("/illustrate", { mode: "roleplay" })!.command;
+  const illustrations: unknown[] = [];
+  const illustrationContext = {
+    ...context,
+    illustrate: async (prompt?: string, range?: [string, string]) => {
+      illustrations.push({ prompt, range });
+    },
+  };
+  await illustrate.execute("range=1-2", illustrationContext);
+  await illustrate.execute("range=2 a moonlit garden", illustrationContext);
+  await illustrate.execute("a moonlit garden", illustrationContext);
+  assert.deepEqual(illustrations, [
+    { prompt: undefined, range: ["first", "second"] },
+    { prompt: "a moonlit garden", range: ["second", "second"] },
+    { prompt: "a moonlit garden", range: undefined },
+  ]);
+  for (const args of [
+    "range=0",
+    "range=2-1",
+    "range=1-201",
+    "range=4",
+    "range=x",
+    "range=1-",
+    "range=9007199254740992",
+  ]) {
+    assert.ok((await illustrate.execute(args, illustrationContext)).feedback, args);
+  }
+  assert.equal(illustrations.length, 3, "invalid ranges never start illustration");
+
+  const historyLookup = Promise.withResolvers<typeof messages>();
+  const pendingIllustration = Promise.withResolvers<void>();
+  let concurrentIllustrations = 0;
+  const concurrentContext = {
+    ...context,
+    illustrate: async () => {
+      concurrentIllustrations++;
+      await pendingIllustration.promise;
+    },
+  };
+  api.get = (() => historyLookup.promise) as typeof api.get;
+  const firstIllustration = illustrate.execute("range=1", concurrentContext);
+  const secondIllustration = illustrate.execute("range=2", concurrentContext);
+  historyLookup.resolve(messages);
+  try {
+    await nextTurn();
+    assert.equal(concurrentIllustrations, 1, "concurrent history lookups must not start duplicate illustrations");
+    assert.ok((await secondIllustration).feedback, "the second command explains that illustration is busy");
+  } finally {
+    pendingIllustration.resolve();
+    await Promise.all([firstIllustration, secondIllustration]);
+    api.get = (async () => messages) as typeof api.get;
+  }
+  await illustrate.execute("range=2", illustrationContext);
+  assert.equal(illustrations.length, 4, "illustration is available again after the first request finishes");
+
   const command = matchSlashCommand("/hide 1-2 Lady Maria", { mode: "roleplay" })!;
   await command.command.execute(command.args, context);
   assert.deepEqual(

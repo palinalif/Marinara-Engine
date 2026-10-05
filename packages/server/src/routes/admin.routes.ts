@@ -2,18 +2,24 @@
 // Routes: Admin (clear data, maintenance)
 // ──────────────────────────────────────────────
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { eq, ne } from "../db/file-query.js";
+import { eq, like, ne } from "../db/file-query.js";
 import { existsSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { MARINARA_UNIVERSAL_PRESET_SYSTEM_KEY, PROFESSOR_MARI_ID, TTS_SETTINGS_KEY } from "@marinara-engine/shared";
 import { DATA_DIR } from "../utils/data-dir.js";
 import * as schema from "../db/schema/index.js";
 import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
-import { ADMIN_RESTART_RATE_LIMIT, AVATAR_STORAGE_RATE_LIMIT } from "../middleware/rate-limit.js";
+import {
+  ADMIN_RESTART_RATE_LIMIT,
+  AVATAR_STORAGE_RATE_LIMIT,
+  REQUEST_TIMEOUT_SETTINGS_RATE_LIMIT,
+  RUNTIME_DIAGNOSTICS_RATE_LIMIT,
+} from "../middleware/rate-limit.js";
 import { logger } from "../lib/logger.js";
-import { isDockerRuntime } from "../config/runtime-config.js";
+import { getRequestTimeoutSettings, saveRequestTimeoutSettings, isDockerRuntime } from "../config/runtime-config.js";
 import { noteSessionExitKind } from "../lib/session-postmortem.js";
 import { armShutdownDeadline } from "../lib/shutdown-deadline.js";
+import { collectRuntimeDiagnostics } from "../lib/runtime-diagnostics.js";
 import {
   ABANDONED_AVATAR_MIN_AGE_MS,
   collectCharacterAvatarPaths,
@@ -24,14 +30,7 @@ import {
 } from "../services/image/avatar-file-lifecycle.js";
 
 type ExpungeScope =
-  | "chats"
-  | "characters"
-  | "personas"
-  | "lorebooks"
-  | "presets"
-  | "connections"
-  | "automation"
-  | "media";
+  "chats" | "characters" | "personas" | "lorebooks" | "presets" | "connections" | "automation" | "media";
 
 const ALL_EXPUNGE_SCOPES: ExpungeScope[] = [
   "chats",
@@ -66,6 +65,21 @@ function isValidScope(scope: unknown): scope is ExpungeScope {
 
 export async function adminRoutes(app: FastifyInstance) {
   let restartScheduled = false;
+
+  app.get("/request-timeouts", () => getRequestTimeoutSettings());
+  app.put("/request-timeouts", { config: { rateLimit: REQUEST_TIMEOUT_SETTINGS_RATE_LIMIT } }, async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Request timeout settings" })) return;
+    return saveRequestTimeoutSettings(req.body);
+  });
+
+  // Read-only runtime detail for support, beyond what /api/health serves:
+  // storage residency and whether each capability package runtime is live.
+  // Counts and states only, never row content or settings values.
+  app.get("/runtime-diagnostics", { config: { rateLimit: RUNTIME_DIAGNOSTICS_RATE_LIMIT } }, async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Runtime diagnostics" })) return;
+    reply.header("Cache-Control", "no-store");
+    return collectRuntimeDiagnostics();
+  });
 
   app.post<{ Body: { confirm?: boolean } }>(
     "/restart",
@@ -276,6 +290,9 @@ export async function adminRoutes(app: FastifyInstance) {
       await runDelete("agent_runs", () => db.delete(schema.agentRuns).run());
       await runDelete("agent_memory", () => db.delete(schema.agentMemory).run());
       await runDelete("agent_configs", () => db.delete(schema.agentConfigs).run());
+      await runDelete("app_settings:agent_home_widgets", () =>
+        db.delete(schema.appSettings).where(like(schema.appSettings.key, "agent_home_widget:%")).run(),
+      );
       await runDelete("custom_tools", () => db.delete(schema.customTools).run());
       await runDelete("regex_scripts", () => db.delete(schema.regexScripts).run());
       await runDelete("custom_themes", () => db.delete(schema.customThemes).run());

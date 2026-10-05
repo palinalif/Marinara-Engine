@@ -139,3 +139,18 @@ export const memoryChunks = fileTable("memory_chunks", {
   lastMessageAt: text("last_message_at").notNull(),
   createdAt: text("created_at").notNull(),
 });
+
+// ── Message trash: user-deleted messages kept for restore (purged after 30 days) ──
+export const messageTrash = fileTable("message_trash", {
+  id: text("id").primaryKey(),
+  chatId: text("chat_id")
+    .notNull()
+    .references(() => chats.id, { onDelete: "cascade" }),
+  messageId: text("message_id").notNull(),
+  role: text("role", { enum: ["user", "assistant", "system", "narrator"] }).notNull(),
+  characterId: text("character_id"),
+  content: text("content").notNull().default(""),
+  snapshot: text("snapshot").notNull(),
+  messageCreatedAt: text("message_created_at").notNull(),
+  deletedAt: text("deleted_at").notNull(),
+});

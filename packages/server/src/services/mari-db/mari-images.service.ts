@@ -291,6 +291,10 @@ function capabilityForConnection(conn: ImageConnection): ImageCapability {
       editMode = "image-to-image";
       notes.push("Uses text+image image output through chat-completions style payloads.");
       break;
+    case "codex_chatgpt":
+      canEdit = true;
+      editMode = "image-to-image";
+      break;
     case "openrouter":
       canEdit = /(?:gemini.*image|image.*gemini|nano.?banana|kontext)/i.test(model);
       editMode = canEdit ? "model-dependent" : "none";

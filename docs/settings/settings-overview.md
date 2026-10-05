@@ -15,7 +15,7 @@ The panel has six tabs. The table below shows what each tab controls.
 | **Generations** | Image and video defaults, and reusable prompt templates. |
 | **Addons** | Professor Mari's sandboxed Personal Extension drafts, optionally unlocked External Extensions, and custom themes. |
 | **Imports** | Restore full profiles and import from other apps. |
-| **Advanced** | Admin access, updates, message tools, backups, and destructive resets. |
+| **Advanced** | Admin access, optional feature switches, updates, message tools, backups, and destructive resets. |
 
 Here is where to read more about each tab:
 
@@ -24,7 +24,7 @@ Here is where to read more about each tab:
 - **Generations**: see [Style Profiles](../media/style-profiles.md) and [Scene Video](../media/scene-video.md).
 - **Addons**: see [Personal Extensions](../extending/personal-extensions.md) and [Custom CSS Themes](../appearance/custom-css-themes.md).
 - **Imports**: see [Importing from SillyTavern](../data/importing-from-sillytavern.md) and [Backup and Restore](../data/backup-and-restore.md).
-- **Advanced**: see the **Message Tools** section below, plus [Upgrading Marinara Engine](../UPGRADING.md), [Remote Access](../REMOTE_ACCESS.md), and [Clearing Your Data](../data/clearing-data.md).
+- **Advanced**: see the **Message Tools** section below, [Feature Switches](../configuration/features.md), plus [Upgrading Marinara Engine](../UPGRADING.md), [Remote Access](../REMOTE_ACCESS.md), and [Clearing Your Data](../data/clearing-data.md).
 
 ## Settings, General tab
 
@@ -93,6 +93,7 @@ Read more in [Sending and Streaming Messages](../chats/sending-and-streaming.md)
 The **Input & Editing** section controls:
 
 - **Send on Enter**: pick which modes send when you press Enter.
+- **Keep guidance after regenerating**: leave your direction in the message box after a guided regenerate. On by default.
 - **Speech-to-text microphone**: show a microphone button in chat inputs.
 - **Intuitive swipe navigation**: use arrow keys or touch swipes to move between alternate replies.
 - **Reroll past the newest swipe**: make a new reply when you swipe past the newest one.

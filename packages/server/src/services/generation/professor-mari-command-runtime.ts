@@ -586,6 +586,7 @@ async function createPreset(command: CreatePresetCommand, args: Parameters<typeo
           injectionDepth: Math.max(0, section.injectionDepth ?? 0),
           injectionOrder: section.injectionOrder ?? (index + 1) * 100,
           forbidOverrides: section.forbidOverrides ?? false,
+          skipWrap: section.skipWrap ?? false,
         });
         sectionCount += 1;
       }
@@ -978,6 +979,7 @@ async function fetchPresetContent(
         `  Group: ${group?.name ?? "none"}`,
         `  Injection: ${section.injectionPosition} depth=${section.injectionDepth} order=${section.injectionOrder}`,
         `  Forbid Overrides: ${String(section.forbidOverrides) === "true" ? "true" : "false"}`,
+        `  Skip Wrap: ${String(section.skipWrap) === "true" ? "true" : "false"}`,
         `  Content:\n${truncateMariFetchedText(section.content, 3000)}`,
       ].join("\n"),
     );

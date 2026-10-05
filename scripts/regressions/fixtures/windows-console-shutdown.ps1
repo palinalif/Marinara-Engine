@@ -43,12 +43,18 @@ try {
   # Set after spawn: keep this harness alive without passing an ignored Ctrl+C to the server.
   if (-not [ConsoleSignals]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)) { throw 'Cannot protect the harness' }
   $deadline = [DateTime]::UtcNow.AddSeconds(25)
+  $readinessClock = [Diagnostics.Stopwatch]::StartNew()
   do {
     Start-Sleep -Milliseconds 100
-    $output = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+    # Keep matches scalar even when the growing redirected file is read in chunks.
+    $output = (Get-Content $outputFile -Raw -ErrorAction SilentlyContinue) -join "`n"
     if ($server.HasExited) { throw "Server exited before readiness: $output" }
   } until ($output -match 'Marinara Engine server listening' -or [DateTime]::UtcNow -gt $deadline)
-  if ($output -notmatch 'Marinara Engine server listening') { throw "Server readiness timed out: $output" }
+  if ($output -notmatch 'Marinara Engine server listening') {
+    $outputType = if ($null -eq $output) { 'null' } else { $output.GetType().FullName }
+    $matchingChunks = @($output | Where-Object { [string]$_ -match 'Marinara Engine server listening' }).Count
+    throw "Server readiness timed out (elapsedMs=$($readinessClock.ElapsedMilliseconds), utcNow=$([DateTime]::UtcNow.ToString('o')), deadline=$($deadline.ToString('o')), outputType=$outputType, matchingChunks=$matchingChunks): $output"
+  }
   Write-Phase 'Production server ready'
   # Keep app.close pending, making the premature hard-kill reliably observable.
   $socket = [Net.Sockets.TcpClient]::new('127.0.0.1', $Port)
@@ -59,7 +65,7 @@ try {
   if (-not [ConsoleSignals]::GenerateConsoleCtrlEvent(0, 0)) { throw 'Native Ctrl+C delivery failed' }
   if (-not $server.WaitForExit(15000)) { throw 'Supervisor did not exit after Ctrl+C' }
   Write-Phase 'Supervisor exited after Ctrl+C'
-  $output = Get-Content $outputFile -Raw
+  $output = (Get-Content $outputFile -Raw) -join "`n"
   if ($output -notmatch 'Received SIGINT; shutting down') { throw "No SIGINT reached production shutdown: $output" }
   if ($output -notmatch 'Shutdown complete') { throw "Graceful shutdown was interrupted: $output" }
   if ($output -match 'forcing exit now') { throw "Shutdown exceeded its deadline: $output" }

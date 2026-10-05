@@ -9,21 +9,24 @@ import {
   isProviderLocalUrlsEnabled,
 } from "../../config/runtime-config.js";
 import { requestHeadersWithIdentityEncoding, safeFetch, type SafeFetchOptions } from "../../utils/security.js";
-import {
-  estimateTextTokens,
-  sliceTextToTokenBudget,
-  type GenerationParameterSendKey,
-  type GenerationParameterSendMap,
-} from "@marinara-engine/shared";
+import { estimateTextTokens, sliceTextToTokenBudget, type GenerationParameterSendKey } from "@marinara-engine/shared";
+
+/** For models that reject assistant prefill but can continue an existing reply from history. */
+export const ASSISTANT_CONTINUATION_PROMPT =
+  "Continue the assistant's reply from where it stopped, without repeating existing text.";
 
 /**
- * Shared undici Agent settings. The headers timeout (time to first byte) follows
- * CHAT_GENERATION_TIMEOUT_MS so slow local models get the same budget on background
- * generation (Noodle, agents) as on the chat routes. The inter-chunk body timeout
- * stays finite so half-open streams cannot hang forever.
+ * Shared undici Agent settings. Both the headers timeout (time to first byte) and the
+ * wait between streamed chunks follow CHAT_GENERATION_TIMEOUT_MS, so slow local models
+ * get the same budget on background generation (Professor Mari, Noodle, agents) as on
+ * the chat routes. A local server often sends headers at once and then spends minutes
+ * on a long prompt before the first token; a fixed 2-minute chunk wait cut those calls
+ * off (#6970). The wait stays finite so half-open streams cannot hang forever.
  */
-const LLM_BODY_TIMEOUT = 120 * 1000; // 2 minutes between body chunks
-const llmAgentOptions = () => ({ bodyTimeout: LLM_BODY_TIMEOUT, headersTimeout: getChatGenerationTimeoutMs() });
+const llmAgentOptions = () => {
+  const timeoutMs = getChatGenerationTimeoutMs();
+  return { bodyTimeout: timeoutMs, headersTimeout: timeoutMs };
+};
 const llmRequestTimeout = new AsyncLocalStorage<number>();
 
 /** Scope a provider request timeout without changing background/agent generation behavior. */
@@ -128,175 +131,24 @@ export function isRateLimitError(error: unknown): error is LLMHttpError {
   return error.status === 503 && typeof error.retryAfterMs === "number";
 }
 
-export interface ChatMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string;
-  /** Internal context-fitting hint: prompt data is preserved before chat history. */
-  contextKind?: "prompt" | "history" | "injection";
-  /** For tool result messages */
-  tool_call_id?: string;
-  /** For assistant messages with tool calls */
-  tool_calls?: LLMToolCall[];
-  /** Base64 data URLs for multimodal image inputs */
-  images?: string[];
-  /** Base64 data URLs for provider-native file/document inputs */
-  files?: Array<{
-    type: string;
-    data: string;
-    filename?: string;
-  }>;
-  /** Base64 data URLs for provider-native audio/video inputs */
-  media?: ChatMediaAttachment[];
-  /** Provider-specific metadata (e.g. Gemini parts with thought signatures) */
-  providerMetadata?: Record<string, unknown>;
-}
-
-export interface ChatMediaAttachment {
-  kind: "audio" | "video";
-  data: string;
-  mimeType: string;
-  filename?: string;
-}
-
-export interface LLMToolCall {
-  id: string;
-  type: "function";
-  function: {
-    name: string;
-    arguments: string;
-  };
-}
-
-export interface LLMToolDefinition {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: Record<string, unknown>;
-  };
-}
-
-export interface ChatOptions {
-  model: string;
-  temperature?: number;
-  maxTokens?: number;
-  /** Total context window limit for prompt + completion tokens. */
-  maxContext?: number;
-  /** Managed context must fail visibly instead of silently trimming scene history or instructions. */
-  preserveContext?: boolean;
-  topP?: number;
-  topK?: number;
-  minP?: number;
-  frequencyPenalty?: number;
-  presencePenalty?: number;
-  stream?: boolean;
-  stop?: string[];
-  /** Tool/function definitions for function calling */
-  tools?: LLMToolDefinition[];
-  /** OpenAI-compatible tool selection policy for the current provider round. */
-  toolChoice?: "auto" | "required";
-  /** Enable provider-native prompt caching when supported */
-  enableCaching?: boolean;
-  /** Anthropic only: use 1-hour prompt-cache TTL instead of the default 5-minute TTL */
-  anthropicExtendedCacheTtl?: boolean;
-  /** Anthropic cache breakpoint depth from the newest message. 0 = newest message. */
-  cachingAtDepth?: number;
-  /** Callback for streaming thinking/reasoning content */
-  onThinking?: (chunk: string) => void;
-  /** Prefer provider APIs that expose reasoning summaries when available */
-  captureReasoning?: boolean;
-  /** Callback for streaming text tokens as they arrive (used in tool path) */
-  onToken?: (chunk: string) => void | Promise<void>;
-  /** Enable extended thinking (reasoning models) */
-  enableThinking?: boolean;
-  /**
-   * Reasoning effort level for models that support it.
-   * `none` is an explicit request to disable thinking; `undefined` leaves the
-   * provider/model default untouched.
-   */
-  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
-  /** When true, previous provider-native reasoning state is not reused. */
-  excludePastReasoning?: boolean;
-  /** Output verbosity for GPT-5+ models */
-  verbosity?: "low" | "medium" | "high";
-  /** Emit provider prompt debug logs even when normal debug logging is disabled. */
-  debugMode?: boolean;
-  /** OpenRouter-only service tier. */
-  serviceTier?: "flex" | "priority" | null;
-  /** Abort signal — when triggered, the in-flight LLM request should be cancelled. */
-  signal?: AbortSignal;
-  /**
-   * Invoked when a rate-limit-aware retry pauses before re-attempting the request (proxy 429 /
-   * per-connection throttle). Callers (e.g. Professor Mari) use this to surface a "paused,
-   * resuming in Ns" indicator instead of appearing to hang.
-   */
-  onRateLimitPause?: (info: { attempt: number; delayMs: number; reason: "rate_limit" | "throttle" }) => void;
-  /** Callback to receive the full response parts (for providers that return structured metadata like Gemini thought signatures) */
-  onResponseParts?: (parts: unknown[]) => void;
-  /** OpenRouter: preferred provider for model routing */
-  openrouterProvider?: string | null;
-  /** Encrypted reasoning items from a previous Responses API turn to replay for reasoning continuity */
-  encryptedReasoningItems?: unknown[];
-  /** Callback to receive encrypted reasoning items from the current response (store for next turn) */
-  onEncryptedReasoning?: (items: unknown[]) => void;
-  /** Callback to receive Chat Completions reasoning fields that must be replayed for some providers */
-  onChatCompletionsReasoning?: (metadata: Record<string, unknown>) => void;
-  /** Force a specific response format (e.g. { type: "json_object" } or a JSON schema config) */
-  responseFormat?: { type: string; [key: string]: unknown };
-  /** Raw provider request parameters merged into the outgoing request body. */
-  customParameters?: Record<string, unknown>;
-  /** Per-parameter request switches. Missing map preserves legacy send behavior. */
-  enabledParameters?: GenerationParameterSendMap;
-  /** Do not add inferred sampler/model parameters; max output tokens and customParameters still apply. */
-  suppressModelParameters?: boolean;
-  /**
-   * Skip sending tools to the provider API and rely entirely on textual tool-call parsing.
-   * Set by the local-sidecar provider when native tool calls are disabled (no --jinja),
-   * because sending a tools array to a server started without Jinja templates produces
-   * garbled or ignored output. The tools array is still used for parsing the response.
-   */
-  forceTextualToolCalls?: boolean;
-}
-
-/** Token usage statistics returned by the model */
-export interface LLMUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  cachedPromptTokens?: number;
-  cacheWritePromptTokens?: number;
-  /** Hidden reasoning tokens included in completion/output tokens by reasoning models. */
-  completionReasoningTokens?: number;
-  /** Audio output tokens included in completion/output tokens, when reported. */
-  completionAudioTokens?: number;
-  /** Predicted output tokens accepted by the model, when reported. */
-  acceptedPredictionTokens?: number;
-  /** Predicted output tokens rejected by the model but still counted in output usage. */
-  rejectedPredictionTokens?: number;
-  /** Provider-reported stream finish reason when usage is returned from a streaming generator. */
-  finishReason?: "stop" | "tool_calls" | "length" | string;
-}
-
-/** Result from a non-streaming chat call that may include tool calls */
-export interface ChatCompletionResult {
-  content: string | null;
-  toolCalls: LLMToolCall[];
-  finishReason: "stop" | "tool_calls" | "length" | string;
-  usage?: LLMUsage;
-  /** Provider-native metadata to replay with the assistant message, e.g. DeepSeek reasoning_content */
-  providerMetadata?: Record<string, unknown>;
-}
-
-export interface ContextFitResult {
-  messages: ChatMessage[];
-  maxContext?: number;
-  maxTokens?: number;
-  inputBudget?: number;
-  reservedTokens?: number;
-  estimatedTokensBefore: number;
-  estimatedTokensAfter: number;
-  trimmed: boolean;
-}
+import type {
+  ChatMessage,
+  LLMToolDefinition,
+  ChatOptions,
+  LLMUsage,
+  ChatCompletionResult,
+  ContextFitResult,
+} from "@marinara-engine/shared";
+export type {
+  ChatMessage,
+  ChatMediaAttachment,
+  LLMToolCall,
+  LLMToolDefinition,
+  ChatOptions,
+  LLMUsage,
+  ChatCompletionResult,
+  ContextFitResult,
+} from "@marinara-engine/shared";
 
 type ContextFitOptions = Pick<
   ChatOptions,
@@ -351,6 +203,15 @@ function estimateToolDefinitionTokens(tools?: LLMToolDefinition[]): number {
 
 function contextSafetyMargin(maxContext: number): number {
   return Math.max(CONTEXT_SAFETY_MARGIN_TOKENS, Math.ceil(maxContext * CONTEXT_SAFETY_MARGIN_RATIO));
+}
+
+/** Total window needed to retain a prompt allowance without charging reply tokens to it. */
+export function contextWindowForInputBudget(inputBudget: number, maxTokens = 0): number {
+  const usableWindow = (normalizePositiveInteger(inputBudget) ?? 1) + (normalizePositiveInteger(maxTokens) ?? 0);
+  return Math.max(
+    usableWindow + CONTEXT_SAFETY_MARGIN_TOKENS,
+    Math.ceil(usableWindow / (1 - CONTEXT_SAFETY_MARGIN_RATIO)),
+  );
 }
 
 function estimateMessageTokens(message: ChatMessage): number {
@@ -561,6 +422,7 @@ export function fitMessagesToContext(
       messages,
       maxContext,
       maxTokens,
+      requestedMaxTokens,
       inputBudget,
       reservedTokens,
       estimatedTokensBefore,
@@ -679,6 +541,7 @@ export function fitMessagesToContext(
     messages: fittedMessages,
     maxContext,
     maxTokens,
+    requestedMaxTokens,
     inputBudget,
     reservedTokens,
     estimatedTokensBefore,
@@ -757,15 +620,26 @@ export abstract class BaseLLMProvider {
   }
 
   protected logContextTrim(result: ContextFitResult, model: string): void {
-    if (!result.trimmed || !result.inputBudget) return;
-    logger.warn(
-      "[LLM context] Trimmed prompt for %s from ~%d to ~%d tokens (budget ~%d, maxContext=%d)",
-      model,
-      result.estimatedTokensBefore,
-      result.estimatedTokensAfter,
-      result.inputBudget!,
-      result.maxContext!,
-    );
+    if (result.trimmed && result.inputBudget) {
+      logger.warn(
+        "[LLM context] Trimmed prompt for %s from ~%d to ~%d tokens (budget ~%d, maxContext=%d)",
+        model,
+        result.estimatedTokensBefore,
+        result.estimatedTokensAfter,
+        result.inputBudget!,
+        result.maxContext!,
+      );
+    }
+    // Dropping messages was reported; spending the reply budget on the prompt was not, so a user
+    // whose configured Max Tokens never reached the provider had nothing to go on (#6614).
+    // Single-shot prompts give that budget back by design, so only the floor — where the model can
+    // no longer write a reply — is worth a warning.
+    const { requestedMaxTokens, maxTokens } = result;
+    if (requestedMaxTokens === undefined || maxTokens === undefined || maxTokens >= requestedMaxTokens) return;
+    const message =
+      "[LLM context] Reply budget for %s reduced from %d to %d tokens to fit the prompt (~%d tokens, maxContext=%d)";
+    const report = maxTokens <= MIN_OUTPUT_BUDGET_TOKENS ? logger.warn : logger.debug;
+    report.call(logger, message, model, requestedMaxTokens, maxTokens, result.estimatedTokensAfter, result.maxContext!);
   }
 
   protected resolveOpenrouterProvider(openrouterProvider?: string | null): string | null | undefined {

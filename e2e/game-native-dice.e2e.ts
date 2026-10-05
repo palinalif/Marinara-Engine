@@ -310,13 +310,10 @@ for (const theme of ["dark", "light"] as const) {
         await narration.getByRole("button", { name: "Next", exact: true }).click();
       }
       await expect(narration).toContainText("The gate opens.");
-      if (testInfo.project.name.includes("mobile")) {
-        await page.getByRole("button", { name: "Game actions", exact: true }).click();
-      }
       await page.getByRole("button", { name: "Chat Settings", exact: true }).filter({ visible: true }).click();
       const section = page.locator('[data-chat-settings-section="function-calling"]');
       await section.locator('[role="button"][aria-expanded]').click();
-      await expect(section).toContainText("Game chats already roll real dice without this");
+      await expect(section).toContainText("Game chats roll real dice without this");
       await expect(section).not.toContainText("If disabled, no functions will be available.");
       await expect(section.getByLabel("Enable Tool Use", { exact: true })).not.toBeChecked();
       await testInfo.attach(`game-tool-hint-${theme}-${testInfo.project.name}.png`, {

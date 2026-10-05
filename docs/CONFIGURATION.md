@@ -38,7 +38,9 @@ Every import shows the Agent's requested capabilities before it is stored. Permi
 
 Custom repositories are disabled by default because their prompts and tool selections are unvetted third-party content. Set `ENABLE_CUSTOM_AGENT_REPOS=true`, enable **Allow custom Agent imports** in the Danger Zone, then open **Agents → Download Agents → Custom Sources** to preview a public GitHub repository. Adding a source and applying any later content change both require explicit confirmation. Synchronization is manual; Marinara does not clone repositories or poll them in the background.
 
-The repository root must contain an `agents.json` array using the same agent-definition format as downloadable agent packages. A minimal file looks like this:
+A repository may publish agents, Game Mode rulesets, or both. It needs at least one of them.
+
+The repository root may contain an `agents.json` array using the same agent-definition format as downloadable agent packages. A minimal file looks like this:
 
 ```json
 [
@@ -54,7 +56,11 @@ The repository root must contain an `agents.json` array using the same agent-def
 ]
 ```
 
-Marinara accepts GitHub repository-root URLs only and validates the bounded archive plus every agent definition before showing the preview. During synchronization, remote prompt, settings, and tool values replace the repository-managed values shown in that preview. Connection and artwork choices remain local. If an agent disappears upstream, Marinara keeps it as a normal local custom agent and removes only its repository link. Removing a source follows the same keep-local policy.
+The repository root may also contain a `rulesets` folder holding one Game Mode ruleset per `.json` file, up to 32 files of 256 KB each. Only files directly inside `rulesets` are read, so anything in a subfolder is ignored. Each ruleset is listed in the preview with its name, version, and what it covers. A ruleset's Game Master text is sent to the model in every game that uses it, so only install rulesets from people you trust.
+
+An imported ruleset is named after the repository owner, such as `alice/my-5e`, so it can never take an official ruleset's name and two authors can both publish a ruleset called `v20`. Every imported version is kept and a game always plays on the exact version it was created on. If the same version arrives again with different contents, Marinara keeps the installed one and tells you to ask the author to raise the version number. A file Marinara cannot read is listed with the reason and skipped; the rest of the repository still installs.
+
+Marinara accepts GitHub repository-root URLs only and validates the bounded archive plus every agent definition before showing the preview. During synchronization, remote prompt, settings, and tool values replace the repository-managed values shown in that preview. Connection and artwork choices remain local. If an agent disappears upstream, Marinara keeps it as a normal local custom agent and removes only its repository link. Removing a source follows the same keep-local policy, and rulesets it supplied stay installed so games pinned to them keep working.
 
 ### External Extensions
 
@@ -65,6 +71,28 @@ The environment variable is the host-operator permission; the Danger Zone toggle
 Professor Mari drafts remain available without this flag. They are created disabled and still require approval of their exact code hash.
 
 Sandboxed Browser Extensions remain the default. Some older third-party packages are marked **Full page access** because they depend on Marinara's DOM. That mode runs the exact approved code inside Marinara's page and can access page content, browser storage, network APIs, and the current same-origin session. It is available only to External Extensions after both gates are open and requires a separate warning acknowledgement. Disable it and reload the page if the extension leaves visual or behavioral changes behind.
+
+## Optional multiplayer
+
+Multiplayer is off by default. While either activation gate is off, the feature performs no background session, certificate or peer checks; the client only reads availability once unless you explicitly refresh Settings. It supports private rooms in Conversation, Roleplay and Game without a fixed human or AI roster cap. Each guest uses their own trusted Marinara installation; a phone may use its owner's trusted Engine server. Guests do not need an AI connection. The host provides the AI connections and can read and retain shared content.
+
+1. Set `MULTIPLAYER_ENABLED=true` in the `.env` of each participating Engine and restart it. Only the exact value `true` enables the prerequisite; hot reload does not change it.
+2. Open **Settings → Advanced → Multiplayer**, read the warning and enable the separate setting. This does not start a listener or join a room.
+3. To host, use **Create shared session** or **Play together** in the existing mode/setup flow. Review the setup, your display name and the exact persona text to share. An existing chat contributes setup selections only; its private transcript, notes and memories are not copied.
+4. Configure `SSL_CERT` and `SSL_KEY` on the host with a certificate valid for the room hostname and trusted by the guest Engine. Choose a separate HTTPS room address and port, such as `https://room.example.org:7861`. The explicit Host action opens that port. Route only the room listener through your firewall/router; do not expose the ordinary Engine API. No port forwarding, relay account or certificate bypass is configured automatically.
+5. Set a room password of at least 12 characters, distinct from your Engine/admin credentials. Share the expiring invitation and password separately with people you trust. A guest reviews the hostname fingerprint, room name and persona text in their own client, consents and requests admission. The host approves each request in **Players** before any room history is sent.
+
+TLS validates the certificate chain and hostname and also checks the invitation's certificate fingerprint before sending a password. Self-signed certificates are not silently accepted. A renewed or changed certificate needs a new invitation and another review. Invitations expire after 30 minutes; admitted sessions last at most 12 hours. Replace/revoke prevents unused invitations from admitting new participants; Kick revokes an admitted participant.
+
+The host controls automatic/manual replies, a bounded generation allowance, Pause/Resume and Stop. The default allowance is 100 coordinated generation turns per hosting session; a group turn or Game setup can make more than one model call. This is a turn limit, not a price estimate. Conversation schedules use the existing host scheduler. Guests never run another scheduler or local commands from received text.
+
+In Game, review the admitted human party before Start Game. Each required human submits an action or passes. The GM resolves only after everyone is ready. A disconnected player remains required until they return or the host explicitly passes/removes them. New players and persona changes take effect at the next round. Paused/interrupted resolution never automatically repeats a paid request or already committed world effects; inspect the transcript before continuing.
+
+Stop, Leave, disabling Settings and server restart end the relevant live session. A restart never automatically hosts or joins. The host server owns the room, so closing its browser does not transfer authority to a guest. Mobile browser suspension can delay updates; it does not cause a second generation.
+
+Only connect to people you trust. Use your own trusted Marinara client; never install a host-provided client, extension, or required file. The host can read and retain what you share, and shared content may be sent to their configured AI providers. Direct connections reveal network addresses. Do not share passwords, API keys or sensitive personal information. Leave immediately if anything seems suspicious.
+
+Shared content is bounded text only. There is no peer file/media transfer, executable content, package import, remote asset loading or native action path. Custom/package tools and unsafe commands remain unavailable in rooms. The Android native wrapper cannot join. See the [compatibility and verification record](development/multiplayer.md) for exact restrictions and tested platforms; these controls are not a guarantee against every browser/OS vulnerability or an independent external download.
 
 ## Where the .env file is
 
@@ -105,6 +133,7 @@ A small group of low-level settings are locked in when the server starts. Changi
 - `TZ`
 - `AUTO_OPEN_BROWSER`, `AUTO_UPDATE_ENABLED`, `AUTO_CREATE_DEFAULT_CONNECTION`
 - `LOG_DISABLE_REQUEST_LOGGING`
+- `STORAGE_CACHE_WINDOWS_BOOT_ID`, `SHUTDOWN_WINDOWS_CONSOLE_SIGNALS`, `SHUTDOWN_FORCE_EXIT_ON_REPEAT`
 - The image, video, sprite, and ComfyUI timeout and poll settings (`IMAGE_GEN_TIMEOUT_MS`, `VIDEO_GEN_TIMEOUT_MS`, `VIDEO_GEN_MAX_RESPONSE_BYTES`, `SPRITE_GENERATION_TIMEOUT_MS`, `SPRITE_ANIMATED_FFMPEG_TIMEOUT_MS`, `COMFYUI_GEN_TIMEOUT`, and the four `*_VIDEO_POLL_INTERVAL_MS` settings)
 
 When one of these changes, the log warns that a restart is required. Access-control settings and secrets like `BASIC_AUTH_USER`, `BASIC_AUTH_PASS`, `IP_ALLOWLIST`, `ADMIN_SECRET`, and `CSRF_TRUSTED_ORIGINS` do not need a restart.
@@ -202,11 +231,15 @@ Browser logging is separate and is not controlled by `LOG_LEVEL`.
 
 ## Timeouts
 
+Open **Settings → Advanced → Request timeouts** to adjust text, agent, Game image-prompt, image, video, ComfyUI and embedding limits in seconds. Higher limits help slow local backends finish; they cannot override a limit enforced by the provider itself. Server administration access is required to save.
+
+These settings apply to every profile and are saved beside the active `.env` as `.env.timeouts.json` (or `<custom-env-path>.timeouts.json`). They override the corresponding environment variables without rewriting your `.env`. Text, agent, Game image-prompt and embedding changes apply to new requests. Restart the server for media changes and installed agent packages. To return to environment-based configuration, remove the timeout settings file and restart the server.
+
 A timeout is the longest time the server waits for a slow job before giving up. Media jobs like image and video generation can be slow, so their timeouts are generous by default. All timeout values are in milliseconds unless the name says otherwise.
 
 | Variable                               | Default                              | What it does                                                                                                                                                                                                                                                                                                                                                 |
 | -------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `CHAT_GENERATION_TIMEOUT_MS`           | `300000` (5 minutes)                 | Provider headers/time-to-first-token and inter-chunk timeout for ordinary Conversation, Roleplay, and Game generations, and the time-to-first-byte budget for background generation that has no timeout of its own (Noodle timeline refresh, Slurp replies). Valid range: `10000`-`3600000`. It does not change Agent, media, embedding, or tool timeouts. |
+| `CHAT_GENERATION_TIMEOUT_MS`           | `300000` (5 minutes)                 | Provider headers/time-to-first-token and inter-chunk timeout for ordinary Conversation, Roleplay, and Game generations, and the time-to-first-token and inter-chunk budget for background generation that has no timeout of its own (Professor Mari, Noodle timeline refresh, Slurp replies). Valid range: `10000`-`3600000`. It does not change Agent, media, embedding, or tool timeouts. |
 | `AGENT_CALL_TIMEOUT_MS`                | `300000` (5 minutes)                 | Total-duration cap for one agent LLM call (trackers, HTML reformatter, and other agents), applied even while the response is still streaming. Raise it for slow local models that need longer than 5 minutes per agent pass. Valid range: `10000`-`3600000`. The Illustrator keeps at least its built-in 30-minute budget.                                   |
 | `GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS` | `45000` (45 seconds)                 | Total-duration cap for the model call that turns the current Game scene into a dynamic image prompt. Raise it for slower local models. Valid range: `10000`-`3600000`.                                                                                                                                                                                       |
 | `EMBEDDING_TIMEOUT_MS`                 | `300000` (5 minutes)                 | Time allowed for one embedding request. Higher helps slow local embedding servers.                                                                                                                                                                                                                                                                           |
@@ -266,6 +299,10 @@ Turn on only the switch you need for a self-hosted service on another private-ne
 
 To connect a local or self-hosted model, see [Connecting a Local or Self-Hosted Model](connections/local-self-hosted.md).
 
+## Feature switches
+
+Optional server behaviours, such as retrying failed provider calls or keeping lorebook group picks stable, are switched on in **Settings > Advanced > Features**. All of them are off by default. A few have an environment variable that, when set, wins over the switch. See [Feature Switches](configuration/features.md) for every switch, its default and its variable.
+
 ## Full environment variable reference
 
 This section lists the remaining settings, grouped by purpose. The tables above already cover access control, storage, logging, timeouts, privileged actions, and local address opt-ins.
@@ -316,6 +353,32 @@ Scene video providers are set up as connections inside the app, not as environme
 | `SEEDANCE_VIDEO_POLL_INTERVAL_MS`   | `10000` | How often the server checks a Seedance job.                                                    |
 | `VIDEO_REFERENCE_PUBLIC_BASE_URL`   | empty   | Public HTTPS address of this server, used when a provider must fetch a reference image by URL. |
 
+### Lorebooks
+
+Both settings are off by default and apply on the next generation after a `.env` change. `LOREBOOK_STABLE_GROUP_WINNERS` pins the **Stable lorebook picks** switch in Settings > Advanced > Features: when it is set, it wins over the switch; when it is unset, the switch decides (see [Feature Switches](configuration/features.md)).
+
+| Variable                        | Default | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOREBOOK_STABLE_GROUP_WINNERS` | `false` | Keeps the same lorebook inclusion-group winner per chat while the matching candidates stay the same, instead of re-rolling every generation. Keeps the prompt prefix stable for provider prompt caching.                                                                                                                                                                                                                                                         |
+| `LOREBOOK_COMPACT_STORED_SCANS` | `false` | Stores the full text of activated lorebook entries only on the newest assistant or narrator message of a chat (its row and its swipes; an impersonated user turn does not replace it). Older messages keep entry ids, keys and scores, which makes chats with large lorebooks much smaller on disk and in memory. If the newer messages are deleted, Active Context and agent retries show the entry's current stored text for the message that is newest again. |
+
+`scripts/compact-lorebook-scans.mjs` applies the same rule to chats saved before the setting was turned on. Stop the server first; it is a dry run unless you pass `--apply`, and it backs up both message tables before writing.
+
+### Robustness
+
+Every setting here is off by default, which keeps the behaviour exactly as it was, and each one works on its own. `STORAGE_CACHE_WINDOWS_BOOT_ID`, `SHUTDOWN_WINDOWS_CONSOLE_SIGNALS` and `SHUTDOWN_FORCE_EXIT_ON_REPEAT` are read at startup and need a restart; the others apply on the next request, save or stop after a `.env` change. `PROVIDER_RETRY_TRANSIENT_ERRORS` pins the **Retry failed provider calls** switch in Settings > Advanced > Features: when it is set, it wins over the switch; when it is unset, the switch decides (see [Feature Switches](configuration/features.md)).
+
+| Variable                           | Default | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PROVIDER_RETRY_TRANSIENT_ERRORS`  | `false` | Retries a refused or unreachable connection, or a gateway 502 or 503, up to twice with a short jittered wait (at most 5 s, even when the gateway asks for longer), and only before any text reached you. A 504 or a dropped connection is never retried. Not used when the connection has a fallback: the fallback is tried at once instead. A connect timeout counts as unreachable, so with a slow-failing host the error can take up to about 20 s longer to show. |
+| `STORAGE_SKIP_UNCHANGED_WRITES`    | `false` | A save skips rewriting a chat file or `manifest.json` when its content is identical to what this server last wrote and the file on disk is unchanged. A file just restored from its `.bak` is always rewritten.                                                                                                                                                                                                                                                       |
+| `STORAGE_YIELDING_SERIALIZE`       | `false` | Large chat files are prepared for saving in short slices, so a save of a very long chat no longer pauses other requests and streams while it runs. The bytes written are the same.                                                                                                                                                                                                                                                                                    |
+| `STORAGE_CACHE_WINDOWS_BOOT_ID`    | `false` | Windows only. Remembers the boot time check the storage lock runs at every start (about 1.5 to 2 s of PowerShell) until the next reboot, in `.writer-boot-id.json` inside `DATA_DIR`.                                                                                                                                                                                                                                                                                 |
+| `SHUTDOWN_WINDOWS_CONSOLE_SIGNALS` | `false` | Windows only. Ctrl+Break and closing the console window also stop the server cleanly (pending saves are written) instead of ending it at once. A console close gets shorter deadlines so it finishes inside the roughly 5 s Windows allows.                                                                                                                                                                                                                           |
+| `SHUTDOWN_FORCE_EXIT_ON_REPEAT`    | `false` | Pressing Ctrl+C (or Ctrl+Break) again more than 1.5 s after the first press ends the server at once. Saves not yet written may be lost. Without it, repeats are ignored and the normal 8 s shutdown limit applies.                                                                                                                                                                                                                                                    |
+| `SHUTDOWN_EARLY_FLUSH`             | `false` | Starts writing pending saves as soon as a stop signal (Ctrl+C, SIGTERM) arrives, while open connections are still closing. The Advanced Settings restart does not use it.                                                                                                                                                                                                                                                                                             |
+| `SHUTDOWN_RUNTIME_STOP_BUDGET_MS`  | `0`     | How long a stop signal waits for background runtimes (capability packages, extensions, sidecar) before it closes storage anyway. The Advanced Settings restart still waits for all of them. `0` waits for all of them, as before. At most `2500`, so storage always closes inside the 8 s shutdown limit.                                                                                                                                                             |
+
 ### Integrations and extras
 
 | Variable                          | Default                                    | What it does                                                                                                                                                                                                    |
@@ -335,6 +398,7 @@ For a Giphy key, note that GIF search stays unavailable until you set `GIPHY_API
 
 ## Related guides
 
+- [Feature Switches](configuration/features.md)
 - [Remote Access: Basic Auth and IP Allowlist](REMOTE_ACCESS.md)
 - [Where Your Data Is Stored](data/where-data-is-stored.md)
 - [Connecting to an AI Provider](connections/connecting-to-a-provider.md)

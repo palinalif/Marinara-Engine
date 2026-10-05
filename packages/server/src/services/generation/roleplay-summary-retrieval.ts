@@ -3,10 +3,8 @@ import { compileChatSummaryEntries, normalizeChatSummaryEntries, type ChatSummar
 import { logger } from "../../lib/logger.js";
 import { calibrateLorebookSimilarity, cosineSimilarity, lorebookSimilarityBaseline } from "../lorebook/embeddings.js";
 import { embedMemoryRecallTexts, type MemoryRecallEmbeddingOptions } from "../memory-recall.js";
-
-const SEMANTIC_SUMMARY_RECENT_ENTRY_COUNT = 2;
-const SEMANTIC_SUMMARY_TOP_K = 3;
-const SEMANTIC_SUMMARY_MIN_SIMILARITY = 0.15;
+import { normalizeSemanticSummaryRetrievalSettings } from "@marinara-engine/shared";
+import { embedSummaryDocuments } from "./summary-document-embeddings.js";
 const SEMANTIC_SUMMARY_CALIBRATION_TEXTS = [
   "A recipe explains how to bake a loaf of bread.",
   "A spacecraft studies distant galaxies and nebulae.",
@@ -83,14 +81,18 @@ export async function resolveRoleplayChatSummaryForPrompt(args: {
     args.excludeMessageIds ?? [],
   );
   const enabledEntries = entries.filter((entry) => entry.enabled);
-  if (enabledEntries.length <= SEMANTIC_SUMMARY_RECENT_ENTRY_COUNT) return fallbackSummary;
+  const settings = normalizeSemanticSummaryRetrievalSettings(args.chatMetadata);
+  if (enabledEntries.length <= settings.semanticSummaryRecentCount) return fallbackSummary;
 
   const newestEntryIds = new Set(
     [...enabledEntries]
       .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
-      .slice(-SEMANTIC_SUMMARY_RECENT_ENTRY_COUNT)
+      .slice(Math.max(0, enabledEntries.length - settings.semanticSummaryRecentCount))
       .map((entry) => entry.id),
   );
+  if (settings.semanticSummaryOlderCount === 0) {
+    return compileChatSummaryEntries(enabledEntries.filter((entry) => newestEntryIds.has(entry.id)));
+  }
   const olderEntries = enabledEntries.filter((entry) => !newestEntryIds.has(entry.id));
 
   try {
@@ -99,13 +101,22 @@ export async function resolveRoleplayChatSummaryForPrompt(args: {
         ...(args.embeddingOptions ?? {}),
         inputType: "query",
       }),
-      embedMemoryRecallTexts(
+      embedSummaryDocuments(
         olderEntries.map((entry) => entry.content),
-        { ...(args.embeddingOptions ?? {}), inputType: "document" },
+        args.embeddingOptions ?? {},
       ),
     ]);
     const queryEmbedding = queryEmbeddings[0];
     if (!queryEmbedding?.length || summaryEmbeddings.length !== olderEntries.length) return fallbackSummary;
+    if (summaryEmbeddings.some((embedding) => embedding.length !== queryEmbedding.length)) {
+      const refreshed = await embedSummaryDocuments(
+        olderEntries.map((entry) => entry.content),
+        args.embeddingOptions ?? {},
+        queryEmbedding.length,
+      );
+      if (refreshed.length !== olderEntries.length) return fallbackSummary;
+      summaryEmbeddings.splice(0, summaryEmbeddings.length, ...refreshed);
+    }
 
     const baseline = lorebookSimilarityBaseline(queryEmbeddings.slice(1));
     const relevantOlderIds = new Set(
@@ -119,9 +130,9 @@ export async function resolveRoleplayChatSummaryForPrompt(args: {
           };
         })
         .filter((match): match is { id: string; similarity: number } => match !== null)
-        .filter((match) => match.similarity >= SEMANTIC_SUMMARY_MIN_SIMILARITY)
+        .filter((match) => match.similarity >= settings.semanticSummaryMinSimilarity)
         .sort((left, right) => right.similarity - left.similarity)
-        .slice(0, SEMANTIC_SUMMARY_TOP_K)
+        .slice(0, settings.semanticSummaryOlderCount)
         .map((match) => match.id),
     );
 

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "child_process";
 import { logger } from "../../lib/logger.js";
+import { runWithRootLogContext } from "../../lib/log-context.js";
 import { createWriteStream, existsSync, readFileSync, writeFileSync, type WriteStream } from "fs";
 import { createServer } from "net";
 import { dirname, join } from "path";
@@ -12,6 +13,7 @@ import { mlxRuntimeService, type MlxRuntimeInstall } from "./mlx-runtime.service
 import { sidecarRuntimeService, type SidecarRuntimeInstall } from "./sidecar-runtime.service.js";
 import { assertSupportedLlamaCppModelPath } from "./sidecar-model-files.js";
 import { resolveSidecarRequestModel } from "./sidecar-request-model.js";
+import { SidecarGpuMemoryReporter } from "./sidecar-gpu-memory.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -93,9 +95,22 @@ class SidecarProcessService {
   private manuallyUnloaded = false;
   private syncLock: Promise<void> = Promise.resolve();
   private childErrors = new WeakMap<ChildProcess, Error>();
+  private gpuMemory = new SidecarGpuMemoryReporter();
+
+  getGpuMemory() {
+    return this.ready ? this.gpuMemory.report() : null;
+  }
 
   isReady(): boolean {
     return this.ready && this.baseUrl !== null;
+  }
+
+  /**
+   * The running llama-server's process id, so its device memory can be measured
+   * rather than estimated from the model file. Null when nothing is running.
+   */
+  getProcessId(): number | null {
+    return this.child?.pid ?? null;
   }
 
   getBaseUrl(): string | null {
@@ -455,6 +470,7 @@ class SidecarProcessService {
       embeddingPooling: config.embeddingPooling,
       embeddingBatchSize: config.embeddingBatchSize,
       maxParallelJobs: config.maxParallelJobs,
+      kvCacheType: config.kvCacheType,
     });
   }
 
@@ -556,6 +572,7 @@ class SidecarProcessService {
           contextSize: config.contextSize,
           maxParallelJobs: config.maxParallelJobs,
           gpuLayers: config.gpuLayers,
+          kvCacheType: config.kvCacheType ?? "f16",
           enableNativeToolCalls: config.enableNativeToolCalls,
           embeddingPooling: config.embeddingPooling,
           embeddingBatchSize: config.embeddingBatchSize,
@@ -671,12 +688,16 @@ class SidecarProcessService {
       logStream.write(`[sidecar] runtime variant: ${runtime.variant}\n`);
       logStream.write(`[sidecar] command: ${runtime.serverPath} ${this.formatCommandArgs(args)}\n`);
 
-      const child = spawn(runtime.serverPath, args, {
-        cwd: dirname(runtime.serverPath),
-        env: buildLlamaProcessEnv(runtime),
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      // Root log context: the process outlives the request that started it, so its exit lines
+      // must not carry that request's requestId.
+      const child = runWithRootLogContext({}, () =>
+        spawn(runtime.serverPath, args, {
+          cwd: dirname(runtime.serverPath),
+          env: buildLlamaProcessEnv(runtime),
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      );
 
       this.bindChild(child, logStream, `http://127.0.0.1:${port}`, signature);
 
@@ -718,16 +739,20 @@ class SidecarProcessService {
     logStream.write(`[sidecar] startup attempt 1/1 (MLX native)\n`);
     logStream.write(`[sidecar] command: ${runtime.pythonPath} ${this.formatCommandArgs(args)}\n`);
 
-    const child = spawn(runtime.pythonPath, args, {
-      cwd: runtime.directoryPath,
-      env: {
-        ...process.env,
-        HF_HOME: runtime.hfHomePath,
-        HF_HUB_CACHE: join(runtime.hfHomePath, "hub"),
-      },
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Root log context: the process outlives the request that started it, so its exit lines
+    // must not carry that request's requestId.
+    const child = runWithRootLogContext({}, () =>
+      spawn(runtime.pythonPath, args, {
+        cwd: runtime.directoryPath,
+        env: {
+          ...process.env,
+          HF_HOME: runtime.hfHomePath,
+          HF_HUB_CACHE: join(runtime.hfHomePath, "hub"),
+        },
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
 
     this.bindChild(child, logStream, `http://127.0.0.1:${port}`, signature);
 
@@ -748,6 +773,7 @@ class SidecarProcessService {
   }
 
   private bindChild(child: ChildProcess, logStream: WriteStream, baseUrl: string, signature: string): void {
+    this.gpuMemory = new SidecarGpuMemoryReporter();
     this.child = child;
     this.logStream = logStream;
     this.baseUrl = baseUrl;
@@ -757,9 +783,11 @@ class SidecarProcessService {
 
     child.stdout?.on("data", (chunk) => {
       logStream.write(chunk);
+      if (this.child === child) this.gpuMemory.consume(String(chunk), "stdout");
     });
     child.stderr?.on("data", (chunk) => {
       logStream.write(chunk);
+      if (this.child === child) this.gpuMemory.consume(String(chunk));
     });
     child.on("error", (error) => {
       const spawnError = error instanceof Error ? error : new Error(String(error));

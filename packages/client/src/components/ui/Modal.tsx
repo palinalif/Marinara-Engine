@@ -73,7 +73,15 @@ export function Modal({
   const [animating, setAnimating] = useState<"enter" | "exit" | null>(null);
   const enterRafRef = useRef<number | null>(null);
   const backdropDismiss = useBackdropDismiss(onClose, closeDisabled);
-  useDialogFocusScope(open && mounted, panelRef, initialFocusRef, restoreFocusRef, focusScopePortalSelector);
+  const overlayRegistrationRef = useRef<ModalOverlayRegistration | null>(null);
+  useDialogFocusScope(
+    open && mounted,
+    panelRef,
+    initialFocusRef,
+    restoreFocusRef,
+    focusScopePortalSelector,
+    () => overlayRegistrationRef.current?.isTopmost() ?? true,
+  );
   // Hardware / gesture back closes the topmost modal. While closing is disabled
   // the press is absorbed rather than ignored, matching Escape: an in-flight
   // operation must not be interrupted by backgrounding the app.
@@ -109,7 +117,6 @@ export function Modal({
   // draw their own full-page shell learn that a dialog is stacked above them,
   // and the Escape listener below asks whether THIS dialog is the topmost one,
   // since every open Modal hears the same keypress and none stops propagation.
-  const overlayRegistrationRef = useRef<ModalOverlayRegistration | null>(null);
   useEffect(() => {
     if (!open) return;
     const registration = registerModalOverlay();
@@ -125,6 +132,8 @@ export function Modal({
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
+      // Escape while an IME is composing cancels the composition first.
+      if (e.isComposing) return;
       if (e.key !== "Escape" || closeDisabled) return;
       if (!overlayRegistrationRef.current?.isTopmost()) return;
       onClose();
@@ -213,7 +222,7 @@ export function Modal({
             onClick={onClose}
             disabled={closeDisabled}
             aria-label={localizeUi("ui.ui.modal.value1Value2", { value1: localize("Close"), value2: localizedTitle })}
-            className="rounded-lg p-1.5 text-[var(--marinara-chat-chrome-panel-muted)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)] hover:text-[var(--marinara-chat-chrome-highlight-text)] disabled:cursor-wait disabled:opacity-40"
+            className="flex shrink-0 items-center justify-center rounded-lg p-1.5 text-[var(--marinara-chat-chrome-panel-muted)] transition-colors max-md:h-9 max-md:w-9 [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9 hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)] hover:text-[var(--marinara-chat-chrome-highlight-text)] disabled:cursor-wait disabled:opacity-40"
           >
             <X size="1rem" />
           </button>

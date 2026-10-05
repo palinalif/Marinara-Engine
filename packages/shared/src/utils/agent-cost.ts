@@ -17,7 +17,8 @@
 //     the server-side batching in
 //     `packages/server/src/services/agents/agent-pipeline.ts`: agents that
 //     share a phase, connection, and lane batch into a single LLM call. Rewrite
-//     agents use a dedicated lane and never share tracker calls. v1 ignores
+//     agents use a dedicated lane and never share tracker calls. An agent with
+//     its own request (`ownRequest`) is one call of its own. v1 ignores
 //     the tool-extraction nuance (tool-using agents technically run alone,
 //     adding 1 call each beyond the batch) — fine for a soft signal.
 // ──────────────────────────────────────────────
@@ -36,6 +37,8 @@ export interface AgentCostInput {
   promptTemplate: string;
   /** Resolved output format, used to isolate custom rewrite agents. */
   resultType?: string;
+  /** The user turned off "Share requests with other agents", so this agent is one call of its own. */
+  ownRequest?: boolean;
 }
 
 export interface AgentLoadCost {
@@ -75,7 +78,7 @@ export function estimateAgentLoadCost(enabled: AgentCostInput[], defaultConnecti
     instructionTokens += estimateTextTokens(a.promptTemplate);
     if (NO_EXTRA_CALL_AGENT_TYPES.has(a.type)) continue;
     const connection = a.connectionId ?? defaultConnectionId ?? "default";
-    callKeys.add(`${a.phase}::${connection}::${getAgentCostLane(a)}`);
+    callKeys.add(`${a.phase}::${connection}::${getAgentCostLane(a)}${a.ownRequest ? `::${a.type}` : ""}`);
   }
 
   const extraCalls = callKeys.size;

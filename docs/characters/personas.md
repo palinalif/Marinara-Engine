@@ -82,6 +82,7 @@ The **Card** tab is where you write the core persona fields. Each field is a lar
 - **Personality**: your temperament, behavior, speech habits, and emotional patterns.
 - **Backstory**: your history, origin, relationships, and formative events.
 - **Appearance**: physical description, clothing, and visual details the model should remember.
+- **Image Appearance Override**: an optional switch under **Appearance**, off by default. Turn it on to reveal a second box for an image-prompt-ready description of your persona. While it is on and the box is filled, image prompts use that text instead of **Appearance**. The narrator always sees the full **Appearance** text.
 - **Scenario**: your default situation or context for roleplays. Use it to establish where your persona starts.
 
 These text boxes support macros. Quote characters you type are auto-formatted to match your app quote style.
@@ -119,6 +120,8 @@ The **Stats** tab has two separate blocks. Both feed the on-screen stat display 
 
 - **Enable Persona Stats** turns on status bars for needs like hunger, energy, and mood. When you enable it fresh, you get starter bars for Satiety, Energy, Hygiene, and Mood, each at 100 of 100. The **Persona Stats** agent adjusts these values as the story goes.
 - **Enable RPG Attributes** turns on RPG-style Pools and Attributes. When you enable it fresh, you get starter HP and MP Pools at 100 out of 100 and starter Attributes STR, DEX, CON, INT, WIS, and CHA at 10. These values are sent with the persona card for Combat and Game Mode, and for optional rolls in Roleplay or Game Mode. Tracker agents do not update them.
+
+When a Game Mode ruleset is installed, or the persona still holds a sheet for a ruleset you no longer have, a **Ruleset sheets** block appears below these two. It holds your persona's starting build for each ruleset, which a new game on that ruleset copies. See [Ruleset sheets](colors-and-stats.md#ruleset-sheets).
 
 The values you set here are the starting defaults for new chats. Persona Status Bars can update automatically when the Persona Stats agent is enabled; persona RPG Pools and Attributes are not agent-managed. For the full explanation, see [Character Colors and RPG Stats](colors-and-stats.md).
 

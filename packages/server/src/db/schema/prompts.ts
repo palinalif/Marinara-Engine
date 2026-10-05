@@ -79,6 +79,8 @@ export const promptSections = fileTable("prompt_sections", {
   wrapInXml: text("wrap_in_xml").notNull().default("false"),
   xmlTagName: text("xml_tag_name").notNull().default(""),
   forbidOverrides: text("forbid_overrides").notNull().default("false"),
+  /** "true" sends this prompt block without the preset's wrap format (group wrapping still applies; ignored for markers) */
+  skipWrap: text("skip_wrap").notNull().default("false"),
 });
 
 export const choiceBlocks = fileTable("choice_blocks", {

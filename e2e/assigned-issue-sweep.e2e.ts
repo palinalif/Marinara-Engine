@@ -1,3 +1,4 @@
+import { prepareViteFixtureDependencies } from "./vite-fixture-dependencies.js";
 import Fastify from "../packages/server/node_modules/fastify/fastify.js";
 import {
   androidLocalAuthHook,
@@ -206,7 +207,8 @@ test("single random choices can be overridden and greetings resolve choices with
     await page.locator(".mari-chat-settings-drawer").getByText("Prompt Preset", { exact: true }).click();
     const editVariables = page.getByRole("button", { name: "Edit preset variables", exact: true });
     await editVariables.click();
-    const modal = page.getByRole("dialog");
+    // Chat Settings is a dialog too (#7036), so pick the preset-variables one.
+    const modal = page.getByRole("dialog").filter({ hasText: "Choose the genre" });
     await expect(modal.getByText("Choose the genre", { exact: true })).toBeVisible();
     const initiallySelected = modal.getByRole("button", { pressed: true });
     await expect(initiallySelected).toHaveCount(1);
@@ -240,13 +242,11 @@ test("single random choices can be overridden and greetings resolve choices with
       promptPresetId: preset.id,
       characterIds: [character.id],
     });
+    await prepareViteFixtureDependencies(page);
     await page.evaluate(
       async ({ chatId, presetId }) => {
         const { ChoiceSelectionModal } = await import("/src/components/presets/ChoiceSelectionModal.tsx" as string);
-        const dependencyUrl = (name: string) =>
-          performance
-            .getEntriesByType("resource")
-            .find((entry) => new URL(entry.name).pathname.endsWith(`/deps/${name}.js`))!.name;
+        const dependencyUrl = window.__viteFixtureDependencyUrl;
         const { default: React } = await import(dependencyUrl("react"));
         const { default: ReactDOM } = await import(dependencyUrl("react-dom_client"));
         const { QueryClient, QueryClientProvider } = await import(dependencyUrl("@tanstack_react-query"));

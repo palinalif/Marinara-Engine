@@ -1,6 +1,6 @@
 # Downloadable Agents Reference
 
-This guide lists all 36 official first-party packages available through **Agents → Download Agents**, grouped by category. Agents do not ship inside a fresh Marinara Engine installation. Their package sources, manifests, artifacts, and machine-readable catalog are published in [Pasta-Devs/Marinara-Agents](https://github.com/Pasta-Devs/Marinara-Agents). For each one, this guide explains what the agent does, when it runs or integrates, which chat modes allow it, and the main settings. For installation and activation, read the [Agents overview](agents-overview.md) first.
+This guide lists official first-party packages available through **Agents → Download Agents**, grouped by category. Agents do not ship inside a fresh Marinara Engine installation. Their package sources, manifests, artifacts, and machine-readable catalog are published in [Pasta-Devs/Marinara-Agents](https://github.com/Pasta-Devs/Marinara-Agents). For each one, this guide explains what the agent does, when it runs or integrates, which chat modes allow it, and the main settings. For installation and activation, read the [Agents overview](agents-overview.md) first. Entries marked **staging only** are available to Engine staging users; stable users see them after their package is promoted.
 
 ## How to read this reference
 
@@ -12,7 +12,7 @@ Each agent below shows three quick facts.
 - **Where it works**: the chat modes that let you add the agent. Most agents work in **Roleplay** chats. A few work in other modes, and each entry says which.
 - **Key settings**: the settings you are most likely to change. You set these when you add the agent, or later in the agent's setup card in **Chat Settings**.
 
-Marinara groups its agents into three categories in the **Agents** panel: **Writer Agents**, **Tracker Agents**, and **Misc Agents**. This reference uses the same grouping.
+Marinara groups its agents in the **Agents** panel into **Apps**, **Writer Agents**, **Tracker Agents**, and **Misc Agents**. Apps are packages with their own Home tab, like Noodle and Slurp. This reference describes Noodle in the Misc agents section.
 
 A run interval means the agent runs once every few user and assistant messages instead of after every message. You can change a run interval in the agent's setup, up to 100.
 
@@ -155,6 +155,26 @@ Tracks money, equipped gear, and carried items as three structured lists without
 - **Phase**: Post-Processing.
 - **Where it works**: Roleplay.
 - **Key settings**: **Add as Prompt Section** (on by default). The HUD and Tracker Panel let you edit and lock every name and quantity.
+
+### Quartermaster
+
+Manages the active persona's inventory, equipment slots, item quantities and storage locations, and saved outfits. Its tracker reads the story after replies and applies item changes. A floating dock and the Tracker Panel let you edit the same inventory manually; item and outfit artwork is optional.
+
+- **Phase**: Post-Processing, with inventory context supplied to later replies.
+- **Where it works**: Roleplay; tracks the active persona, not party members or NPCs.
+- **Availability**: **Staging only**, requiring Engine **2.4.6+**. Stable publication is planned with the next Engine main release.
+- **Install and activate**: install **Quartermaster** from **Agents → Download Agents** and restart when prompted. In each Roleplay chat, enable agents in **Chat Settings → Agents**, add Quartermaster under **Tracker Agents**, and choose its model connection. Open the dock from the launcher above the Tracker Panel.
+- **Key controls**: equip and store items, save outfits, restore inventory or revert recent tracker changes, and export/import a chat's setup. Image generation uses a separately configured image connection. The appearance macro and replacing the persona's avatar are optional; see the [Quartermaster package guide](https://github.com/Pasta-Devs/Marinara-Agents/blob/staging/packages/quartermaster/README.md) before enabling them.
+
+### Relationship Tracker
+
+Maintains an editable relationship web for the character cards assigned to a Roleplay group chat, plus each character's perception of the active persona. Defined relationships use positive, neutral, negative, or complicated categories. Manual locks protect edited relationships from automatic changes.
+
+- **Phase**: Post-Processing, with relationship context supplied to later replies.
+- **Where it works**: Roleplay group chats.
+- **Availability**: **Staging only**, requiring Engine **2.4.4+** with the staging preview catalog. Stable publication is planned with the next Engine main release.
+- **Install and activate**: install **Relationship Tracker** from **Agents → Download Agents** and restart when prompted. In each Roleplay chat, enable agents in **Chat Settings → Agents**, add it under **Tracker Agents**, and choose its model connection. The web appears in the Tracker Panel. Select **All relationships** or **Scene-only relationships** there once to initialize the chat before editing or updating relationships.
+- **Key controls**: **All relationships** or **Scene-only relationships** for prompt context, **Update from History** for a bounded recent-message scan, and manual editing, locking, and **Resume automatic updates**. **Context Size** (default 5 messages), **Presence lookback** (default 15), and the history scan's message count are separate controls. Hover or keyboard-focus a line to read it; on touch or pen, press the line. See the [Relationship Tracker package guide](https://github.com/Pasta-Devs/Marinara-Agents/blob/staging/packages/relationship-tracker/README.md).
 
 ### Memory Nag
 

@@ -1,3 +1,5 @@
+import { LorebookEntryImages } from "./LorebookEntryImages";
+import { appendLorebookActivationKeys } from "../../lib/lorebook-keys";
 // ──────────────────────────────────────────────
 // Lorebook Entry Row
 // Compact one-line row with inline controls + expandable drawer.
@@ -8,6 +10,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -15,6 +18,7 @@ import {
   type TouchEvent as ReactTouchEvent,
 } from "react";
 import { createPortal } from "react-dom";
+import { useIsMutating } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   Ban,
@@ -38,12 +42,20 @@ import {
 } from "lucide-react";
 import { cn, copyToClipboard } from "../../lib/utils";
 import { showConfirmDialog } from "../../lib/app-dialogs";
-import { useUpdateLorebookEntry, useDeleteLorebookEntry, useDuplicateLorebookEntry } from "../../hooks/use-lorebooks";
+import {
+  lorebookKeys,
+  useUpdateLorebookEntry,
+  useDeleteLorebookEntry,
+  useDuplicateLorebookEntry,
+} from "../../hooks/use-lorebooks";
+import { isCapabilityPackageAvailable, useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
 import { useUIStore } from "../../stores/ui.store";
 import { MacroTextarea } from "../ui/MacroTextarea";
+import { DecisionStatementNote } from "../ui/DecisionStatementNote";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
 import type {
   LorebookEntry,
+  LorebookEntryImage,
   LorebookFilterMode,
   LorebookFolder,
   LorebookMatchingSource,
@@ -87,7 +99,8 @@ interface Props {
   onDragHandleTouchStart?: (e: ReactTouchEvent<HTMLButtonElement>, sourceElement: HTMLDivElement | null) => void;
   selectionMode?: boolean;
   isSelected?: boolean;
-  onToggleSelected?: () => void;
+  /** Receives the click so the editor can extend the selection with Shift. */
+  onToggleSelected?: (event?: { shiftKey: boolean }) => void;
   /**
    * When the editor's "Keyword test" panel has text in it, the editor
    * computes which entries that text would activate and passes the verdict
@@ -97,6 +110,8 @@ interface Props {
    */
   previewMatch?: "matched" | "constant";
   mapBacklinks?: Array<{ chatId: string; locationId: string; locationName: string }>;
+  /** How often this entry fired in real generations (absent = never). */
+  activationStat?: { count: number; lastActivatedAt: string | null };
   onUpdateEntry?: LorebookEntryUpdateHandler;
   /** Override only this row's enabled control; content edits keep their existing scope. */
   chatEnabled?: { enabled: boolean; onChange: (enabled: boolean) => Promise<unknown> };
@@ -196,7 +211,14 @@ const GENERATION_TRIGGER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "test_scan", label: "Test scan" },
   { value: "game_setup", label: "Game setup" },
   { value: "lorebook_assistant", label: "Lorebook Assistant" },
-  { value: "noodle", label: "Noodle" },
+];
+
+// Triggers sent by downloadable packages. They only show while a package that sends them is
+// installed and usable; a saved value stays on the entry when its package is removed.
+// Slurp Legacy (`slurp`) sends the "noodle" trigger, like the Noodle it was forked from.
+const PACKAGE_GENERATION_TRIGGER_OPTIONS: Array<{ value: string; label: string; packageIds: string[] }> = [
+  { value: "noodle", label: "Noodle", packageIds: ["noodle", "slurp"] },
+  { value: "slurp", label: "Slurp", packageIds: ["slurp2"] },
 ];
 
 /** A compact lorebook-entry list row with inline-editable status / position / depth / order /
@@ -225,6 +247,7 @@ export function LorebookEntryRow({
   isSelected = false,
   onToggleSelected,
   previewMatch,
+  activationStat,
   mapBacklinks = [],
   onUpdateEntry,
   chatEnabled,
@@ -255,6 +278,10 @@ export function LorebookEntryRow({
   const statusMenuRef = useRef<HTMLDivElement>(null);
   const upstreamOutletNameRef = useRef(entry.outletName);
   const pendingOutletNameRef = useRef(entry.outletName);
+  const upstreamImagesRef = useRef(entry.images);
+  const pendingImagesRef = useRef(entry.images);
+  const changingImages =
+    useIsMutating({ mutationKey: lorebookKeys.imageChange(lorebookId, entry.id), exact: true }) > 0;
 
   // Re-sync local state when the upstream entry changes (e.g. after refetch)
   // so we don't show stale values, but avoid clobbering an in-flight edit.
@@ -267,6 +294,9 @@ export function LorebookEntryRow({
     if (pendingOutletNameRef.current === previousOutletName) {
       pendingOutletNameRef.current = entry.outletName;
     }
+    const previousImages = upstreamImagesRef.current;
+    upstreamImagesRef.current = entry.images;
+    if (pendingImagesRef.current === previousImages) pendingImagesRef.current = entry.images;
     setLocalStatus(deriveStatus(entry));
     setLocalPosition(entry.position);
     setLocalDepth(entry.depth);
@@ -410,7 +440,7 @@ export function LorebookEntryRow({
     (e: ReactMouseEvent<HTMLDivElement>) => {
       if (isHeaderInlineControlTarget(e.target)) return;
       if (selectionMode) {
-        onToggleSelected?.();
+        onToggleSelected?.(e);
         return;
       }
       onToggleExpand();
@@ -450,7 +480,10 @@ export function LorebookEntryRow({
     [deleteEntry, entry.id, entry.name, localizeUi, lorebookId],
   );
 
-  const duplicateDisabled = duplicateEntry.isPending || updateEntry.isPending;
+  const duplicateDisabled = duplicateEntry.isPending || updateEntry.isPending || changingImages;
+  const handleImagesDraftChange = useCallback((images: LorebookEntryImage[]) => {
+    pendingImagesRef.current = images;
+  }, []);
   const handleOutletNameDraftChange = useCallback((outletName: string) => {
     pendingOutletNameRef.current = outletName;
   }, []);
@@ -477,6 +510,7 @@ export function LorebookEntryRow({
           probability: localProbability === 100 ? null : localProbability,
           useRegex: localUseRegex,
           outletName: pendingOutletNameRef.current,
+          images: pendingImagesRef.current ?? [],
         },
       });
     },
@@ -541,6 +575,10 @@ export function LorebookEntryRow({
       <div
         className="group flex min-w-0 cursor-pointer items-center gap-0.5 px-1.5 py-1.5 sm:gap-2 sm:px-2"
         onClick={handleHeaderClick}
+        onMouseDown={(e) => {
+          // Shift+click range selection: stop the browser from also highlighting text across rows.
+          if (selectionMode && e.shiftKey && !isHeaderInlineControlTarget(e.target)) e.preventDefault();
+        }}
       >
         {/* Drag handle */}
         <button
@@ -589,7 +627,7 @@ export function LorebookEntryRow({
             }
             onClick={(e) => {
               e.stopPropagation();
-              onToggleSelected?.();
+              onToggleSelected?.(e);
             }}
             className={cn(
               "flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--ring)] sm:h-7 sm:w-7",
@@ -777,6 +815,21 @@ export function LorebookEntryRow({
           className="min-w-0 flex-1 truncate rounded bg-transparent px-1 text-sm font-medium outline-none transition-colors hover:bg-[var(--accent)]/40 focus:bg-[var(--accent)]/40 focus:ring-1 focus:ring-[var(--ring)] sm:min-w-[7rem]"
         />
 
+        {activationStat && activationStat.count > 0 && (
+          <span
+            className="shrink-0 rounded px-1 text-[0.625rem] tabular-nums text-[var(--muted-foreground)]"
+            title={localizeUi("lorebook.editor.stats.firedTitle", {
+              count: activationStat.count,
+              date: activationStat.lastActivatedAt ? new Date(activationStat.lastActivatedAt).toLocaleString() : "",
+            })}
+            aria-label={localizeUi("lorebook.editor.stats.firedTitle", {
+              count: activationStat.count,
+              date: activationStat.lastActivatedAt ? new Date(activationStat.lastActivatedAt).toLocaleString() : "",
+            })}
+          >
+            {localizeUi("lorebook.editor.stats.firedShort", { count: activationStat.count })}
+          </span>
+        )}
         {mapBacklinks.length > 0 && (
           <button
             type="button"
@@ -1059,6 +1112,7 @@ export function LorebookEntryRow({
           compact={compact}
           onUpdateEntry={onUpdateEntry}
           onOutletNameDraftChange={handleOutletNameDraftChange}
+          onImagesDraftChange={handleImagesDraftChange}
         />
       )}
     </div>
@@ -1289,6 +1343,8 @@ function buildEntrySavePayload(form: Partial<LorebookEntry>) {
     excludeRecursion: form.excludeRecursion,
     delayUntilRecursion: form.delayUntilRecursion,
     excludeFromVectorization: form.excludeFromVectorization,
+    decisionStatement: form.decisionStatement,
+    decisionMode: form.decisionMode,
   };
 }
 
@@ -1368,6 +1424,7 @@ function ExpandedDrawer({
   compact,
   onUpdateEntry,
   onOutletNameDraftChange,
+  onImagesDraftChange,
 }: {
   entry: LorebookEntry;
   position: number;
@@ -1377,9 +1434,20 @@ function ExpandedDrawer({
   compact: boolean;
   onUpdateEntry?: LorebookEntryUpdateHandler;
   onOutletNameDraftChange: (outletName: string) => void;
+  onImagesDraftChange: (images: LorebookEntryImage[]) => void;
 }) {
   const { t: localizeUi } = useUiTranslation();
   const { mutate: mutateEntry, mutateAsync: mutateEntryAsync } = useUpdateLorebookEntry();
+  const { data: installedCapabilities = [] } = useInstalledCapabilityPackages();
+  const generationTriggerOptions = useMemo(
+    () => [
+      ...GENERATION_TRIGGER_OPTIONS,
+      ...PACKAGE_GENERATION_TRIGGER_OPTIONS.filter((option) =>
+        option.packageIds.some((packageId) => isCapabilityPackageAvailable(installedCapabilities, packageId)),
+      ),
+    ],
+    [installedCapabilities],
+  );
   const [form, setForm] = useState<Partial<LorebookEntry>>(() => ({ ...entry }));
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1627,6 +1695,61 @@ function ExpandedDrawer({
             ))}
           </div>
         </FieldGroup>
+
+        {/* Decision activation (#6570) */}
+        <FieldGroup
+          label={localizeUi("ui.lorebooks.expandeddrawer.decision")}
+          icon={Sparkles}
+          help={localizeUi("ui.lorebooks.expandeddrawer.decisionHelp")}
+        >
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(
+              [
+                ["off", localizeUi("ui.lorebooks.expandeddrawer.decisionModeOff")],
+                ["require", localizeUi("ui.lorebooks.expandeddrawer.decisionModeRequire")],
+                ["trigger", localizeUi("ui.lorebooks.expandeddrawer.decisionModeTrigger")],
+              ] as const
+            ).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={(form.decisionMode ?? "off") === mode}
+                onClick={() => update({ decisionMode: mode })}
+                className={cn(
+                  "rounded-md px-2 py-0.5 text-[0.6875rem] font-medium transition-colors",
+                  (form.decisionMode ?? "off") === mode
+                    ? "mari-chrome-accent-surface mari-accent-animated"
+                    : "text-[var(--muted-foreground)] hover:bg-[var(--marinara-editor-control-bg-hover)]",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {(form.decisionMode ?? "off") !== "off" && (
+            <>
+              <textarea
+                value={form.decisionStatement ?? ""}
+                onChange={(event) => update({ decisionStatement: event.target.value })}
+                onBlur={flushAutosave}
+                maxLength={500}
+                rows={2}
+                aria-label={localizeUi("ui.lorebooks.expandeddrawer.decisionStatement")}
+                className="mari-editor-field mt-2 w-full resize-y px-2.5 py-2 text-xs"
+                placeholder={localizeUi("ui.lorebooks.expandeddrawer.decisionStatementPlaceholder")}
+              />
+              <p className="mt-1 text-[0.625rem] text-[var(--muted-foreground)]">
+                {form.decisionMode === "trigger"
+                  ? localizeUi("ui.lorebooks.expandeddrawer.decisionTriggerHint")
+                  : localizeUi("ui.lorebooks.expandeddrawer.decisionRequireHint")}
+              </p>
+              <DecisionStatementNote
+                active={(form.decisionStatement ?? "").trim().length > 0}
+                message={localizeUi("ui.lorebooks.expandeddrawer.decisionModelMissing")}
+              />
+            </>
+          )}
+        </FieldGroup>
       </div>
 
       <details className="mari-editor-panel mari-editor-panel--soft px-3 py-2">
@@ -1680,7 +1803,7 @@ function ExpandedDrawer({
                 />
               </div>
               <FilterPills
-                values={GENERATION_TRIGGER_OPTIONS}
+                values={generationTriggerOptions}
                 selected={form.generationTriggerFilters ?? []}
                 onChange={(next) => update({ generationTriggerFilters: next })}
                 emptyLabel="No trigger filters available."
@@ -1744,6 +1867,17 @@ function ExpandedDrawer({
           placeholder={localizeUi("ui.lorebooks.expandeddrawer.theContentThatWillBeInjectedIntoThePrompt")}
           title={localizeUi("ui.lorebooks.expandeddrawer.editContent")}
           showMacroReference
+        />
+        <LorebookEntryImages
+          key={entry.id}
+          lorebookId={lorebookId}
+          entryId={entry.id}
+          images={entry.images ?? []}
+          onDraftChange={onImagesDraftChange}
+          hasWardrobeKey={(form.keys ?? []).some((key) => key.toLowerCase() === "wardrobe")}
+          onAddWardrobeKey={() =>
+            update({ keys: appendLorebookActivationKeys(formRef.current.keys ?? [], "wardrobe") })
+          }
         />
         <p className="mt-1 flex items-center gap-1 text-[0.625rem] text-[var(--muted-foreground)]">
           <Hash size="0.5625rem" />~{estimateTokens(form.content ?? "").toLocaleString()}{" "}

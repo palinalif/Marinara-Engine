@@ -73,6 +73,8 @@ codex login
 
 Marinara reads your local Codex login file and refreshes the session when it can.
 
+To set how long Codex thinks before answering, open the connection, turn on **Use custom defaults for this connection** under **Default Chat Parameters**, and pick a **Reasoning Effort**; it starts at **Default**. A chat can pick its own level in **Advanced Parameters**. **Default** keeps the level Codex uses for the model. Codex uses that default until the connection or the chat picks a level; the level in your preset does not change it, and a Codex connection used as a fallback follows only its own level. The levels match the ones Codex offers for each model: GPT-5.5 goes up to **xhigh**, and GPT-5.6 and GPT-6 models go up to **max**.
+
 ## Grok CLI (Subscription)
 
 You need a SuperGrok or X Premium+ account.
@@ -97,6 +99,14 @@ grok login
 Two things are special about Grok CLI. It does not stream, so a reply appears all at once instead of word by word. Its context window defaults to 32000 tokens, lower than other providers, because very large prompts can hit the CLI's own turn limit.
 
 To load Grok models, use the **Fetch Models from Grok CLI** button in the **Model** section.
+
+## Claude prompt-cache duration
+
+In the Claude connection editor, **Prompt Caching → Extended token caching (1 hour)** requests a one-hour cache for longer pauses between messages. It requires Claude Code **2.1.242 or later**. Marinara passes the setting for that request without changing your saved Claude settings.
+
+Off leaves Claude's default for main conversations and Agent SDK requests in place: currently one hour for subscription usage within plan limits and five minutes for extra usage, credits, or API billing. Claude Code's own subagents use five minutes unless configured separately; selected server-controlled helper requests may use one hour. Existing CLI environment overrides still take precedence. See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching).
+
+Debug logs separate five-minute and one-hour cache writes using the SDK's reported usage. The cost equivalents use standard API token multipliers, not your subscription bill; when the SDK omits the write-duration breakdown, the estimate is left unknown.
 
 ## Why there is no API key field
 

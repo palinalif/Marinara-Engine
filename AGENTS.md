@@ -2,6 +2,35 @@
 
 This is the repository guide for coding agents. Canonical workflow, validation, and release guidance lives in `CONTRIBUTING.md`.
 
+Shared skills live in `.claude/skills`; Codex accesses them through `.agents/skills → ../.claude/skills`. Use the instructions and capabilities supported by the current agent host.
+
+## Codex Runtime and Models
+
+- Use the instructions and tools actually supplied by the current Codex host. Codex discovers `AGENTS.md`/`AGENTS.override.md` and repository skills through `.agents/skills`; a Claude command, agent definition or hook is not automatically a Codex capability. Read the selected skill's `SKILL.md` before using it.
+- Preserve the user's configured model and reasoning effort unless a model change is requested or an applicable workflow authorizes a selection. Verify model IDs and supported effort levels against the current host; API availability does not guarantee availability in Codex. Do not change the user's global configuration to carry out a repository task.
+- When selecting an OpenAI model for an authorized task, use this repository's task-based guidance, not a supposed one-to-one translation of Claude model tiers:
+
+| Work | OpenAI model, when available |
+| --- | --- |
+| Difficult architecture, cross-system debugging, final integration and demanding review | `gpt-6-astra` |
+| Substantial implementation or detailed review | `gpt-5.6-sol` |
+| Bounded implementation where balanced cost and capability matter | `gpt-5.6-terra` |
+| Narrow searches, mechanical edits or focused checks | `gpt-5.6-luna` |
+
+- The table is project guidance, checked against the available host models on 2026-09-17. Honor an explicitly requested supported model, including `gpt-5.5`, rather than silently substituting another. Use only reasoning levels exposed by that host/model; larger effort is not mandatory for routine work.
+- When delegation is authorized, use the available Codex subagent tools for independent, bounded work with clear ownership. Keep integration and verification with the primary agent. Do not create user-visible tasks as a substitute for subagents unless the user asks for a new task. If delegation is unavailable, continue locally.
+- Treat the runtime's sandbox, network permissions and approval tools as authoritative. Existing user authorization should not cause another conversational confirmation, but it does not bypass a tool-enforced boundary. Explain an actual denial or timeout accurately and use the permitted retry/recovery path.
+
+References: [OpenAI agent instructions](https://learn.chatgpt.com/docs/agent-configuration/agents-md), [skills](https://learn.chatgpt.com/docs/build-skills), and [model catalog](https://developers.openai.com/api/docs/models).
+
+## Expected Completion and Authorization
+
+- Carry the requested work through implementation, appropriate validation, review fixes and the authorized publication steps. Do not stop at a plan, a clean local review, or a local commit when the user has asked for a PR.
+- Local CodeRabbit review, including uploading the relevant branch changes, is part of this repository's expected review workflow. Do not ask the maintainer for a separate confirmation on each run. Honor any explicit restriction on external uploads and the host's permission controls.
+- A request to publish or update a PR covers the necessary feature-branch commit/push, PR creation/update and transition to ready for review. Reuse that authorization across turns. Do not infer authorization to merge, promote to `main`, deploy or release.
+- Ask only for missing decisions that materially block the task or for actions outside its authorized scope. A previously agreed phase does not need another phase-approval question. Current maintainer instructions override default workflow or skill guidance within the platform's instruction hierarchy.
+- Report what was completed and verified, link the PR, and identify real remaining blockers. Do not imply that queued, skipped or pending checks passed.
+
 ## Agent Workflow Overlay
 
 - Follow `.github/agents/chai-workflow.md` as the repo's additive AI-agent workflow overlay for proof discipline, bugfix lanes, feature sizing, issue filing, PR gates, and risky-work claim boundaries.
@@ -9,6 +38,7 @@ This is the repository guide for coding agents. Canonical workflow, validation, 
 
 ## Ponytail Implementation Discipline
 
+- Prefer simple code solutions, do not over-engineer things, and reuse code whenever possible.
 - Apply [Ponytail](https://github.com/DietrichGebert/ponytail) as an additive minimalism overlay after understanding the task and tracing the affected flow. It never overrides repository rules, validation requirements, or the maintainer's latest request.
 - Before adding code, stop at the first option that works: skip unnecessary work, reuse an existing helper or pattern, use the standard library, use a native platform capability, use an already-installed dependency, choose a clear inline solution, then write the minimum new code.
 - Prefer shared root-cause fixes after checking every caller, deletion over addition, boring over clever, and the fewest files. Avoid speculative abstractions, dependencies, and boilerplate.
@@ -20,6 +50,7 @@ This is the repository guide for coding agents. Canonical workflow, validation, 
 
 - Start with `pnpm install`.
 - Run `pnpm check` as the baseline validation command.
+- Before pushing, follow the local validation and reporting requirements in `CONTRIBUTING.md § Validation`.
 - Run `pnpm version:check` when you touch release metadata, version-bearing files, or README release references.
 - For every bug fix, behavior change, or new feature, add a concise user-focused entry under the appropriate `CHANGELOG.md` `[Unreleased]` heading. Purely mechanical changes with no product or contributor-workflow impact do not need an entry.
 
@@ -44,6 +75,14 @@ This is the repository guide for coding agents. Canonical workflow, validation, 
 - When a change adds, renames, or edits user-facing docs under `docs/`, also update every translated language pack on the `docs-i18n` branch to match — or open a `[docs-i18n] <paths>` follow-up issue. Renames/deletions must be mirrored there or the translation is silently orphaned. See `CONTRIBUTING.md § Translated documentation`.
 
 ## AI-Generated Pull Request
+
+1. Open a draft early while implementation is in progress, so issue ownership and work status are visible.
+2. Finish implementation and the required local checks. Run CodeRabbit locally; reproduce or trace each finding, fix legitimate defects and rerun review after substantive fixes. Record code-based reasons for rejecting false positives, non-regressions and purely pedantic suggestions. Do not claim zero findings when findings were dismissed.
+3. Once implementation, required local validation and substantive local review are complete, **push and mark the PR ready for review in the same workflow without asking again**. If the first PR is only being created at that point, create it ready rather than draft. A user request to keep it draft is an exception.
+4. Keep a PR draft only for unfinished implementation, unresolved substantive local findings, blocked required local validation, or an explicit maintainer instruction. Unchecked human checklist items and documented optional follow-ups are not automatic draft blockers. Pending GitHub CI and GitHub CodeRabbit are merge gates, not reasons to leave completed local work in draft; the GitHub review must be allowed to run.
+5. Inspect CI/review feedback when preparing a PR for review or shipping it. Address valid failures within scope. Never merge until all repository merge gates pass and merging is authorized.
+
+The local review conserves the shared CodeRabbit quota and complements the GitHub review. Use an existing PR rather than creating another for follow-up fixes.
 
 - **Never auto-check validation or test-plan checkboxes in a PR.** Those boxes are a to-do list for the human contributor, not evidence that work is done. If you generate a test plan, leave every box unchecked.
 - When preparing a PR description, list what needs manual verification clearly and explicitly. Write entries like "Manually verify X in browser" rather than "Works correctly."

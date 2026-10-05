@@ -13,7 +13,7 @@ import { cn } from "../../lib/utils";
 import { PersonalExtensionContributionIcon } from "../extensions/PersonalExtensionContributionIcon";
 
 const TOPBAR_CONTRIBUTION_CLASS =
-  "mari-topbar-action relative flex h-8 w-8 items-center justify-center rounded-lg p-0 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] active:scale-95 max-sm:h-7 max-sm:w-7";
+  "mari-topbar-action relative flex h-8 w-8 items-center justify-center rounded-lg p-0 text-[var(--muted-foreground)] transition-all hover:bg-[var(--accent)] hover:text-[var(--foreground)] active:scale-95 [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9";
 
 function ContributionAttribution({ contribution }: { contribution: PersonalExtensionHostContribution }) {
   const { t } = useTranslation();
@@ -24,7 +24,7 @@ function ContributionAttribution({ contribution }: { contribution: PersonalExten
   );
 }
 
-export function PersonalExtensionTopbarButtons() {
+export function PersonalExtensionTopbarButtons({ className }: { className?: string } = {}) {
   const { t: localizeUi } = useUiTranslation();
   const { contributions } = usePersonalExtensionContributions();
   const buttons = contributions
@@ -36,7 +36,7 @@ export function PersonalExtensionTopbarButtons() {
       key={contribution.key}
       type="button"
       onClick={() => activatePersonalExtensionContribution(contribution.key)}
-      className={TOPBAR_CONTRIBUTION_CLASS}
+      className={cn(TOPBAR_CONTRIBUTION_CLASS, className)}
       title={localizeUi("ui.layout.personalextensiontopbarbuttons.value1Value2", {
         value1: contribution.label,
         value2: contribution.extensionName,
@@ -195,7 +195,7 @@ export function PersonalExtensionContributionsMenu() {
         aria-label={t("extensions.contributions.openMenu")}
         title={t("extensions.contributions.title")}
         className={cn(
-          "mari-topbar-action relative flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all active:scale-95 max-sm:h-7 max-sm:w-7",
+          "mari-topbar-action relative flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all active:scale-95 [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9",
           open
             ? "bg-[var(--accent)] text-[var(--foreground)]"
             : "text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",

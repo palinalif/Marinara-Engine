@@ -1,3 +1,5 @@
+import { clickTopbarPanel } from "./topbar-navigation.js";
+import { prepareViteFixtureDependencies } from "./vite-fixture-dependencies.js";
 import { test, expect, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { seedUIState } from "./ui-state-fixture";
@@ -200,7 +202,7 @@ test("Personas are chosen per chat and Conversation names match that choice", as
     await page.screenshot({ path: info.outputPath("conversation-persona-identity.png") });
     const renderedGreeting = await messageRow.innerText();
 
-    await page.locator('[data-tour="panel-personas"]').click();
+    await clickTopbarPanel(page, "personas");
     const panel = page.locator('[data-component="RightPanel"]');
     const aliceRow = page.locator('[data-touch-drag-card="persona"]').filter({ hasText: "Alice Persona" });
     await expect(aliceRow).toBeVisible();
@@ -221,7 +223,7 @@ test("Personas are chosen per chat and Conversation names match that choice", as
     expect.soft(activeBadges).toBe(0);
     expect(renderedGreeting).toContain("Hello Alice Persona. I am Bob Character.");
     await library.getByTitle("Close library").click();
-    if (await aliceRow.isVisible()) await page.locator('[data-tour="panel-personas"]').click();
+    if (await aliceRow.isVisible()) await clickTopbarPanel(page, "personas");
     const composer = page.locator("textarea[data-chat-composer]");
     await expect(composer).toBeVisible();
     const openPersonas = async (currentName: string) => {
@@ -422,7 +424,7 @@ test("Roleplay line volume stays on screen and touch reveal preserves action col
     await page.goto("/");
     const row = page.locator(`[data-message-id="${message.id}"]`);
     const copy = row.getByRole("button", { name: "Copy", exact: true });
-    const volume = row.getByRole("button", { name: /^Line volume: \d+%$/u });
+    const volume = row.getByRole("button", { name: /^Voice controls/u });
     const actions = row.locator(".mari-message-actions");
     const actionAppearance = () =>
       actions.locator("button").evaluateAll((elements) =>
@@ -459,7 +461,7 @@ test("Roleplay line volume stays on screen and touch reveal preserves action col
       }, direction);
       if (testInfo.project.use.hasTouch) await volume.tap();
       else await volume.click();
-      const panel = page.getByRole("dialog", { name: "Line volume", exact: true });
+      const panel = page.getByRole("dialog", { name: /^Voice controls/u });
       await expect(panel).toBeVisible();
       const bounds = await panel.evaluate((element) => {
         const rect = element.getBoundingClientRect();
@@ -477,11 +479,11 @@ test("Roleplay line volume stays on screen and touch reveal preserves action col
       expect(bounds.top).toBeGreaterThanOrEqual(0);
       expect(bounds.bottom).toBeLessThanOrEqual(bounds.height);
       const slider = panel.getByRole("slider", { name: "Line volume", exact: true });
-      await expect(slider).toBeFocused();
+      await slider.focus();
       await slider.press("Home");
       await slider.press("ArrowRight");
       await expect(slider).toHaveValue("1");
-      await expect(volume).toHaveAttribute("aria-label", "Line volume: 1%");
+      await expect(panel.getByText("1%", { exact: true })).toBeVisible();
       await page.screenshot({ path: testInfo.outputPath(`line-volume-${direction}.png`) });
       await slider.press("Escape");
       await expect(panel).toHaveCount(0);
@@ -693,6 +695,7 @@ test("Game translation follows changed narration and remains manually accessible
     await page.route("**/api/translate", async (route) => {
       const body = route.request().postDataJSON();
       expect(body.targetLanguage).toBe("pl");
+      expect(body.chatId).toBe(chat.id);
       requested.push(body.text);
       await route.fulfill({
         json: {
@@ -840,7 +843,7 @@ test("Game translation follows changed narration and remains manually accessible
 });
 
 for (const mode of ["conversation", "roleplay", "game"] as const) {
-  test(`${mode} automatic translation survives navigation and evicted chat settings`, async ({ page, request }) => {
+  test(`${mode} server translations survive navigation and evicted chat settings`, async ({ page, request }) => {
     const chat = await (
       await request.post("/api/chats", { data: { name: "Background translation fixture", mode, characterIds: [] } })
     ).json();
@@ -878,6 +881,7 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
       await page.goto("/");
       // The real hooks run under an isolated QueryClient so eviction can be
       // deterministic, without waiting for the inactive cache's five-minute GC.
+      await prepareViteFixtureDependencies(page);
       await page.evaluate(
         async ({ chat, metadata }) => {
           const { useGenerate } = await import("/src/hooks/use-generate.ts" as string);
@@ -886,10 +890,7 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
           const { useChatStore } = await import("/src/stores/chat.store.ts" as string);
           const { useTranslationStore } = await import("/src/stores/translation.store.ts" as string);
           const { trackChatMetadataSave } = await import("/src/lib/chat-metadata-save-barrier.ts" as string);
-          const dependencyUrl = (name: string) =>
-            performance
-              .getEntriesByType("resource")
-              .find((entry) => new URL(entry.name).pathname.endsWith(`/deps/${name}.js`))!.name;
+          const dependencyUrl = window.__viteFixtureDependencyUrl;
           const { default: React } = await import(dependencyUrl("react"));
           const { default: ReactDOM } = await import(dependencyUrl("react-dom_client"));
           const { QueryClient, QueryClientProvider } = await import(dependencyUrl("@tanstack_react-query"));
@@ -983,9 +984,11 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
             settled: () => generated,
             cached(id: string) {
               const data = client.getQueryData(chatKeys.messages(chat.id));
-              return data?.pages.flat().find((row: { id: string }) => row.id === id)?.extra;
+              const extra = data?.pages.flat().find((row: { id: string }) => row.id === id)?.extra;
+              return typeof extra === "string" ? JSON.parse(extra) : extra;
             },
             showSaved() {
+              root?.unmount();
               useTranslationStore.getState().setConfig(config);
               useTranslationStore
                 .getState()
@@ -1049,7 +1052,13 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
         }
         const source = `The ${scenario} story continues.`;
         const saved = await (
-          await request.post(`/api/chats/${chat.id}/messages`, { data: { role: "assistant", content: source } })
+          await request.post(`/api/chats/${chat.id}/messages`, {
+            data: {
+              role: "assistant",
+              content: source,
+              extra: { translation: "Gotowe tłumaczenie.", translationSource: source, translationHidden: false },
+            },
+          })
         ).json();
         await pendingGeneration!.fulfill({
           contentType: "text/event-stream",
@@ -1062,14 +1071,10 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
             .join(""),
         });
         await page.evaluate(() => (window as any).translationFixture.settled());
-        await expect.poll(() => translations.length).toBe(scenarios.indexOf(scenario) + 1);
-        expect(translations.at(-1)).toMatchObject({
-          text: source,
-          provider: "ai",
-          targetLanguage: scenario === "malformed-legacy" ? "en" : "pl",
-          connectionId: "origin-connection",
-          systemPrompt: metadata.translationOutputPrompt,
-        });
+        // Generation now persists output translation on the server. The browser must
+        // consume the saved extra even after navigating or evicting the chat query,
+        // without issuing a duplicate client-side translation request.
+        expect(translations).toHaveLength(0);
         await expect
           .poll(async () => {
             const messages = await (await request.get(`/api/chats/${chat.id}/messages`)).json();
@@ -1087,8 +1092,8 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
               return useTranslationStore.getState().translations[id];
             }, saved.id),
           ).toBeUndefined();
-          await page.evaluate(() => (window as any).translationFixture.showSaved());
         }
+        await page.evaluate(() => (window as any).translationFixture.showSaved());
         await expect(page.getByTestId("translation-fixture-output")).toContainText("Gotowe tłumaczenie.");
       }
     } finally {
@@ -1125,16 +1130,13 @@ test("Notification position is selectable, moves errors, and survives reload", a
   await expect(selector).toBeFocused();
   await expect(selector).toHaveValue("top");
   await selector.selectOption("bottom");
-  const error = async () =>
-    page.evaluate(async () => {
-      const moduleUrl = performance
-        .getEntriesByType("resource")
-        .map((entry) => entry.name)
-        .find((url) => new URL(url).pathname.endsWith("/sonner.js"));
-      if (!moduleUrl) throw new Error("The app's notification module was not loaded");
-      const { toast } = await import(moduleUrl);
+  const error = async () => {
+    await prepareViteFixtureDependencies(page, "/src/App.tsx");
+    await page.evaluate(async () => {
+      const { toast } = await import(window.__viteFixtureDependencyUrl("sonner"));
       toast.error("Notification position fixture", { duration: Infinity });
     });
+  };
   await error();
   await expect(page.locator('[data-sonner-toaster][data-y-position="bottom"]')).toContainText(
     "Notification position fixture",

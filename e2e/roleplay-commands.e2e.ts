@@ -4,6 +4,7 @@ import { readFileSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { createRequire } from "node:module";
+import { trackPageFetches, waitForPageFetchesToSettle } from "./page-fetch-fixture.js";
 import { seedUIState } from "./ui-state-fixture.js";
 
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -370,6 +371,678 @@ async function createFixture(request: APIRequestContext, baseUrl: string, names:
   };
 }
 
+for (const responseOrder of ["manual", "smart"] as const) {
+  test(`Roleplay Smart trigger chooses a speaker without changing ${responseOrder} order`, async ({
+    page,
+    request,
+  }, info) => {
+    let selectedIds: string[] = [];
+    let selections = 0;
+    const provider = createServer(async (incoming, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      const selecting = JSON.stringify(body.messages ?? []).includes("hidden response orchestrator");
+      if (selecting) selections++;
+      const content = selecting ? JSON.stringify(selectedIds) : "The chosen character answers.";
+      if (body.stream) {
+        response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+        response.end(
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+        );
+      } else {
+        response.writeHead(200, { "content-type": "application/json", connection: "close" });
+        response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }] }));
+      }
+    });
+    await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+    const address = provider.address();
+    if (!address || typeof address === "string") throw new Error("Fixture did not bind");
+    const fixture = await createFixture(request, `http://127.0.0.1:${address.port}/v1`, ["Alice", "Bob"]);
+    const { chat, characters } = fixture;
+    const [alice, bob] = characters;
+    const stored = async () =>
+      (await (await request.get(`/api/chats/${chat.id}/messages`)).json()) as Array<{
+        role: string;
+        characterId: string | null;
+      }>;
+    try {
+      selectedIds = [bob.id];
+      const patched = await request.patch(`/api/chats/${chat.id}/metadata`, {
+        data: { groupResponseOrder: responseOrder },
+      });
+      expect(patched.ok(), await patched.text()).toBeTruthy();
+      await openChat(page, chat.id, {
+        theme: responseOrder === "manual" ? "dark" : "light",
+        appAccentColor: "#38bdf8",
+        trackerPanelEnabled: false,
+        trackerPanelOpen: false,
+      });
+      const trigger = page.getByRole("button", { name: "Trigger character response", exact: true });
+      await trigger.click();
+      const menu = page.getByText("Trigger Response", { exact: true }).locator("..");
+      const smart = menu.getByRole("button", { name: "Smart", exact: true });
+      await expect(menu.getByRole("button").first()).toHaveText("Smart");
+      await expect(smart.locator("svg.lucide-users")).toHaveCSS("color", "rgb(56, 189, 248)");
+      const bounds = await menu.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width + 1);
+      await page.screenshot({ path: info.outputPath(`smart-trigger-${responseOrder}.png`), animations: "disabled" });
+      const smartRequest = page.waitForRequest((req) => req.url().endsWith("/api/generate") && req.method() === "POST");
+      await smart.click();
+      expect((await smartRequest).postDataJSON()).toMatchObject({ chatId: chat.id, smartResponse: true });
+      await expect
+        .poll(async () => (await stored()).filter((row) => row.role === "assistant").map((row) => row.characterId))
+        .toEqual([bob.id]);
+      expect(selections).toBe(1);
+      await expect(page.locator(".mari-chat-send-btn .lucide-send")).toBeVisible();
+      await trigger.click();
+      const namedRequest = page.waitForRequest((req) => req.url().endsWith("/api/generate") && req.method() === "POST");
+      await menu.getByRole("button", { name: /Alice/u }).click();
+      const namedBody = (await namedRequest).postDataJSON();
+      expect(namedBody.forCharacterId).toBe(alice.id);
+      expect(namedBody.smartResponse).not.toBe(true);
+      await expect
+        .poll(async () => (await stored()).filter((row) => row.role === "assistant").map((row) => row.characterId))
+        .toEqual([bob.id, alice.id]);
+      expect(selections).toBe(1);
+      const savedChat = await (await request.get(`/api/chats/${chat.id}`)).json();
+      expect(extra(savedChat.metadata).groupResponseOrder).toBe(responseOrder);
+    } finally {
+      await fixture.cleanup();
+      provider.closeAllConnections();
+      await new Promise<void>((resolve) => provider.close(() => resolve()));
+    }
+  });
+}
+
+for (const presentation of ["classic", "visual-novel"] as const) {
+  test(`Roleplay whispers reveal only on screen and preserve recipient privacy (${presentation})`, async ({
+    page,
+    request,
+  }, info) => {
+    test.setTimeout(90_000);
+    let output =
+      'Before the secret. [whisper: character="Bob" text="The hidden key is beneath the blue vase."] Between the secrets. [whisper: character="Mari" text="A silver door appears in your vision."] After the secret.';
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    // openChat already stubs settings. Resolve that stub in-page so WebKit's
+    // intercepted beforeunload writes do not report false CORS page errors.
+    await page.addInitScript(() => {
+      const fetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+        if (url.origin === location.origin && url.pathname === "/api/app-settings/ui") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ value: "" }), {
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        return fetch(input, init);
+      };
+    });
+    await trackPageFetches(page);
+    const provider = createServer(async (incoming, response) => {
+      incoming.resume();
+      response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+      response.end(
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: output }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      );
+    });
+    await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+    const address = provider.address();
+    if (!address || typeof address === "string") throw new Error("Fixture did not bind");
+    const fixture = await createFixture(request, `http://127.0.0.1:${address.port}/v1`, ["Alice", "Bob", "Narrator"]);
+    const { chat, characters } = fixture;
+    const [alice, bob, narrator] = characters;
+    const patch = async (path: string, data: unknown) => {
+      const response = await request.patch(path, { data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+    };
+    const preview = async (forCharacterId: string) => {
+      const response = await request.post("/api/generate/dryRun", {
+        data: { chatId: chat.id, forCharacterId, returnPrompt: true },
+      });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return contentOf((await response.json()).prompt);
+    };
+    const reload = async () => {
+      // Let startup requests finish before tearing down WebKit's page context.
+      await waitForPageFetchesToSettle(page);
+      await page.reload();
+    };
+
+    const generate = async () => {
+      const response = await request.post("/api/generate", { data: { chatId: chat.id, forCharacterId: narrator.id } });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      expect(await response.text()).not.toContain('"type":"error"');
+      const rows = await (await request.get(`/api/chats/${chat.id}/messages`)).json();
+      return rows.at(-1);
+    };
+    try {
+      const personaResponse = await request.post("/api/characters/personas", { data: { name: "Mari" } });
+      expect(personaResponse.ok()).toBeTruthy();
+      const persona = await personaResponse.json();
+      fixture.resources.push(`/api/characters/personas/${persona.id}`);
+      await patch(`/api/chats/${chat.id}`, { personaId: persona.id });
+      await patch(`/api/chats/${chat.id}/metadata`, { roleplayDisplayStyle: presentation });
+      await openChat(page, chat.id, {
+        theme: presentation === "classic" ? "dark" : "light",
+        trackerPanelEnabled: false,
+        trackerPanelOpen: false,
+      });
+      await page.evaluate(async () => {
+        const { useChatStore } = await import("/src/stores/chat.store.ts" as string);
+        useChatStore.getState().setShouldOpenSettings(true);
+      });
+      const section = page.locator('[data-chat-settings-section="roleplay-agents"]');
+      const header = section.locator('[role="button"][aria-expanded]').first();
+      if ((await header.getAttribute("aria-expanded")) === "false") await header.click();
+      const commands = page.locator("[data-roleplay-commands]");
+      await commands.getByRole("button", { name: "Expand Commands", exact: true }).click();
+      await commands
+        .locator("label")
+        .filter({ hasText: /^Commands$/u })
+        .click();
+      const toggle = commands.getByRole("checkbox", { name: /^Whisper\b/u });
+      await expect(toggle).not.toBeChecked();
+      await toggle.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: info.outputPath("whisper-default-off.png"), animations: "disabled" });
+      await commands
+        .locator("label")
+        .filter({ hasText: /^Whisper$/u })
+        .click();
+      await commands.getByRole("combobox", { name: "Who can whisper" }).selectOption("narrator");
+      await commands.getByRole("combobox", { name: /^Narrator character/u }).selectOption(narrator.id);
+      await expect
+        .poll(async () => extra((await (await request.get(`/api/chats/${chat.id}`)).json()).metadata))
+        .toMatchObject({
+          roleplayCommandToggles: { whisper: true },
+          roleplayWhisperAudience: "narrator",
+          roleplayCommandNarratorId: narrator.id,
+        });
+      await page.getByRole("button", { name: /^Close chat settings$/iu }).click();
+      const saved = await generate();
+      await reload();
+      const bubble =
+        presentation === "visual-novel"
+          ? page.getByRole("region", { name: "Current paragraph", exact: true })
+          : page.locator(`[data-message-id="${saved.id}"]`);
+      const secret = bubble.locator("[data-roleplay-whisper]").filter({ hasText: "Whisper to Bob" });
+      const personal = bubble.locator("[data-roleplay-whisper]").filter({ hasText: "Whisper to Mari" });
+      await expect(secret).toBeVisible();
+      await expect(personal).toContainText("A silver door appears in your vision.");
+      await expect(personal.getByRole("button", { name: "Edit whisper", exact: true })).toBeVisible();
+      await expect(secret.getByRole("button", { name: "Edit whisper", exact: true })).toHaveCount(0);
+      await expect(page.locator("body")).not.toContainText("The hidden key is beneath the blue vase.");
+      await expect(secret.getByRole("button")).toHaveAccessibleDescription("Whisper to Bob");
+      await expect(secret.getByRole("button")).not.toHaveAttribute("aria-controls", /.+/u);
+      await page.screenshot({ path: info.outputPath("whisper-concealed.png"), animations: "disabled" });
+      await secret.getByRole("button", { name: "Reveal a secret", exact: true }).click();
+      await expect(secret).toContainText("The hidden key is beneath the blue vase.");
+      await expect(secret.getByRole("button", { name: "Hide the secret", exact: true })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(
+        await secret
+          .getByRole("button", { name: "Hide the secret", exact: true })
+          .evaluate((button) => document.getElementById(button.getAttribute("aria-controls") ?? "")?.textContent),
+      ).toBe("The hidden key is beneath the blue vase.");
+      const order = await secret.evaluate((element) => {
+        const range = document.createRange();
+        range.selectNodeContents(element.closest('[data-message-id], [role="region"]')!);
+        range.setEndBefore(element);
+        const before = range.toString();
+        range.selectNodeContents(element.closest('[data-message-id], [role="region"]')!);
+        range.setStartAfter(element);
+        return { before, after: range.toString() };
+      });
+      expect(order.before).toContain("Before the secret.");
+      expect(order.after).toContain("Between the secrets.");
+      const bounds = await secret.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width + 1);
+      await page.screenshot({ path: info.outputPath("whisper-revealed.png"), animations: "disabled" });
+      expect(await preview(alice.id)).not.toContain("The hidden key is beneath the blue vase.");
+      expect(await preview(alice.id)).not.toContain("A silver door appears in your vision.");
+      expect(await preview(bob.id)).toContain("The hidden key is beneath the blue vase.");
+      expect(await preview(bob.id)).not.toContain("A silver door appears in your vision.");
+      expect(await preview(narrator.id)).toContain("A silver door appears in your vision.");
+      const editor = page.locator('[data-component="ExpandedTextarea"]');
+      const whisperText = editor.getByRole("textbox", { name: "Edit whisper", exact: true });
+      await secret.getByRole("button", { name: "Edit whisper", exact: true }).click();
+      await expect(whisperText).toHaveValue("The hidden key is beneath the blue vase.");
+      await whisperText.fill("Discard this correction.");
+      await editor.getByRole("button", { name: "Cancel", exact: true }).last().click();
+      await expect(editor).toHaveCount(0);
+      await expect(secret).toContainText("The hidden key is beneath the blue vase.");
+      await secret.getByRole("button", { name: "Edit whisper", exact: true }).click();
+      await whisperText.fill("   ");
+      await expect(editor.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+      const corrected = "The corrected key is beneath the green vase.\nKeep it private.";
+      await whisperText.fill(corrected);
+      await page.route(
+        `**/api/chats/${chat.id}/messages/${saved.id}/extra*`,
+        (route) => route.fulfill({ status: 503, json: { error: "Fixture save failure" } }),
+        { times: 1 },
+      );
+      await editor.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(editor.getByRole("alert")).toHaveText("Could not save this change. Please try again.");
+      await expect(whisperText).toHaveValue(corrected);
+      await page.screenshot({ path: info.outputPath("whisper-edit-retry.png"), animations: "disabled" });
+      await editor.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(editor).toHaveCount(0);
+      await expect(secret).toContainText(corrected);
+      await expect(secret).not.toContainText("The hidden key is beneath the blue vase.");
+      await expect(personal).toContainText("A silver door appears in your vision.");
+      await secret.getByRole("button", { name: "Hide the secret", exact: true }).click();
+      await expect(secret).not.toContainText(corrected);
+      await reload();
+      await expect(secret).not.toContainText(corrected);
+      await secret.getByRole("button", { name: "Reveal a secret", exact: true }).click();
+      await expect(secret).toContainText(corrected);
+      const bobPrompt = await preview(bob.id);
+      expect(bobPrompt).toContain(corrected);
+      expect(bobPrompt).not.toContain("The hidden key is beneath the blue vase.");
+      expect(await preview(alice.id)).not.toContain(corrected);
+      expect(await preview(narrator.id)).toContain(corrected);
+      await page.screenshot({ path: info.outputPath("whisper-edited-reloaded.png"), animations: "disabled" });
+      output = '[whisper: character="Bob" text="A secret without public narration."]';
+      const only = await generate();
+      await reload();
+      const onlySecret =
+        presentation === "visual-novel"
+          ? page.getByRole("region", { name: "Current paragraph", exact: true }).locator("[data-roleplay-whisper]")
+          : page.locator(`[data-message-id="${only.id}"] [data-roleplay-whisper]`);
+      await expect(onlySecret).toBeVisible();
+      await onlySecret.getByRole("button", { name: "Reveal a secret", exact: true }).click();
+      await expect(onlySecret).toContainText("A secret without public narration.");
+      if (presentation === "visual-novel") {
+        output =
+          'First paragraph.\n\n[whisper: character="Bob" text="A secret between paragraphs."]\n\nSecond paragraph.';
+        const between = await generate();
+        // Imported or edited command records may retain an offset inside the blank-line separator.
+        const activity = extra(between.extra).roleplayCommandActivity;
+        const offset = "First paragraph.\n".length;
+        await patch(`/api/chats/${chat.id}/messages/${between.id}/extra`, {
+          roleplayCommandActivity: activity.map((item: Record<string, unknown>) => ({
+            ...item,
+            contentOffset: offset,
+            contentAnchor: between.content.slice(0, offset),
+          })),
+        });
+        // Apply the offset before reloading so this fixture needs only one navigation.
+        await reload();
+        const paragraph = page.getByRole("region", { name: "Current paragraph", exact: true });
+        const previous = page.getByRole("button", { name: "Previous paragraph", exact: true });
+        if (await previous.isEnabled()) await previous.click();
+        await expect(paragraph).toContainText("First paragraph.");
+        await expect(paragraph.locator("[data-roleplay-whisper]")).toHaveCount(1);
+        await paragraph.getByRole("button", { name: "Reveal a secret", exact: true }).click();
+        await expect(paragraph).toContainText("A secret between paragraphs.");
+        await paragraph.getByRole("button", { name: "Edit whisper", exact: true }).click();
+        await whisperText.fill("Keep this unfinished correction.");
+        await page.clock.install();
+        await page.evaluate(async () => {
+          const { useUIStore } = await import("/src/stores/ui.store.ts" as string);
+          useUIStore.getState().setRoleplayVnAutoPlayDelay(200);
+          useUIStore.getState().setRoleplayVnAutoPlay(true);
+        });
+        await page.route(
+          `**/api/chats/${chat.id}/messages/${between.id}/extra*`,
+          (route) => route.fulfill({ status: 503, json: { error: "Fixture save failure" } }),
+          { times: 1 },
+        );
+        await editor.getByRole("button", { name: "Save", exact: true }).click();
+        await expect(editor.getByRole("alert")).toHaveText("Could not save this change. Please try again.");
+        await page.clock.runFor(500);
+        await expect(whisperText).toHaveValue("Keep this unfinished correction.");
+        await expect(paragraph).toContainText("First paragraph.");
+        await editor.getByRole("button", { name: "Cancel", exact: true }).last().click();
+        await expect(editor).toHaveCount(0);
+        await page.clock.runFor(500);
+        await expect(paragraph).toContainText("Second paragraph.");
+        await expect(paragraph.locator("[data-roleplay-whisper]")).toHaveCount(0);
+        await page.evaluate(async () => {
+          const { useUIStore } = await import("/src/stores/ui.store.ts" as string);
+          useUIStore.getState().setRoleplayVnAutoPlay(false);
+        });
+      }
+      expect(errors).toEqual([]);
+    } finally {
+      await fixture.cleanup();
+      provider.closeAllConnections();
+      await new Promise<void>((resolve) => provider.close(() => resolve()));
+    }
+  });
+}
+
+test("Roleplay users send and edit private whispers and notes in Manual group chats", async ({
+  page,
+  request,
+}, info) => {
+  test.setTimeout(90_000);
+  const fixture = await createFixture(request, "http://127.0.0.1:9/v1", ["Alice", "Bob", "Narrator"]);
+  const { chat, characters } = fixture;
+  const [alice, bob, narrator] = characters;
+  const preview = async (forCharacterId: string) => {
+    const response = await request.post("/api/generate/dryRun", {
+      data: { chatId: chat.id, forCharacterId, returnPrompt: true },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    return contentOf((await response.json()).prompt);
+  };
+  try {
+    const personaResponse = await request.post("/api/characters/personas", { data: { name: "Mari" } });
+    expect(personaResponse.ok()).toBeTruthy();
+    const persona = await personaResponse.json();
+    fixture.resources.push(`/api/characters/personas/${persona.id}`);
+    expect((await request.patch(`/api/chats/${chat.id}`, { data: { personaId: persona.id } })).ok()).toBeTruthy();
+    const metadata = await request.patch(`/api/chats/${chat.id}/metadata`, {
+      data: {
+        roleplayCommandsEnabled: true,
+        roleplayCommandToggles: { whisper: true, notes: true },
+        roleplayWhisperAudience: "narrator",
+        roleplayCommandNarratorId: narrator.id,
+      },
+    });
+    expect(metadata.ok(), await metadata.text()).toBeTruthy();
+    await openChat(page, chat.id, {
+      theme: "light",
+      trackerPanelEnabled: false,
+      trackerPanelOpen: false,
+    });
+    await page
+      .locator("textarea[data-chat-composer]")
+      .fill(
+        'I greet the room. [whisper: character="Bob", text="USER_WHISPER: meet at the gate."] [notes: content="USER_NOTE: keep the map hidden."]',
+      );
+    const sent = page.waitForResponse(
+      (response) => response.url().endsWith(`/api/chats/${chat.id}/messages`) && response.request().method() === "POST",
+    );
+    await page.locator(".mari-chat-send-btn").click();
+    const sentResponse = await sent;
+    expect(sentResponse.ok(), await sentResponse.text()).toBeTruthy();
+    const saved = await sentResponse.json();
+    expect(saved.content.trim()).toBe("I greet the room.");
+    expect(extra(saved.extra).roleplayCommandActivity).toHaveLength(2);
+    const bubble = page.locator(`[data-message-id="${saved.id}"]`);
+    const whisper = bubble.locator("[data-roleplay-whisper]");
+    await expect(whisper).toContainText("USER_WHISPER: meet at the gate.");
+    await expect(whisper.getByRole("button", { name: "Reveal a secret", exact: true })).toHaveCount(0);
+    await whisper.getByRole("button", { name: "Edit whisper", exact: true }).click();
+    const editor = page.locator('[data-component="ExpandedTextarea"]');
+    await editor
+      .getByRole("textbox", { name: "Edit whisper", exact: true })
+      .fill("USER_WHISPER_EDITED: meet at the bridge.");
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(editor).toBeHidden();
+    await expect(whisper).toContainText("USER_WHISPER_EDITED: meet at the bridge.");
+    const note = bubble.locator('[data-roleplay-command="notes"]');
+    await note.getByRole("button", { name: "Mari used notes command!", exact: true }).click();
+    await expect(note).toContainText("USER_NOTE: keep the map hidden.");
+    await note.getByRole("button", { name: "Edit", exact: true }).click();
+    await editor.locator("textarea").fill("USER_NOTE_EDITED: the map is in my coat.");
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(editor).toBeHidden();
+    await expect(note).toContainText("USER_NOTE_EDITED: the map is in my coat.");
+    await page.screenshot({ path: info.outputPath("user-private-commands.png"), animations: "disabled" });
+    const bobPrompt = await preview(bob.id);
+    expect(bobPrompt).toContain("USER_WHISPER_EDITED");
+    expect(bobPrompt).not.toContain("USER_NOTE");
+    expect(await preview(alice.id)).not.toMatch(/USER_WHISPER|USER_NOTE/u);
+    const narratorPrompt = await preview(narrator.id);
+    expect(narratorPrompt).toContain("USER_WHISPER_EDITED");
+    expect(narratorPrompt).toContain("USER_NOTE_EDITED");
+    expect(narratorPrompt).not.toContain("USER_WHISPER: meet");
+    expect(narratorPrompt).not.toContain("USER_NOTE: keep");
+    await page.reload();
+    await expect(whisper).toContainText("USER_WHISPER_EDITED");
+    await note.getByRole("button", { name: "Mari used notes command!", exact: true }).click();
+    await expect(note).toContainText("USER_NOTE_EDITED");
+    await note.getByRole("button", { name: "Delete", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+    await expect.poll(() => preview(narrator.id)).not.toContain("USER_NOTE");
+    expect(await preview(bob.id)).toContain("USER_WHISPER_EDITED");
+
+    // A whisper typed while editing the narrator's reply becomes a whisper, quotes and line breaks included.
+    const narrated = await request.post(`/api/chats/${chat.id}/messages`, {
+      data: { role: "assistant", characterId: narrator.id, content: "The fog rolls in." },
+    });
+    expect(narrated.ok(), await narrated.text()).toBeTruthy();
+    const narratorBubble = page.locator(`[data-message-id="${(await narrated.json()).id}"]`);
+    await page.reload();
+    await narratorBubble.getByRole("button", { name: "Edit", exact: true }).click();
+    await narratorBubble
+      .locator("textarea[data-chat-message-editor]")
+      .fill(
+        'The fog lifts. [whisper: character="Bob" text=""NARRATOR_WHISPER," a voice breathes.\nOnly you hear it."] The bells ring.',
+      );
+    await narratorBubble.getByRole("button", { name: "Save edit", exact: true }).click();
+    await expect(narratorBubble.locator("textarea[data-chat-message-editor]")).toHaveCount(0);
+    const narratorWhisper = narratorBubble.locator("[data-roleplay-whisper]").filter({ hasText: "Whisper to Bob" });
+    await expect(narratorWhisper).toBeVisible();
+    await expect(narratorBubble).not.toContainText("[whisper:");
+    await expect(narratorBubble).toContainText("The bells ring.");
+    await narratorWhisper.getByRole("button", { name: "Reveal a secret", exact: true }).click();
+    await expect(narratorWhisper).toContainText('"NARRATOR_WHISPER," a voice breathes.');
+    expect(await preview(bob.id)).toContain("NARRATOR_WHISPER");
+    expect(await preview(alice.id)).not.toContain("NARRATOR_WHISPER");
+    const sendPrivateCommand = async (content: string) => {
+      await page.locator("textarea[data-chat-composer]").fill(content);
+      const response = page.waitForResponse(
+        (result) => result.url().endsWith(`/api/chats/${chat.id}/messages`) && result.request().method() === "POST",
+      );
+      await page.locator(".mari-chat-send-btn").click();
+      const savedResponse = await response;
+      expect(savedResponse.ok()).toBeTruthy();
+      const savedMessage = await savedResponse.json();
+      expect(savedMessage.content.trim()).toBe("");
+      return page.locator(`[data-message-id="${savedMessage.id}"]`);
+    };
+    const onlyWhisper = await sendPrivateCommand('[whisper: character="Bob", text="ONLY_WHISPER_SECRET"]');
+    await expect(onlyWhisper.locator("[data-roleplay-whisper]")).toContainText("ONLY_WHISPER_SECRET");
+    await expect(onlyWhisper.getByRole("button", { name: "Edit whisper", exact: true })).toBeVisible();
+    expect(await preview(bob.id)).toContain("ONLY_WHISPER_SECRET");
+    expect(await preview(alice.id)).not.toContain("ONLY_WHISPER_SECRET");
+    const onlyNote = await sendPrivateCommand('[notes: content="ONLY_NOTE_SECRET"]');
+    await onlyNote.getByRole("button", { name: "Mari used notes command!", exact: true }).click();
+    await expect(onlyNote.locator('[data-roleplay-command="notes"]')).toContainText("ONLY_NOTE_SECRET");
+    expect(await preview(narrator.id)).toContain("ONLY_NOTE_SECRET");
+    expect(await preview(bob.id)).not.toContain("ONLY_NOTE_SECRET");
+    const malformed = await sendPrivateCommand('[whisper: character="Bob", text="UNFINISHED_PRIVATE_SECRET');
+    await malformed.getByRole("button", { name: "Mari used whisper command!", exact: true }).click();
+    await expect(malformed).toContainText(
+      "This private command could not be read. Your original text is preserved below.",
+    );
+    await expect(malformed).toContainText("UNFINISHED_PRIVATE_SECRET");
+    for (const character of characters) expect(await preview(character.id)).not.toContain("UNFINISHED_PRIVATE_SECRET");
+    for (const invalid of [
+      { enabled: true, target: "Unknown", reason: "Whispers need one unambiguous character in this chat." },
+      { enabled: false, target: "Bob", reason: "This command is disabled in this chat." },
+    ]) {
+      const changed = await request.patch(`/api/chats/${chat.id}/metadata`, {
+        data: { roleplayCommandsEnabled: invalid.enabled },
+      });
+      expect(changed.ok()).toBeTruthy();
+      const rejected = await sendPrivateCommand(`[whisper: character="${invalid.target}", text="REJECTED_SECRET"]`);
+      const failedWhisper = rejected.locator('[data-roleplay-command="whisper"]');
+      await failedWhisper.getByRole("button", { name: "Mari used whisper command!", exact: true }).click();
+      await expect(failedWhisper).toContainText(invalid.reason);
+      await expect(failedWhisper).toContainText("REJECTED_SECRET");
+      for (const character of characters) expect(await preview(character.id)).not.toContain("REJECTED_SECRET");
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Roleplay continue streams inside the last reply while an empty send creates a new message", async ({
+  page,
+  request,
+}, info) => {
+  test.setTimeout(90_000);
+  let finishResponse: (() => void) | undefined;
+  let turn = 0;
+  const provider = createServer(async (incoming, response) => {
+    incoming.resume();
+    if (incoming.method !== "POST") {
+      response.writeHead(404).end();
+      return;
+    }
+    turn++;
+    response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+    response.write(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: `Continuation ${turn}.` }, finish_reason: null }] })}\n\n`,
+    );
+    finishResponse = () =>
+      response.end(
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      );
+  });
+  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  const address = provider.address();
+  if (!address || typeof address === "string") throw new Error("Fixture did not bind");
+  const fixture = await createFixture(request, `http://127.0.0.1:${address.port}/v1`, ["Alice"]);
+  try {
+    await request.patch(`/api/chats/${fixture.chat.id}/metadata`, { data: { groupResponseOrder: "sequential" } });
+    const otherResponse = await request.post("/api/chats", { data: { name: "Other scene", mode: "roleplay" } });
+    expect(otherResponse.ok(), await otherResponse.text()).toBeTruthy();
+    const otherChat = await otherResponse.json();
+    fixture.resources.unshift(`/api/chats/${otherChat.id}`);
+    const seeded = await request.post(`/api/chats/${fixture.chat.id}/messages`, {
+      data: { role: "assistant", characterId: fixture.characters[0].id, content: "The original reply." },
+    });
+    expect(seeded.ok(), await seeded.text()).toBeTruthy();
+    const original = await seeded.json();
+    const rows = async () => (await (await request.get(`/api/chats/${fixture.chat.id}/messages`)).json()) as any[];
+    await openChat(page, fixture.chat.id, { enterToSendRP: true, continueAddsNewline: true });
+    const bubble = page.locator(`[data-message-id="${original.id}"]`);
+    for (const command of ["/continue", "/cont", ""]) {
+      const before = await rows();
+      if (command === "/cont")
+        await page.evaluate(async () => {
+          const { useUIStore } = await import("/src/stores/ui.store.ts" as string);
+          useUIStore.setState({ continueAddsNewline: false });
+        });
+      await page.locator("textarea[data-chat-composer]").fill(command);
+      const outgoing = page.waitForRequest(
+        (request) => request.url().endsWith("/api/generate") && request.method() === "POST",
+      );
+      await page.locator(".mari-chat-send-btn").click();
+      const payload = (await outgoing).postDataJSON();
+      expect(payload.continueMessageId ?? null).toBe(command ? original.id : null);
+      await expect.poll(() => Boolean(finishResponse)).toBe(true);
+      await expect(page.locator("body")).toContainText(`Continuation ${turn}.`, { timeout: 20_000 });
+      if (command) {
+        await page.screenshot({ path: info.outputPath(`continue-live-${turn}.png`), animations: "disabled" });
+        await expect(bubble).toContainText("The original reply.");
+        await expect(bubble).toContainText(`Continuation ${turn}.`);
+        await expect(page.locator("[data-message-id]")).toHaveCount(before.length);
+        if (command === "/continue") {
+          const switchChat = (id: string) =>
+            page.evaluate(async (chatId) => {
+              const { useChatStore } = await import("/src/stores/chat.store.ts" as string);
+              useChatStore.getState().setActiveChatId(chatId);
+            }, id);
+          await switchChat(otherChat.id);
+          await expect(bubble).toHaveCount(0);
+          await switchChat(fixture.chat.id);
+          await expect(bubble).toContainText("The original reply.");
+          await expect(bubble).toContainText(`Continuation ${turn}.`);
+        }
+      } else {
+        await expect(bubble).not.toContainText(`Continuation ${turn}.`);
+      }
+      await page.screenshot({
+        path: info.outputPath(command ? `continue-${turn}.png` : "empty-send.png"),
+        animations: "disabled",
+      });
+      finishResponse!();
+      finishResponse = undefined;
+      await expect
+        .poll(async () => (await rows()).map((row) => row.content).join("\n"))
+        .toContain(`Continuation ${turn}.`);
+      await expect
+        .poll(() =>
+          page.evaluate(async () => {
+            const { useChatStore } = await import("/src/stores/chat.store.ts" as string);
+            return useChatStore.getState().isStreaming;
+          }),
+        )
+        .toBe(false);
+      const after = await rows();
+      expect(after).toHaveLength(before.length + (command ? 0 : 1));
+      expect(after.find((row) => row.id === original.id).content).toBe(
+        command
+          ? `${before.find((row) => row.id === original.id).content}${command === "/continue" ? "\n\n" : ""}Continuation ${turn}.`
+          : before.find((row) => row.id === original.id).content,
+      );
+    }
+    await page.reload();
+    await expect(bubble).toContainText("The original reply.");
+    await expect(bubble).toContainText("Continuation 2.");
+    await expect(bubble).not.toContainText("Continuation 3.");
+    await expect(page.locator("[data-message-id]")).toHaveCount(3);
+
+    // Replay the editor's full-message SSE contract without invoking a downloadable agent.
+    const latest = (await rows()).at(-1)!;
+    const rewritten = `${latest.content} Edited continuation.`;
+    await page.route(
+      "**/api/generate",
+      async (route) => {
+        expect(route.request().postDataJSON().continueMessageId).toBe(latest.id);
+        const saved = await request.patch(`/api/chats/${fixture.chat.id}/messages/${latest.id}`, {
+          data: { content: rewritten },
+        });
+        expect(saved.ok(), await saved.text()).toBeTruthy();
+        await route.fulfill({
+          contentType: "text/event-stream",
+          body: [
+            { type: "token", data: "Draft continuation." },
+            {
+              type: "message_saved",
+              data: {
+                ...latest,
+                content: `${latest.content} Draft continuation.`,
+                extra: { postProcessingPending: { agentType: "text-rewrite" } },
+              },
+            },
+            { type: "text_rewrite", data: { editedText: rewritten, agentType: "text-rewrite" } },
+            { type: "done", data: {} },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        });
+      },
+      { times: 1 },
+    );
+    await page.locator("textarea[data-chat-composer]").fill("/continue");
+    await page.locator(".mari-chat-send-btn").click();
+    const editedBubble = page.locator(`[data-message-id="${latest.id}"]`);
+    await expect(editedBubble).toContainText(rewritten);
+    await expect(editedBubble).not.toContainText("Draft continuation.");
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const { useChatStore } = await import("/src/stores/chat.store.ts" as string);
+          return useChatStore.getState().continuationStreams.size;
+        }),
+      )
+      .toBe(0);
+    expect((await editedBubble.innerText()).split(latest.content)).toHaveLength(2);
+    expect(await rows()).toHaveLength(3);
+  } finally {
+    finishResponse?.();
+    await request.post("/api/generate/abort", { data: { chatId: fixture.chat.id } });
+    await fixture.cleanup();
+    provider.closeAllConnections();
+    await new Promise<void>((resolve) => provider.close(() => resolve()));
+  }
+});
+
 test("Roleplay command settings stay interactive during slow saves and preserve rapid changes", async ({
   page,
   request,
@@ -630,9 +1303,15 @@ test("Roleplay commands default off, scope private notes, and follow swipes and 
     expect(contentOf(requests.at(-1))).toContain("<commands>");
     expect(noteMessage.content).not.toContain("ALICE_SECRET");
     expect(extra(noteMessage.extra).roleplayCommandActivity).toHaveLength(3);
+    const documentStyle = extra(noteMessage.extra).roleplayCommandActivity[2].documentStyle;
+    expect([0, 1, 2]).toContain(documentStyle);
     await page.reload();
     const document = page.locator("[data-roleplay-command-results]");
     await expect(document.getByRole("article", { name: "Invitation", exact: true })).toContainText("Meet at dawn.");
+    await expect(document.getByRole("article", { name: "Invitation", exact: true })).toHaveAttribute(
+      "data-roleplay-document-style",
+      String(documentStyle),
+    );
     await document.getByRole("button", { name: "Alice used document command!", exact: true }).click();
     await expect(document).toContainText("Meet at dawn.");
     await testInfo.attach(`roleplay-document-${testInfo.project.name}.png`, {
@@ -936,18 +1615,30 @@ test("Roleplay sound commands reuse cached audio and play the attachment URL", a
   }
 });
 
-for (const native of [true, false]) {
-  test(`Roleplay resolves a ${native ? "native" : "textual"} roll before continuing the streamed reply`, async ({
+for (const [native, targetKind, modifier, dc] of [
+  [true, "character", undefined, undefined],
+  [false, "character", undefined, undefined],
+  [true, "persona", 2, 7],
+  [false, "persona-character", -6, 10],
+] as const) {
+  test(`Roleplay resolves a ${native ? "native" : "textual"} roll for ${targetKind} before continuing the streamed reply`, async ({
     page,
     request,
   }, testInfo) => {
+    const prefix = native ? "<strong>I attempt the lock." : "**I attempt the lock.";
+    const suffix = native ? "</strong>" : "**";
     let finishFollowup: (() => void) | undefined;
     let total = 0;
     let requestCount = 0;
     let firstStreamClosed = false;
     let firstRequestTools: string[] = [];
+    let rollTargets: string[] = [];
+    let rollProperties: Record<string, any> = {};
+    let resolved: Record<string, any> = {};
     let resultMessageFound = false;
     let followupPrompt = "";
+    const roller = targetKind === "character" ? "Alice" : "Narrator";
+    const target = targetKind === "character" ? "Alice" : "Mari";
     const provider = createServer(async (incoming, response) => {
       if (incoming.method !== "POST") {
         incoming.resume();
@@ -963,7 +1654,9 @@ for (const native of [true, false]) {
         response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`);
       if (requestCount === 1) {
         firstRequestTools = (body.tools ?? []).map((tool: any) => tool.function?.name);
-        write({ content: "I attempt the lock." });
+        rollProperties = body.tools?.[0]?.function?.parameters?.properties ?? {};
+        rollTargets = rollProperties.character?.enum ?? [];
+        write({ content: prefix });
         if (native) {
           write(
             {
@@ -974,12 +1667,21 @@ for (const native of [true, false]) {
                   type: "function",
                   function: {
                     name: "roll_dice",
-                    arguments: JSON.stringify({ notation: "1d6+3", character: "Alice", attribute: "Strength" }),
+                    arguments: JSON.stringify({
+                      notation: "1d6+3",
+                      character: target,
+                      attribute: "Strength",
+                      modifier,
+                      dc,
+                    }),
                   },
                 },
               ],
             },
             "tool_calls",
+          );
+          response.write(
+            `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 44000, completion_tokens: 500, total_tokens: 44500, prompt_tokens_details: { cached_tokens: 40000 } } })}\n\n`,
           );
           response.end("data: [DONE]\n\n");
         } else {
@@ -990,7 +1692,7 @@ for (const native of [true, false]) {
           });
           write({ content: " [ro" });
           write({
-            content: 'll: character="Alice" notation="1d6+3" attribute="Strength" reason="Need four"] INVENTED_OUTCOME',
+            content: `ll: character="${target}" notation="1d6+3" attribute="Strength" reason="Try the lock"${modifier !== undefined ? ` modifier="${modifier}" dc="${dc}"` : ""}] INVENTED_OUTCOME`,
           });
         }
       } else {
@@ -1007,13 +1709,17 @@ for (const native of [true, false]) {
           const result = native
             ? JSON.parse(resultMessage?.content ?? "{}")
             : JSON.parse(resultMessage?.content?.split("\n")[1] ?? "{}");
+          resolved = result;
           total = result.total ?? 0;
         } catch {
           total = 0; // Assert malformed results in the test body so its cleanup can finish the response.
         }
         response.flushHeaders();
         finishFollowup = () => {
-          write({ content: ` The engine rolled ${total}; the lock opens.` }, "stop");
+          write({ content: ` The engine rolled ${total}; the attempt is resolved.${suffix}` }, "stop");
+          response.write(
+            `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 45000, completion_tokens: 1500, total_tokens: 46500, prompt_tokens_details: { cached_tokens: 40000 } } })}\n\n`,
+          );
           response.end("data: [DONE]\n\n");
         };
       }
@@ -1021,32 +1727,51 @@ for (const native of [true, false]) {
     await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
     const address = provider.address();
     if (!address || typeof address === "string") throw new Error("Fixture did not bind");
-    const fixture = await createFixture(request, `http://127.0.0.1:${address.port}/v1`, ["Alice"]);
+    const fixture = await createFixture(request, `http://127.0.0.1:${address.port}/v1`, [roller]);
     try {
-      const stats = await request.patch(`/api/characters/${fixture.characters[0].id}`, {
-        data: {
-          data: {
-            name: "Alice",
-            extensions: {
-              rpgStats: { enabled: true, attributes: [{ name: "STR", value: 12 }], hp: { value: 10, max: 10 } },
-            },
-          },
-        },
-      });
+      const rpgStats = { enabled: true, attributes: [{ name: "STR", value: 12 }], hp: { value: 10, max: 10 } };
+      const characterData = { name: target, extensions: { rpgStats } };
+      const path = targetKind === "persona" ? "/api/characters/personas" : "/api/characters";
+      const stats =
+        targetKind === "character"
+          ? await request.patch(`${path}/${fixture.characters[0].id}`, { data: { data: characterData } })
+          : await request.post(path, {
+              data:
+                targetKind === "persona"
+                  ? { name: target, personaStats: JSON.stringify({ enabled: true, bars: [], rpgStats }) }
+                  : { data: characterData },
+            });
       expect(stats.ok(), await stats.text()).toBeTruthy();
+      if (targetKind !== "character") {
+        const identity = await stats.json();
+        fixture.resources.push(`${path}/${identity.id}`);
+        const selected = await request.patch(`/api/chats/${fixture.chat.id}`, {
+          data: { [targetKind === "persona" ? "personaId" : "personaCharacterId"]: identity.id },
+        });
+        expect(selected.ok(), await selected.text()).toBeTruthy();
+      }
       const metadataResponse = await request.patch(`/api/chats/${fixture.chat.id}/metadata`, {
         data: { roleplayCommandsEnabled: true, roleplayCommandToggles: { roll: true } },
       });
       expect(metadataResponse.ok(), await metadataResponse.text()).toBeTruthy();
-      await openChat(page, fixture.chat.id);
+      await openChat(page, fixture.chat.id, {
+        theme: native && targetKind === "character" ? "dark" : "light",
+        appAccentColor: "#3b9fe8",
+        showTokenUsage: true,
+      });
       await page.locator("textarea[data-chat-composer]").fill("Try the lock.");
       await page.locator(".mari-chat-send-btn").click();
       await expect.poll(() => Boolean(finishFollowup)).toBe(true);
       expect(firstRequestTools).toEqual(["roll_dice"]);
+      expect(rollTargets).toContain(target);
+      expect(rollProperties.modifier.type).toBe("integer");
+      expect(rollProperties.dc.type).toBe("integer");
+      expect(resolved.dc).toBe(dc);
+      expect(resolved.success).toBe(dc !== undefined ? total >= dc : undefined);
       expect(resultMessageFound).toBe(true);
       expect(followupPrompt).not.toContain("INVENTED_OUTCOME");
-      expect(total).toBeGreaterThanOrEqual(5);
-      expect(total).toBeLessThanOrEqual(10);
+      expect(total).toBeGreaterThanOrEqual(5 + (modifier ?? 0));
+      expect(total).toBeLessThanOrEqual(10 + (modifier ?? 0));
       if (!native) await expect.poll(() => firstStreamClosed).toBe(true);
       await expect(page.getByText(`1d6+3: ${total}`, { exact: true })).not.toBeVisible();
       // WebKit can buffer these tiny SSE frames until the 15-second keepalive
@@ -1060,7 +1785,7 @@ for (const native of [true, false]) {
             }),
           { timeout: 20_000 },
         )
-        .toEqual({ streaming: true, text: native ? "I attempt the lock." : "I attempt the lock. " });
+        .toEqual({ streaming: true, text: native ? prefix : prefix + " " });
       await expect(page.locator("body")).not.toContainText("INVENTED_OUTCOME");
       await testInfo.attach(`roleplay-roll-${native}-${testInfo.project.name}.png`, {
         body: await page.screenshot({ animations: "disabled", path: testInfo.outputPath("roleplay-roll.png") }),
@@ -1068,7 +1793,9 @@ for (const native of [true, false]) {
       });
       finishFollowup!();
       finishFollowup = undefined;
-      await expect(page.getByText(new RegExp(`The engine rolled ${total}; the lock opens\\.`, "u"))).toBeVisible();
+      await expect(
+        page.getByText(new RegExp(`The engine rolled ${total}; the attempt is resolved\\.`, "u")),
+      ).toBeVisible();
       const messages = await (await request.get(`/api/chats/${fixture.chat.id}/messages`)).json();
       const saved = messages.filter((message: any) => message.role === "assistant").at(-1);
       expect(saved.content).not.toContain("[roll");
@@ -1077,12 +1804,106 @@ for (const native of [true, false]) {
       const activity = extra(saved.extra).roleplayCommandActivity;
       expect(activity).toHaveLength(1);
       expect(JSON.parse(activity[0].result).total).toBe(total);
-      expect(JSON.parse(activity[0].result).modifier).toBe(4);
+      expect(JSON.parse(activity[0].result).modifier).toBe(4 + (modifier ?? 0));
+      expect(JSON.parse(activity[0].result).dc).toBe(dc);
+      expect(activity[0].command.modifier).toBe(modifier);
+      expect(activity[0].command.dc).toBe(dc);
+      expect(activity[0].contentOffset).toBe(prefix.length);
+      const inlineDice = page.locator(`[data-message-id="${saved.id}"] [data-roleplay-inline-roll]`);
+      await expect(inlineDice).toHaveCount(1);
+      if (dc !== undefined) await expect(inlineDice.locator(".dice-roll-header")).toContainText(`DC ${dc}`);
+      else await expect(inlineDice.locator(".dice-roll-header")).not.toContainText("DC");
+      await expect(inlineDice.locator(".dice-roll-total")).toContainText(String(total));
+      const formatted = page
+        .locator(`[data-message-id="${saved.id}"] strong`)
+        .filter({ has: page.locator("[data-roleplay-inline-roll]") });
+      await expect(formatted).toContainText("I attempt the lock.");
+      await expect(formatted).toContainText("the attempt is resolved.");
+      await expect(inlineDice.locator(".dice-roll-card")).toHaveClass(/is-settled/u);
+      await page.screenshot({ path: testInfo.outputPath("roleplay-inline-dice.png"), animations: "disabled" });
+      const accent = await inlineDice.evaluate((element) => {
+        const probe = document.createElement("span");
+        probe.style.color = "var(--primary)";
+        element.append(probe);
+        const color = getComputedStyle(probe).color;
+        probe.remove();
+        return color;
+      });
+      await expect(inlineDice.locator(".dice-roll-breakdown")).toHaveCSS("color", accent);
+      await expect(inlineDice.locator(".dice-roll-total")).toHaveCSS("color", accent);
+      if (native) {
+        expect(extra(saved.extra).generationInfo).toMatchObject({
+          requestCount: 2,
+          tokensPrompt: 89000,
+          tokensCompletion: 2000,
+          tokensLastRequestInput: 45000,
+        });
+        const bubble = page.locator(`[data-message-id="${saved.id}"]`);
+        await expect(bubble.locator('[title*="2 requests: 89000→2000 tok total"]')).toBeVisible();
+        if (testInfo.project.name.includes("mobile"))
+          await bubble.getByText("I attempt the lock.", { exact: false }).tap();
+        else await bubble.hover();
+        await bubble.getByRole("button", { name: "Peek prompt", exact: true }).click();
+        await expect(page.getByText("89,000 reported prompt tokens across 2 requests", { exact: false })).toBeVisible();
+        await expect(
+          page.getByText("Last request input: 45,000 tokens (including cached input, excluding output).", {
+            exact: true,
+          }),
+        ).toBeVisible();
+        await expect(page.getByText("Tool follow-ups send the conversation again.", { exact: false })).toBeVisible();
+        await page.screenshot({ path: testInfo.outputPath("roleplay-tool-usage.png"), animations: "disabled" });
+        await page.getByRole("button", { name: "Close assembled prompt", exact: true }).click();
+      }
+      const order = await inlineDice.evaluate((element) => {
+        const range = document.createRange();
+        range.selectNodeContents(element.closest("strong")!);
+        range.setEndBefore(element);
+        const before = range.toString();
+        range.selectNodeContents(element.closest("strong")!);
+        range.setStartAfter(element);
+        return { before, after: range.toString() };
+      });
+      expect(order.before).toContain("I attempt the lock.");
+      expect(order.after).toContain("the attempt is resolved.");
+      const diceBounds = await inlineDice.boundingBox();
+      expect(diceBounds!.x).toBeGreaterThanOrEqual(0);
+      expect(diceBounds!.x + diceBounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width + 1);
       const notice = page.locator('[data-roleplay-command="roll"]');
       await expect(notice).not.toContainText("1d6+3");
-      await notice.getByRole("button", { name: "Alice used roll command!", exact: true }).click();
+      await notice.getByRole("button", { name: `${roller} used roll command!`, exact: true }).click();
       await expect(notice).toContainText("1d6+3");
       await expect(notice).toContainText(String(total));
+      expect(requestCount).toBe(2);
+      await page.reload();
+      await expect(inlineDice).toHaveCount(1);
+      if (dc !== undefined) await expect(inlineDice.locator(".dice-roll-header")).toContainText(`DC ${dc}`);
+      else await expect(inlineDice.locator(".dice-roll-header")).not.toContainText("DC");
+      await expect(inlineDice.locator(".dice-roll-card")).toHaveClass(/is-settled/u);
+      expect(
+        (
+          await request.patch(`/api/chats/${fixture.chat.id}/metadata`, {
+            data: { translationDisplayOnly: true },
+          })
+        ).ok(),
+      ).toBeTruthy();
+      expect(
+        (
+          await request.patch(`/api/chats/${fixture.chat.id}/messages/${saved.id}/extra`, {
+            data: {
+              translation: "Próbuję otworzyć zamek. Wynik rzutu rozstrzyga próbę.",
+              translationSource: saved.content,
+            },
+          })
+        ).ok(),
+      ).toBeTruthy();
+      await page.reload();
+      await expect(page.locator(`[data-message-id="${saved.id}"]`)).toContainText("Próbuję otworzyć zamek.");
+      await expect(page.locator(`[data-message-id="${saved.id}"]`)).not.toContainText("I attempt the lock.");
+      await expect(inlineDice).toHaveCount(1);
+      if (dc !== undefined) await expect(inlineDice.locator(".dice-roll-header")).toContainText(`DC ${dc}`);
+      else await expect(inlineDice.locator(".dice-roll-header")).not.toContainText("DC");
+      await expect(inlineDice.locator(".dice-roll-total")).toContainText(String(total));
+      await expect(inlineDice.locator(".dice-roll-card")).toHaveClass(/is-settled/u);
       expect(requestCount).toBe(2);
     } finally {
       finishFollowup?.();
@@ -1552,15 +2373,18 @@ for (const theme of ["dark", "light"] as const) {
     const kinds = ["note", "letter", "journal", "report", "poster", "terminal", "unknown"];
     const content = "Dear traveller,\n\nThe archive opens at dawn. Bring the brass key.\n\n— The keeper";
     const literalHtml = '<img src=x onerror="window.documentCommandExecuted=true"><style>body{display:none}</style>';
-    const activity = kinds.map((kind) => ({
-      command: {
-        type: "document",
-        documentType: kind,
-        title: `Archive ${kind}`,
-        content: kind === "terminal" ? literalHtml + "\n" + "0123456789".repeat(50) : content,
-      },
-      raw: `[document: kind="${kind}" title="Archive ${kind}" content="Original text"]`,
-    }));
+    const activity = [0, 1, 2].flatMap((style) =>
+      kinds.map((kind) => ({
+        documentStyle: style,
+        command: {
+          type: "document",
+          documentType: kind,
+          title: `Archive ${kind} (${style})`,
+          content: kind === "terminal" ? literalHtml + "\n" + "0123456789".repeat(50) : content,
+        },
+        raw: `[document: kind="${kind}" title="Archive ${kind} (${style})" content="Original text"]`,
+      })),
+    );
     try {
       const legacy = await request.post(`/api/chats/${fixture.chat.id}/messages`, {
         data: {
@@ -1592,16 +2416,27 @@ for (const theme of ["dark", "light"] as const) {
       await expect(page.getByRole("article", { name: "Saved letter", exact: true })).toContainText(
         "A letter from an older save.",
       );
-      for (const kind of kinds) {
-        const article = page.getByRole("article", { name: `Archive ${kind}`, exact: true });
+      for (const item of activity) {
+        const kind = item.command.documentType;
+        const article = page.getByRole("article", { name: item.command.title, exact: true });
+        await expect(article).toHaveAttribute("data-roleplay-document-style", String(item.documentStyle));
         await expect(article).toHaveCount(1);
         await expect(article).toHaveAttribute("data-roleplay-document-kind", kind === "unknown" ? "document" : kind);
         expect(await article.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
       }
-      const terminal = page.getByRole("article", { name: "Archive terminal", exact: true });
+      for (const style of [0, 1, 2]) {
+        for (const kind of ["letter", "poster", "terminal"]) {
+          const article = page.getByRole("article", { name: `Archive ${kind} (${style})`, exact: true });
+          await article.screenshot({
+            path: info.outputPath(`document-${kind}-${style}-${theme}.png`),
+            animations: "disabled",
+          });
+        }
+      }
+      const terminal = page.getByRole("article", { name: "Archive terminal (0)", exact: true });
       await expect(terminal).toContainText(literalHtml);
       await expect(terminal.locator("img, style, script")).toHaveCount(0);
-      const letter = page.getByRole("article", { name: "Archive letter", exact: true });
+      const letter = page.getByRole("article", { name: "Archive letter (0)", exact: true });
       await expect(letter.locator(".mari-roleplay-document-content")).toHaveCSS("white-space", "pre-wrap");
       await letter.scrollIntoViewIfNeeded();
       await page.screenshot({ path: info.outputPath(`document-classic-${theme}.png`), animations: "disabled" });
@@ -1627,11 +2462,11 @@ for (const theme of ["dark", "light"] as const) {
       ).toBeTruthy();
       await page.reload();
       const paragraph = page.getByRole("region", { name: "Current paragraph" });
-      await expect(paragraph.getByRole("article")).toHaveCount(kinds.length);
-      await expect(paragraph.getByRole("article", { name: "Archive letter", exact: true })).toContainText(
+      await expect(paragraph.getByRole("article")).toHaveCount(activity.length);
+      await expect(paragraph.getByRole("article", { name: "Archive letter (0)", exact: true })).toContainText(
         "Bring the silver key.",
       );
-      await paragraph.getByRole("article", { name: "Archive letter", exact: true }).scrollIntoViewIfNeeded();
+      await paragraph.getByRole("article", { name: "Archive letter (0)", exact: true }).scrollIntoViewIfNeeded();
       await page.screenshot({ path: info.outputPath(`document-vn-${theme}.png`), animations: "disabled" });
       await expect(page.locator(".mari-chat-input textarea")).toBeInViewport();
       await notice.getByRole("button", { name: "Alice used document command!", exact: true }).click();
@@ -1642,8 +2477,8 @@ for (const theme of ["dark", "light"] as const) {
       await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
       expect((await saved).ok()).toBeTruthy();
       await page.reload();
-      await expect(paragraph.getByRole("article")).toHaveCount(kinds.length - 1);
-      await expect(paragraph.getByRole("article", { name: "Archive letter", exact: true })).toHaveCount(0);
+      await expect(paragraph.getByRole("article")).toHaveCount(activity.length - 1);
+      await expect(paragraph.getByRole("article", { name: "Archive letter (0)", exact: true })).toHaveCount(0);
     } finally {
       await fixture.cleanup();
     }

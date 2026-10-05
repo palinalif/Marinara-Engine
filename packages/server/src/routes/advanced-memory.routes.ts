@@ -7,9 +7,15 @@ import { logger } from "../lib/logger.js";
 const operationSchema = z.object({
   settings: advancedMemorySettingsSchema.partial().optional(),
   debugMode: z.boolean().optional(),
+  sceneId: z.string().min(1).optional(),
 });
 const recordPatchSchema = z
-  .object({ content: z.string().min(1).max(500_000).optional(), enabled: z.boolean().optional() })
+  .object({
+    content: z.string().min(1).max(500_000).optional(),
+    timeline: z.string().max(2000).optional(),
+    enabled: z.boolean().optional(),
+    audienceCharacterIds: z.array(z.string().min(1)).max(100).optional(),
+  })
   .strict();
 
 const validationErrors = new Set([
@@ -17,8 +23,18 @@ const validationErrors = new Set([
   "Minimum recalled messages cannot exceed the maximum",
   "The continuity summary budget must be smaller than the total context limit",
   "Select a narrator from this chat's characters",
+  "Select a saved Decision connection for Advanced Memory",
   "A character knowledge range points to a message that no longer exists",
   "Memory text must contain between 1 and 500000 characters",
+  "Memory update must include content, timeframe, enabled or audience",
+  "Memory timeframe must contain at most 2000 characters",
+  "Only saved scenes have editable timeframes",
+  "Only saved scenes in Individual mode have editable character access",
+  "Choose characters from this chat; the narrator already has access",
+  "Scene sources are hidden from a selected character or precede their knowledge start",
+  "This scene's message range is no longer available to its selected characters. Review character access or exclude the scene from recall",
+  "Another summary for this scene already has that audience; edit or delete it first",
+  "Only a saved summary can be deleted",
   "Invalid Advanced Memory export",
 ]);
 
@@ -36,7 +52,8 @@ async function withMemoryDomainErrors<T>(reply: FastifyReply, operation: () => P
 }
 
 export async function advancedMemoryRoutes(app: FastifyInstance) {
-  const service = createAdvancedMemoryService(app.db);
+  // The inspector displays summaries; source excerpts are fetched on demand.
+  const service = createAdvancedMemoryService(app.db, { includeExcerptsInStatus: false });
   const prefix = "/:id/advanced-memory";
   app.get<{ Params: { id: string } }>(prefix, async (req) => service.status(req.params.id));
   app.delete<{ Params: { id: string } }>(prefix, async (req, reply) =>
@@ -61,6 +78,7 @@ export async function advancedMemoryRoutes(app: FastifyInstance) {
       const completed = service
         .initialize(req.params.id, {
           debugMode: options.debugMode,
+          sceneId: options.sceneId,
           blocking: true,
           onProgress: acknowledgeStart,
         })
@@ -74,9 +92,14 @@ export async function advancedMemoryRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>(`${prefix}/reindex`, async (req, reply) =>
     withMemoryDomainErrors(reply, async () => {
       const options = operationSchema.parse(req.body ?? {});
-      void service
-        .reindex(req.params.id, { debugMode: options.debugMode, blocking: true })
+      let acknowledgeStart: () => void = () => {};
+      const started = new Promise<void>((resolve) => {
+        acknowledgeStart = resolve;
+      });
+      const completed = service
+        .reindex(req.params.id, { debugMode: options.debugMode, blocking: true, onProgress: acknowledgeStart })
         .catch((error) => logger.warn(error, "[advanced-memory] Reindex interrupted"));
+      await Promise.race([started, completed]);
       return reply.status(202).send(await service.status(req.params.id));
     }),
   );
@@ -87,6 +110,9 @@ export async function advancedMemoryRoutes(app: FastifyInstance) {
   );
   app.get<{ Params: { id: string; recordId: string } }>(`${prefix}/records/:recordId/sources`, async (req, reply) =>
     withMemoryDomainErrors(reply, () => service.getSources(req.params.id, req.params.recordId)),
+  );
+  app.delete<{ Params: { id: string; recordId: string } }>(`${prefix}/records/:recordId`, async (req, reply) =>
+    withMemoryDomainErrors(reply, () => service.deleteRecord(req.params.id, req.params.recordId)),
   );
   app.get<{ Params: { id: string } }>(`${prefix}/export`, async (req, reply) =>
     reply

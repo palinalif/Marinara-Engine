@@ -92,7 +92,9 @@ child.stderr.on("data", (chunk) => {
   output += chunk;
 });
 const exited = new Promise<number | null>((done) => child.once("exit", done));
-const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+// Match the restart fixture's cold native-CI boot allowance without relaxing shutdown checks.
+const startupTimeout = 60_000;
+let deadline = setTimeout(() => child.kill("SIGKILL"), startupTimeout);
 let serverPid: number | undefined;
 let socket: ReturnType<typeof createConnection> | undefined;
 async function waitFor(predicate: () => boolean, timeout = 8_000) {
@@ -102,7 +104,9 @@ async function waitFor(predicate: () => boolean, timeout = 8_000) {
   assert.ok(predicate(), output);
 }
 try {
-  await waitFor(() => output.includes("Marinara Engine server listening"));
+  await waitFor(() => output.includes("Marinara Engine server listening"), startupTimeout);
+  clearTimeout(deadline);
+  deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
   const readyLine = output.split("\n").find((line) => line.includes("Marinara Engine server listening"))!;
   serverPid = JSON.parse(readyLine).pid;
   assert.ok(serverPid);

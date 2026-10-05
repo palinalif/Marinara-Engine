@@ -19,6 +19,8 @@ dist/
 
 # Environment (may contain encryption keys)
 .env
+.env.timeouts.json
+.env.timeouts.json.*.tmp
 .env.local
 .env.production
 
@@ -71,3 +73,5 @@ docker-compose.override.yaml
 
 # MCP
 .playwright-mcp
+# Dev MCP local state (journal, logs, lock)
+.dev-mcp/

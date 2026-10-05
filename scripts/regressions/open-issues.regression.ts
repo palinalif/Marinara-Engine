@@ -189,10 +189,7 @@ import {
 import { persistGeneratedImageToEntityGalleries } from "../../packages/server/src/services/image/generated-image-entity-gallery.js";
 import { withGalleryFileLifecycleLock } from "../../packages/server/src/services/image/gallery-file-lifecycle.js";
 import { runRetrySetupPhase } from "../../packages/server/src/routes/generate/retry-agents-route.js";
-import {
-  parseImageGenerationUserSettings,
-  resolveIllustratorImageSize,
-} from "../../packages/server/src/services/image/image-generation-settings.js";
+import { resolveIllustratorImageSize } from "../../packages/server/src/services/image/image-generation-settings.js";
 import { generateIllustratorImageVariants } from "../../packages/server/src/services/image/illustrator-image-variants.js";
 import { fetchBotBrowserJson } from "../../packages/server/src/services/bot-browser/fetch-json.js";
 import { isAllowedResponseContentType, validateOutboundUrl } from "../../packages/server/src/utils/security.js";
@@ -289,6 +286,7 @@ import {
   buildReferencedPersonaContext,
   extractPersonaReferenceIds,
   MAX_REFERENCED_CHARACTERS,
+  mergeGeneratedChatMacroVariables,
   normalizeChatMacroVariables,
   setLorebookEntryCounts,
 } from "../../packages/server/src/services/prompt/macro-context.js";
@@ -303,7 +301,10 @@ import {
   buildInitialAgentAddSetupState,
 } from "../../packages/client/src/components/chat/AgentAddSetupFields.js";
 import { resolveSpriteTransition } from "../../packages/client/src/lib/sprite-transition.js";
-import { resolveSpriteExpressionState } from "../../packages/client/src/lib/sprite-expression-state.js";
+import {
+  resolveLatestSpriteExpressionTurn,
+  resolveSpriteExpressionState,
+} from "../../packages/client/src/lib/sprite-expression-state.js";
 import {
   parseIllustratorPromptReviewOverride,
   resolveIllustratorPromptSubmission,
@@ -1036,7 +1037,7 @@ assert.throws(
 assert.deepEqual(HOME_CHAT_MODE_ACCENTS, {
   conversation: "oklch(0.79 0.16 205)",
   roleplay: "oklch(0.76 0.19 52)",
-  game: "var(--marinara-chat-chrome-accent)",
+  game: "var(--marinara-mode-game-accent)",
 });
 
 const backgroundOrganization = normalizeBackgroundLibraryOrganization({
@@ -1096,6 +1097,54 @@ assert.deepEqual(
   { "character-a": "neutral" },
 );
 assert.deepEqual(findMissingComfyReferenceSlots(comfyReferenceWorkflow, "reference_image", 1), [1]);
+const completedExpressionMessages = [
+  { id: "completed", role: "assistant", extra: { expressionSpriteIds: ["character-a", "persona"] } },
+  { id: "user", role: "user", extra: {} },
+  { id: "pending", role: "assistant", extra: {} },
+];
+assert.deepEqual(resolveLatestSpriteExpressionTurn(completedExpressionMessages), {
+  characterIds: ["character-a", "persona"],
+  messageId: "completed",
+  messageIndex: 0,
+});
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    ...completedExpressionMessages,
+    {
+      id: "empty",
+      role: "assistant",
+      extra: JSON.stringify({ expressionSpriteIds: [], spriteExpressions: { "character-a": "happy" } }),
+    },
+  ]),
+  { characterIds: [], messageId: "empty", messageIndex: 3 },
+  "a completed empty result is distinct from a pending or failed expression turn",
+);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    { id: "legacy-persona", role: "user", extra: { spriteExpressions: { persona: "happy" } } },
+    { id: "legacy", role: "assistant", extra: { spriteExpressions: { "character-b": "neutral" } } },
+  ]),
+  { characterIds: ["character-b", "persona"], messageId: "legacy", messageIndex: 1 },
+  "legacy expression turns retain both character and persona owners",
+);
+assert.equal(resolveLatestSpriteExpressionTurn([{ id: "pending", role: "assistant", extra: {} }]), undefined);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    completedExpressionMessages[0]!,
+    { id: "user", role: "user", extra: { spriteExpressions: { persona: "happy" } } },
+    { id: "regenerating", role: "assistant", extra: {} },
+  ]),
+  { characterIds: ["character-a", "persona"], messageId: "completed", messageIndex: 0 },
+  "a retained persona appearance alone does not prove the pending assistant's expressions completed",
+);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    { id: "persona-only", role: "assistant", extra: { expressionSpriteIds: ["persona"] } },
+  ]),
+  { characterIds: ["persona"], messageId: "persona-only", messageIndex: 0 },
+  "the completion marker identifies persona-only turns without relying on retained user appearances",
+);
+assert.equal(resolveLatestSpriteExpressionTurn(undefined), undefined);
 assert.deepEqual(findMissingComfyReferenceSlots(comfyReferenceWorkflow, "reference_image_name", 1), [2]);
 assert.equal(numberedComfyReferencePlaceholder("reference_image_name", 2), "%reference_image_name_03%");
 
@@ -5176,6 +5225,16 @@ assert.equal(
   "per-character safety limits should still be able to lower a numeric chat ceiling",
 );
 const autonomousChatId = "regression-autonomous-candidates";
+assert.equal(
+  dailyCapForCharacter(autonomousSchedule(90, 1000)),
+  1000,
+  "custom character limits are not capped at eight",
+);
+assert.equal(
+  dailyCapForCharacter(autonomousSchedule(90, 1000), { autonomousDailyCapOverride: 75 }),
+  75,
+  "the chat-wide safety cap still limits a larger custom character cap",
+);
 initializeActivityFromMessages(autonomousChatId, [
   { role: "user", createdAt: new Date(Date.now() - 5 * 60_000).toISOString() },
 ]);
@@ -5283,16 +5342,29 @@ assert.match(
   /has_explicit_node_heap_limit\(\)[\s\S]*NODE_OPTIONS_VALUE[\s\S]*const heapOption = \/\^--max[\s\S]*resolve_default_node_heap_mb\(\)[\s\S]*heap_mb=1024[\s\S]*heap_mb=1536[\s\S]*if ! has_explicit_node_heap_limit; then[\s\S]*--max-old-space-size=\$\{MARINARA_TERMUX_HEAP_MB\}/u,
   "Termux must parse complete heap-option tokens before applying its bounded profile-aware default",
 );
-for (const buildEntry of [
-  "packages/shared/dist/constants/defaults.js",
-  "packages/server/dist/index.js",
-  "packages/client/dist/index.html",
-]) {
+for (const buildEntry of ["packages/shared/dist/constants/defaults.js", "packages/server/dist/index.js"]) {
   assert.ok(
     termuxLauncher.includes(`if [ ! -f "${buildEntry}" ]; then`),
     `Termux must rebuild when ${buildEntry} is missing`,
   );
 }
+const termuxClientBuildBlock = termuxLauncher
+  .split("if ! node scripts/check-client-build.mjs; then\n")[1]
+  ?.split("\nfi")[0];
+assert.ok(termuxClientBuildBlock, "Termux must handle an incomplete client build");
+assert.equal(
+  termuxClientBuildBlock.match(/build_termux_client/gu)?.length,
+  2,
+  "Initial build and retry must use the bounded build heap",
+);
+const termuxClientBuildHelper = termuxLauncher.split("build_termux_client() (")[1]?.split("\n)")[0];
+assert.ok(termuxClientBuildHelper, "Termux must define the isolated client build helper");
+assert.match(termuxClientBuildHelper, /MARINARA_LOW_MEMORY_BUILD=1 run_pnpm --filter @marinara-engine\/client build/u);
+assert.match(
+  termuxClientBuildBlock,
+  /    node scripts\/check-client-build\.mjs$/u,
+  "Termux must rebuild and recheck incomplete client assets, including a missing index",
+);
 
 const trafficExtensionId = "open-issues-extension-traffic";
 const trafficNow = 180_000;
@@ -5799,10 +5871,20 @@ assert.equal(
   3,
   "Roleplay must identify both HUD layouts and package-provided agent surfaces",
 );
-assert.equal(
-  echoChamberPanelSource.match(/data-roleplay-agent-window="echo"/gu)?.length,
-  2,
-  "Collapsed and expanded Echo Chamber windows must share the mobile edit marker",
+assert.match(
+  echoChamberPanelSource,
+  /const rootAttributes = \{ "data-roleplay-agent-window": "echo" \}/u,
+  "Echo Chamber should retain its marker for mobile composer visibility",
+);
+assert.match(
+  echoChamberPanelSource,
+  /<FloatingWindow[\s\S]*?rootAttributes=\{rootAttributes\}/u,
+  "the Echo Chamber window and desktop bubble must share the mobile edit marker",
+);
+assert.match(
+  echoChamberPanelSource,
+  /<WindowBubble[\s\S]*?attributes=\{\{ \.\.\.rootAttributes,/u,
+  "the collapsed phone Echo Chamber button must retain the mobile edit marker",
 );
 assert.match(chatRowPeekSource, /mari-chrome-accent-text-muted mari-accent-animated text-\[0\.6875rem\]/u);
 assert.match(assignedSweepChatAreaSource, /mari-chrome-accent-text-muted mari-accent-animated max-w-sm text-xs/u);
@@ -5853,25 +5935,11 @@ assert.match(
   /CHAT_SUMMARY_OPEN_REQUEST_EVENT[\s\S]{0,240}detail:\s*\{\s*chatId\s*\}/u,
   "Summary requests must carry the target chat ID",
 );
+// Chat Summary is a Chat Settings drawer, so a request opens Chat Settings there (desktop window or phone sheet).
 assert.match(
-  roleplaySurfaceSource,
-  /requestedChatId !== chatId/u,
-  "SummaryButton must filter requests by chat and only open visible instances",
-);
-assert.match(
-  roleplaySurfaceSource,
-  /rect\.width <= 0 \|\| rect\.height <= 0[\s\S]{0,180}setOpen\(true\)/u,
-  "SummaryButton must only open a measurable visible instance",
-);
-assert.match(
-  chatToolbarControlsSource,
-  /pendingSummaryChatIdRef\.current = chatId[\s\S]{0,80}setOpen\(true\)/u,
-  "Compact and mobile Summary requests must queue the target chat and open the overflow menu",
-);
-assert.match(
-  chatToolbarControlsSource,
-  /if \(!open \|\| !chatId\) return;[\s\S]{0,140}requestAnimationFrame\(\(\) => requestChatSummaryOpen\(chatId\)\)/u,
-  "Compact and mobile Summary requests must forward only after the overflow menu mounts",
+  assignedSweepChatAreaSource,
+  /chatId !== useChatStore\.getState\(\)\.activeChatId\) return;\s*handleOpenSettingsPanel\(undefined, \{ initialSection: "summary" \}\)[\s\S]{0,120}CHAT_SUMMARY_OPEN_REQUEST_EVENT/u,
+  "Summary requests must open Chat Settings at the Chat Summary drawer for the active chat only",
 );
 assert.match(
   narratorUiStoreSource,
@@ -5918,8 +5986,9 @@ assert.equal(
   1,
   "The dedicated Roleplay Inventory Tracker widget must suppress mount animations with reduced ambient effects",
 );
+// Clear Trackers is shared by every Agent activity section (Chat Settings, Trackers window, Tracker Panel).
 assert.match(
-  roleplayHudSource,
+  readFileSync(new URL("../../packages/client/src/hooks/use-agent-activity.ts", import.meta.url), "utf8"),
   /latestAssistantMessage[\s\S]{0,240}extra: \{ cyoaChoices: \[\] \}/u,
   "clearing Roleplay tracker state must also clear the persisted active CYOA prompt",
 );
@@ -6009,7 +6078,8 @@ assert.match(
 );
 assert.match(
   conversationGroupSettingsSource,
-  /if \(!\(await flushProseGuardianDrafts\(\)\)\) return false;[\s\S]{0,250}onClose\(\)[\s\S]{0,100}return true/u,
+  // The close button also closes a pinned window, hence `onClose({ force: true })` (#7036).
+  /if \(!\(await flushProseGuardianDrafts\(\)\)\) return false;[\s\S]{0,250}onClose\((?:\{ force: true \})?\)[\s\S]{0,100}return true/u,
   "Closing Chat Settings must persist changed Prose Guardian preferences before unmounting the drawer",
 );
 assert.match(
@@ -6086,7 +6156,7 @@ assert.match(
 );
 assert.match(
   conversationGenerationSource,
-  /await waitForConversationPresenceDelay\(remainingDelayMs, abortController\.signal\);\s*if \(abortController\.signal\.aborted\) break;\s*\}\s*if \(responderDelay\) \{\s*const refreshedMessages = await chats\.listMessages/u,
+  /await waitForConversationPresenceDelay\(remainingDelayMs, generationSignal\);\s*if \(generationSignal\.aborted\) break;\s*\}\s*if \(responderDelay\) \{\s*const refreshedMessages = await chats\.listMessages/u,
   "delayed Conversation responders should refresh user history even when an earlier reply consumed their wait",
 );
 assert.match(
@@ -6208,8 +6278,13 @@ const globalStylesSource = readFileSync(
 );
 assert.match(
   globalStylesSource,
-  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\) \[data-roleplay-agent-window\] \{\s*display: none;/u,
+  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\)\s+\[data-roleplay-agent-window\]:not\(\[data-roleplay-agent-window="echo"\]\) \{\s*display: none;/u,
   "Mobile Roleplay editing must temporarily remove agent windows from the constrained viewport",
+);
+assert.match(
+  globalStylesSource,
+  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]\[data-mobile-composer-active="true"\] \[data-roleplay-agent-window="echo"\],\s*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\) \[data-roleplay-agent-window="echo"\] \{\s*visibility: hidden;/u,
+  "Mobile Echo must keep its scroll box while hidden, or reactions revealed during typing leave it pinned to a stale offset",
 );
 assert.equal(
   appSource.match(/document\.addEventListener\("visibilitychange", syncEffectsPausedState\)/gu)?.length,
@@ -6322,7 +6397,8 @@ assert.match(
 );
 assert.match(
   chatSettingsDrawerSource,
-  /flex w-full min-w-0 flex-col items-stretch gap-1\.5 sm:w-auto sm:shrink-0 sm:flex-row/u,
+  // Chat Settings content follows the window's width (container queries) since #7036.
+  /flex w-full min-w-0 flex-col items-stretch gap-1\.5 @lg:w-auto @lg:shrink-0 @lg:flex-row/u,
   "Lorebook Keeper actions must stack inside their mobile settings card",
 );
 const characterGreetingsSource = readFileSync(
@@ -6674,7 +6750,38 @@ assert.doesNotMatch(
   /inline-flex h-4 w-7 shrink-0 items-center rounded-full/u,
   "Preset choices must not restore the undersized Android toggle",
 );
-assert.match(gameSurfaceSource, /h-\[min\(42rem,calc\(100dvh-6rem\)\)\]/u);
+// #3624: the Session window embeds the Game Journal, whose tabs scroll only inside a bounded height. The old
+// popover's fixed height cap moved to the control windows: a computer's window has a set height, and a phone's
+// sheet for content that scrolls itself is pinned top and bottom.
+const chatControlWindowSource = readFileSync(
+  new URL("../../packages/client/src/components/chat/ChatControlWindow.tsx", import.meta.url),
+  "utf8",
+);
+const floatingWindowSource = readFileSync(
+  new URL("../../packages/client/src/components/ui/FloatingWindow.tsx", import.meta.url),
+  "utf8",
+);
+assert.match(
+  gameSurfaceSource,
+  /id=\{CHAT_CONTROL_WINDOW_IDS\.session\}[\s\S]{0,400}scroll=\{false\}[\s\S]{0,200}\{renderSessionPanel\(\)\}/u,
+  "The Session window must leave scrolling to the Game Journal inside it",
+);
+assert.match(
+  gameSurfaceSource,
+  /const renderSessionPanel = \(\) => \{[\s\S]{0,300}<div className="flex min-h-0 flex-1 flex-col overflow-hidden">/u,
+  "The Session panel must fill its window as a bounded flex column",
+);
+assert.match(floatingWindowSource, /height: geometry\.height/u, "A computer's control window must have a set height");
+assert.match(
+  chatControlWindowSource,
+  /sheetClassName=\{cn\(PHONE_SHEET_CLASS, !scroll && PHONE_FULL_SHEET_CLASS\)\}/u,
+  "A phone sheet whose content scrolls itself must get a bounded height",
+);
+assert.match(
+  floatingWindowSource,
+  /export const PHONE_SHEET_CLASS =\s*"fixed[^"]*top-\[[^"]*max-h-\[[^"]*";\s*export const PHONE_FULL_SHEET_CLASS =\s*"bottom-\[/u,
+  "Phone sheets must stay on screen, and the full-height one must pin its bottom",
+);
 assert.match(gameSetupWizardSource, /ui\.game\.gamesetupwizard\.adjustGameAssetsForThisGame/u);
 assert.match(gameSetupWizardSource, /selectFoldersByDefault/u);
 assert.match(gameSetupWizardSource, /enableAgents: enableAgents \|\| undefined/u);
@@ -8644,7 +8751,7 @@ assert.match(
   "Only Conversation chats should create character membership timeline notices",
 );
 const summaryPopoverSource = readFileSync(
-  join(REPOSITORY_ROOT, "packages/client/src/components/chat/SummaryPopover.tsx"),
+  join(REPOSITORY_ROOT, "packages/client/src/components/chat/ChatSummaryPanel.tsx"),
   "utf8",
 );
 assert.match(
@@ -8880,8 +8987,8 @@ assert.doesNotMatch(
 );
 assert.match(
   summaryPopoverSource,
-  /if \(await commitCombinePromptDraft\(\)\) onClose\(\);/u,
-  "The Summary popover must close only after its Combine draft is safely persisted",
+  /batchAbortControllerRef\.current\?\.abort\(\);\s*void commitCombinePromptDraftRef\.current\(\);/u,
+  "Collapsing the Chat Summary drawer or closing Chat Settings must still persist the Combine draft",
 );
 assert.equal(
   summaryPopoverSource.match(/className="h-48 space-y-[12] overflow-y-auto pr-0\.5"/gu)?.length,
@@ -9970,7 +10077,7 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
   const worldMapsFeatureSummary = String(lorebookEnglishLocale["ui.chat.chatsettingsdrawer.worldMapsFeatureSummary"]);
   assert.equal(
     worldMapsFeatureSummary,
-    "Adds persistent hierarchical locations, durable shared worlds, reusable artwork, customizable Direct Link lines, and movement to Roleplay and Game.",
+    "Adds world maps to Roleplay and Game, from whole regions down to single rooms, with art and travel between places.",
     "The canonical English World Maps settings summary must describe the feature",
   );
   assert.doesNotMatch(
@@ -10387,10 +10494,14 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
 
   assert.match(
     chatAreaSource,
-    /<ChatConversationSurface[\s\S]*?onIllustrateWithAgent=\{async \(agentType\)[\s\S]*?forceImageGeneration: true/u,
+    /const handleIllustrateWithAgent = useCallback\([\s\S]*?forceImageGeneration: true[\s\S]*?<ChatConversationSurface[\s\S]*?onIllustrateWithAgent=\{handleIllustrateWithAgent\}/u,
     "Conversation Gallery must forward custom image-agent illustration requests",
   );
-  assert.match(conversationSurfaceSource, /onIllustrateWithAgent=\{onIllustrateWithAgent\}/u);
+  // The Gallery drawer in Chat Settings reads the actions the conversation surface provides.
+  assert.match(
+    conversationSurfaceSource,
+    /onIllustrateWithAgent,[\s\S]*?useProvideChatGalleryActions\(activeChatId, galleryActions\)/u,
+  );
 
   assert.match(settingsDrawerSource, /useGenerationStatus\(\s*chat\.id,\s*open && isRoleplayMode/u);
   const generationStatusHookSource = readFileSync(
@@ -10435,12 +10546,12 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
   assert.match(turnGameResumeBlock, /await runTurnGameBotTurns\(/u);
   assert.match(
     turnGameResumeBlock,
-    /if \(abortController\.signal\.aborted \|\| isAbortLikeError\(turnGameErr\)\) return;/u,
+    /if \(generationSignal\.aborted \|\| isAbortLikeError\(turnGameErr\)\) return;/u,
     "Turn-game recovery must propagate cancellation without logging it as a failure",
   );
   assert.match(
     turnGameResumeBlock,
-    /await runTurnGameBotTurns\([\s\S]*?if \(abortController\.signal\.aborted\) return;/u,
+    /await runTurnGameBotTurns\([\s\S]*?if \(generationSignal\.aborted\) return;/u,
     "Turn-game recovery must re-check cancellation after a bot runner resolves",
   );
   assert.match(turnGameResumeBlock, /logger\.warn\(turnGameErr/u);
@@ -10644,10 +10755,19 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
     500,
     "persisted chat-local macro variables remain capped",
   );
+  const fullMacroVariables = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`v${i}`, "x"]));
+  assert.deepEqual(
+    mergeGeneratedChatMacroVariables(fullMacroVariables, fullMacroVariables, {
+      ...fullMacroVariables,
+      overflow: "generated",
+    }),
+    fullMacroVariables,
+    "generation writes reapply the macro-variable cap after merging request changes",
+  );
   assert.match(
     generateRouteSource,
-    /macroVariables: normalizeChatMacroVariables\(\{[\s\S]{0,200}normalizeChatMacroVariables\(current\.macroVariables\)[\s\S]{0,120}requestChanges/u,
-    "generation writes reapply the macro-variable cap after merging request changes",
+    /macroVariables: mergeGeneratedChatMacroVariables\(\s*current\.macroVariables,\s*persistedMacroVariableSnapshot,\s*chatMacroVariables,/u,
+    "generation persists macro variables through the bounded merge helper",
   );
 
   const perfDiagnosticsSource = readFileSync(

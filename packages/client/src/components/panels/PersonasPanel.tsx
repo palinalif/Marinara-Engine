@@ -2,6 +2,7 @@
 // Panel: User Personas
 // ──────────────────────────────────────────────
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { AvatarImage } from "../characters/AvatarImage";
 import { toast } from "sonner";
 import {
   fetchAllPersonaPages,
@@ -17,6 +18,7 @@ import {
   useDuplicatePersona,
 } from "../../hooks/use-characters";
 import { useUIStore } from "../../stores/ui.store";
+import { sortPanelFolders } from "../../lib/panel-sort";
 import {
   Plus,
   Trash2,
@@ -57,7 +59,7 @@ import { clearActiveChatResourceDrag, writeChatResourceDragPayload } from "../..
 import { ChatResourceActionButton } from "../chat/ChatResourceActionButton";
 import { estimateTextTokens, type Persona } from "@marinara-engine/shared";
 
-type PersonaGroupRow = { id: string; name: string; description: string; personaIds: string };
+type PersonaGroupRow = { id: string; name: string; description: string; personaIds: string; createdAt: string };
 type ParsedPersonaGroupRow = PersonaGroupRow & { memberIds: string[] };
 
 type SortOption = "name-asc" | "name-desc" | "newest" | "oldest" | "tokens";
@@ -401,7 +403,7 @@ export function PersonasPanel() {
     }
   }, []);
 
-  const { startTouchDrag: startPersonaTouchDrag } = useTouchFolderDrag({
+  const { startTouchDrag: startPersonaTouchDrag, startMouseDrag: startPersonaMouseDrag } = useTouchFolderDrag({
     onActivate: (personaId) => {
       suppressPersonaClickRef.current = true;
       setDraggedPersonaId(personaId);
@@ -458,11 +460,21 @@ export function PersonasPanel() {
     }
   }, [filteredList, sort]);
 
+  const sortedGroups = useMemo(() => {
+    const folders = sortPanelFolders(parsedGroups, sort === "tokens" ? "name-asc" : sort);
+    if (sort !== "tokens") return folders;
+    const tokens = new Map(list.map((persona) => [persona.id, estimateTokens(persona)]));
+    const totals = new Map(
+      folders.map((folder) => [folder.id, folder.memberIds.reduce((total, id) => total + (tokens.get(id) ?? 0), 0)]),
+    );
+    return folders.sort((a, b) => totals.get(b.id)! - totals.get(a.id)!);
+  }, [parsedGroups, sort, list]);
+
   const visibleRootPersonas = useMemo(
     () => list.filter((persona) => !folderedPersonaIds.has(persona.id)),
     [list, folderedPersonaIds],
   );
-  const visiblePersonaById = useMemo(() => new Map(list.map((persona) => [persona.id, persona])), [list]);
+  const personaOrder = useMemo(() => new Map(list.map((persona, index) => [persona.id, index])), [list]);
   const folderFilterActive = search.trim().length > 0 || activeTag !== null;
 
   const exitSelectionMode = useCallback(() => {
@@ -728,10 +740,12 @@ export function PersonasPanel() {
 
       <div className="flex flex-col gap-0.5">
         {/* Folder rows */}
-        {parsedGroups.map((group) => {
-          const folderMemberIds = folderFilterActive
-            ? group.memberIds.filter((personaId) => visiblePersonaById.has(personaId))
-            : group.memberIds;
+        {sortedGroups.map((group) => {
+          const folderMemberIds = (
+            folderFilterActive
+              ? group.memberIds.filter((personaId) => personaOrder.has(personaId))
+              : [...group.memberIds]
+          ).sort((a, b) => (personaOrder.get(a) ?? list.length) - (personaOrder.get(b) ?? list.length));
           if (folderFilterActive && folderMemberIds.length === 0) return null;
           const isExpanded = (folderFilterActive && folderMemberIds.length > 0) || expandedGroupId === group.id;
           const isEditing = editingGroupId === group.id;
@@ -802,6 +816,7 @@ export function PersonasPanel() {
                       onKeyDown={(e) => {
                         if (e.key === "Enter") e.currentTarget.blur();
                         if (e.key === "Escape") {
+                          e.preventDefault();
                           setEditingGroupId(null);
                           setEditGroupName("");
                         }
@@ -871,6 +886,11 @@ export function PersonasPanel() {
                         <div
                           key={pid}
                           data-touch-drag-card="persona"
+                          onMouseDown={(event) =>
+                            startPersonaMouseDrag(event, pid, {
+                              chatResourcePayload: { version: 1, kind: "persona", ids: [pid], label: p.name },
+                            })
+                          }
                           onClick={() => {
                             if (suppressPersonaClickRef.current) return;
                             if (selectionMode) {
@@ -963,9 +983,10 @@ export function PersonasPanel() {
                           />
                           <div className="mari-avatar-placeholder mari-avatar-placeholder--persona relative flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-lg">
                             {p.avatarPath ? (
-                              <img
+                              <AvatarImage
                                 src={p.avatarPath}
                                 alt=""
+                                iconSize="0.625rem"
                                 className="h-full w-full rounded-lg object-cover"
                                 style={getAvatarCropStyle(p.avatarCrop)}
                               />
@@ -1069,6 +1090,11 @@ export function PersonasPanel() {
             <div
               key={persona.id}
               data-touch-drag-card="persona"
+              onMouseDown={(event) =>
+                startPersonaMouseDrag(event, persona.id, {
+                  chatResourcePayload: { version: 1, kind: "persona", ids: [persona.id], label: persona.name },
+                })
+              }
               className={cn(
                 "group relative flex touch-pan-y cursor-pointer items-center gap-3 rounded-xl p-2.5 transition-all hover:bg-[var(--sidebar-accent)]",
                 selectionMode &&
@@ -1162,9 +1188,10 @@ export function PersonasPanel() {
                     so the camera-hover overlay stays above the cropped image. */}
                 <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-xl">
                   {persona.avatarPath ? (
-                    <img
+                    <AvatarImage
                       src={persona.avatarPath}
                       alt=""
+                      iconSize="1rem"
                       loading="lazy"
                       className="h-full w-full rounded-xl object-cover"
                       style={getAvatarCropStyle(persona.avatarCrop)}

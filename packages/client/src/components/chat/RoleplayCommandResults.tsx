@@ -1,5 +1,16 @@
-import { useState } from "react";
-import { ChevronDown, Pencil, RotateCcw, Trash2 } from "lucide-react";
+import {
+  cloneElement,
+  isValidElement,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import { ChevronDown, Eye, EyeOff, LockKeyhole, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { getRoleplayCommandActivity, type RoleplayCommandActivity } from "@marinara-engine/shared";
 import { useUpdateMessageExtra } from "../../hooks/use-chats";
@@ -8,6 +19,256 @@ import { useChatStore } from "../../stores/chat.store";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { ExpandedTextarea } from "../ui/ExpandedTextarea";
 import { RoleplayDocument } from "./RoleplayDocument";
+import { AnimatedDiceRoll, shouldAnimateDiceRollMessage } from "../dice/AnimatedDiceRoll";
+import { isDiceRollResult } from "../../lib/dice-roll-result";
+
+const loadedAt = Date.now();
+
+export function RoleplayWhisper({
+  chatId,
+  messageId,
+  swipeIndex,
+  activityIndex,
+  extra,
+  isStreaming,
+  character,
+  text,
+  knownToUser,
+}: {
+  chatId: string;
+  messageId: string;
+  swipeIndex: number;
+  activityIndex: number;
+  extra: Record<string, unknown>;
+  isStreaming: boolean;
+  character: string;
+  text: string;
+  knownToUser: boolean;
+}) {
+  const { t } = useTranslation();
+  const id = useId();
+  const mutation = useUpdateMessageExtra(chatId);
+  const chatGenerating = useChatStore(
+    (state) => state.abortControllers.has(chatId) || (state.isStreaming && state.streamingChatId === chatId),
+  );
+  const [revealed, setRevealed] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const visible = knownToUser || revealed;
+  const pending = isStreaming || chatGenerating || mutation.isPending;
+  const limit = 16000;
+  const closeEditor = () => {
+    if (!mutation.isPending) setEditing(false);
+  };
+  const save = async () => {
+    if (pending || !draft.trim() || draft.length > limit) return;
+    setError("");
+    try {
+      await mutation.mutateAsync({
+        messageId,
+        swipeIndex,
+        extra: {
+          roleplayCommandActivity: getRoleplayCommandActivity(extra).map((item, index) =>
+            index === activityIndex && item.command.type === "whisper"
+              ? { ...item, command: { ...item.command, text: draft } }
+              : item,
+          ),
+        },
+      });
+      setEditing(false);
+    } catch {
+      setError(t("roleplay.commands.activity.saveFailed"));
+    }
+  };
+  return (
+    <span
+      className="my-3 block min-w-0 max-w-full rounded-lg border border-[var(--primary)]/25 bg-[var(--card)] px-4 py-3 text-[var(--foreground)] whitespace-normal [text-shadow:none] [-webkit-text-stroke:0px]"
+      data-roleplay-whisper
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <span className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <span className="flex min-w-0 items-center gap-2 text-xs font-medium text-[var(--muted-foreground)]">
+          <LockKeyhole size="0.875rem" className="shrink-0" aria-hidden />
+          <span id={`${id}-recipient`} className="break-words">
+            {t("roleplay.commands.whisper.to", { character })}
+          </span>
+        </span>
+        <span className="flex flex-wrap items-center gap-1">
+          {visible && (
+            <button
+              type="button"
+              className={actionClass}
+              aria-describedby={`${id}-recipient`}
+              disabled={pending}
+              onClick={() => {
+                setDraft(text);
+                setError("");
+                setEditing(true);
+              }}
+            >
+              <Pencil size="0.875rem" aria-hidden className="mr-1 inline" />
+              {t("roleplay.commands.whisper.edit")}
+            </button>
+          )}
+          {!knownToUser && (
+            <button
+              type="button"
+              aria-expanded={visible}
+              aria-describedby={`${id}-recipient`}
+              aria-controls={visible ? `${id}-secret` : undefined}
+              className="flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm text-[var(--primary)] hover:bg-[var(--primary)]/10 focus-visible:outline focus-visible:outline-[var(--primary)]"
+              onClick={() => setRevealed(!revealed)}
+            >
+              {visible ? <EyeOff size="0.875rem" aria-hidden /> : <Eye size="0.875rem" aria-hidden />}
+              <span>{t(visible ? "roleplay.commands.whisper.hide" : "roleplay.commands.whisper.reveal")}</span>
+            </button>
+          )}
+        </span>
+      </span>
+      {visible && (
+        <span id={`${id}-secret`} className="mt-2 block whitespace-pre-wrap break-words text-sm italic leading-relaxed">
+          {text}
+        </span>
+      )}
+      {!knownToUser && visible && (
+        <span className="mt-2 block text-xs text-[var(--muted-foreground)]">
+          {t("roleplay.commands.whisper.revealedHint")}
+        </span>
+      )}
+      {editing && (
+        <ExpandedTextarea
+          open
+          onClose={closeEditor}
+          title={t("roleplay.commands.whisper.edit")}
+          value={draft}
+          onChange={setDraft}
+          readOnly={mutation.isPending}
+          closeLabel={t("roleplay.commands.activity.cancel")}
+          footer={
+            <div className="flex flex-wrap items-center justify-end gap-2 pb-[var(--mari-safe-area-inset-bottom,env(safe-area-inset-bottom))]">
+              {error && (
+                <p role="alert" className="mr-auto text-sm">
+                  {error}
+                </p>
+              )}
+              {draft.length > limit && (
+                <p role="alert" className="mr-auto text-sm">
+                  {t("roleplay.commands.activity.tooLong", { limit })}
+                </p>
+              )}
+              <button type="button" className={actionClass} disabled={mutation.isPending} onClick={closeEditor}>
+                {t("roleplay.commands.activity.cancel")}
+              </button>
+              <button
+                type="button"
+                className={actionClass}
+                disabled={pending || !draft.trim() || draft.length > limit}
+                onClick={() => void save()}
+              >
+                {t("roleplay.commands.activity.save")}
+              </button>
+            </div>
+          }
+        />
+      )}
+    </span>
+  );
+}
+
+export function RoleplayDiceRoll({ result, createdAt }: { result: string; createdAt: string }) {
+  const roll = useMemo(() => {
+    try {
+      const value: unknown = JSON.parse(result);
+      return isDiceRollResult(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }, [result]);
+  const [animate] = useState(() => Date.parse(createdAt) >= loadedAt && shouldAnimateDiceRollMessage(createdAt));
+  return roll ? (
+    <div className="my-3 min-w-0 max-w-full whitespace-normal" data-roleplay-inline-roll>
+      <AnimatedDiceRoll {...roll} animate={animate} />
+    </div>
+  ) : null;
+}
+
+// The HTML has already passed ChatMessage's sanitizer. Insert only text-node
+// slots into that complete document, so an inline roll cannot break its tags.
+function RoleplayCommandHtml({ element, slots }: { element: ReactElement; slots: Map<string, ReactNode> }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Keep the host element identical while portals mount. Reapplying
+  // dangerouslySetInnerHTML would discard their DOM targets.
+  const [host] = useState(() => cloneElement(element, { ref } as Record<string, unknown>));
+  const processed = useRef(false);
+  const [targets, setTargets] = useState<Array<{ marker: string; element: HTMLElement }>>([]);
+  useLayoutEffect(() => {
+    if (!ref.current || processed.current) return;
+    processed.current = true;
+    const walker = document.createTreeWalker(ref.current, NodeFilter.SHOW_TEXT);
+    const nodes: Text[] = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+    const next: typeof targets = [];
+    for (const node of nodes) {
+      if (node.parentElement?.closest("style, script")) continue;
+      const parts = node.data.split(new RegExp(`(${[...slots.keys()].join("|")})`, "u"));
+      if (parts.length === 1) continue;
+      const fragment = document.createDocumentFragment();
+      for (const part of parts) {
+        if (slots.has(part)) {
+          const target = document.createElement("span");
+          target.style.display = "block";
+          fragment.append(target);
+          next.push({ marker: part, element: target });
+        } else fragment.append(document.createTextNode(part));
+      }
+      node.replaceWith(fragment);
+    }
+    setTargets(next);
+  }, [slots]);
+  return (
+    <>
+      {host}
+      {targets.map((target) => createPortal(slots.get(target.marker), target.element, target.marker))}
+      {[...slots].filter(([marker]) => !targets.some((target) => target.marker === marker)).map(([, roll]) => roll)}
+    </>
+  );
+}
+
+/** Replace private, render-only text markers after parsing the complete prose once. */
+export function replaceRoleplayCommandMarkers(content: ReactNode, slots: Map<string, ReactNode>): ReactNode {
+  if (!slots.size) return content;
+  const pattern = new RegExp(`(${[...slots.keys()].join("|")})`, "u");
+  const used = new Set<string>();
+  const visit = (node: ReactNode): ReactNode => {
+    if (typeof node === "string")
+      return node.split(pattern).map((part) => {
+        if (!slots.has(part)) return part;
+        used.add(part);
+        return slots.get(part);
+      });
+    if (Array.isArray(node)) return node.map(visit);
+    if (
+      !isValidElement<{ children?: ReactNode; className?: string; dangerouslySetInnerHTML?: { __html: string } }>(node)
+    )
+      return node;
+    const html = node.props.dangerouslySetInnerHTML?.__html;
+    if (html !== undefined) {
+      for (const marker of slots.keys()) used.add(marker);
+      // Remount when the sanitized document changes; React owns the surrounding
+      // element, while portals own only the empty slots created inside it.
+      return <RoleplayCommandHtml key={`${node.props.className}:${html}`} element={node} slots={slots} />;
+    }
+    return node.props.children === undefined ? node : cloneElement(node, {}, visit(node.props.children));
+  };
+  const rendered = visit(content);
+  return (
+    <>
+      {rendered}
+      {[...slots].filter(([marker]) => !used.has(marker)).map(([, roll]) => roll)}
+    </>
+  );
+}
 
 const actionClass =
   "min-h-11 rounded-lg px-3 text-sm text-[var(--primary)] hover:bg-[var(--primary)]/10 focus-visible:outline focus-visible:outline-[var(--primary)] disabled:opacity-40";
@@ -54,7 +315,7 @@ function CommandNotice({
         !item.error &&
         command.type === "document" &&
         typeof command.title === "string" &&
-        content !== null && <RoleplayDocument document={command} />}
+        content !== null && <RoleplayDocument document={command} styleVariant={item.documentStyle} />}
       <div
         className="overflow-hidden rounded-lg border border-[var(--primary)]/20 text-[var(--marinara-chat-chrome-panel-text)]"
         style={{ WebkitTextStroke: "0px", textShadow: "none" }}
@@ -135,7 +396,9 @@ function CommandNotice({
                 </pre>
               </div>
             )}
-            {item.error && <p>{t("roleplay.commands.failed", { error: item.error })}</p>}
+            {item.error && (
+              <p>{t("roleplay.commands.failed", { error: t(item.error, { defaultValue: item.error }) })}</p>
+            )}
             {command.type === "interrupt" &&
               item.interruption &&
               !item.deleted &&
@@ -250,34 +513,36 @@ export function RoleplayCommandResults({
           attachment.url.startsWith("/api/game-assets/file/sfx/"),
       )
     : [];
-  if (!activity.length && !sounds.length) return null;
+  if (!activity.some((item) => item.command.type !== "whisper" || item.error) && !sounds.length) return null;
   return (
     <div className="mt-3 space-y-2" data-roleplay-command-results onDoubleClick={(event) => event.stopPropagation()}>
-      {activity.map((item, index) => (
-        <CommandNotice
-          key={`${messageId}:${swipeIndex}:${index}`}
-          item={item}
-          characterName={characterName}
-          pending={isStreaming || chatGenerating || mutation.isPending || restore.isPending}
-          restore={() => restore.mutateAsync({ messageId, swipeIndex, activityIndex: index })}
-          soundUrl={
-            item.command.type === "sound"
-              ? sounds.find((sound) => sound.name === (item.command as { description: string }).description)?.url
-              : undefined
-          }
-          update={(next) =>
-            mutation.mutateAsync({
-              messageId,
-              swipeIndex,
-              extra: {
-                roleplayCommandActivity: activity.map((record, i) => (i === index ? next : record)),
-                roleplayPrivateCommands: null,
-                roleplayDocuments: null,
-              },
-            })
-          }
-        />
-      ))}
+      {activity.map((item, index) =>
+        item.command.type === "whisper" && !item.error ? null : (
+          <CommandNotice
+            key={`${messageId}:${swipeIndex}:${index}`}
+            item={item}
+            characterName={characterName}
+            pending={isStreaming || chatGenerating || mutation.isPending || restore.isPending}
+            restore={() => restore.mutateAsync({ messageId, swipeIndex, activityIndex: index })}
+            soundUrl={
+              item.command.type === "sound"
+                ? sounds.find((sound) => sound.name === (item.command as { description: string }).description)?.url
+                : undefined
+            }
+            update={(next) =>
+              mutation.mutateAsync({
+                messageId,
+                swipeIndex,
+                extra: {
+                  roleplayCommandActivity: activity.map((record, i) => (i === index ? next : record)),
+                  roleplayPrivateCommands: null,
+                  roleplayDocuments: null,
+                },
+              })
+            }
+          />
+        ),
+      )}
       {!activity.some((item) => item.command.type === "sound") &&
         sounds.map((sound, index) => (
           <audio

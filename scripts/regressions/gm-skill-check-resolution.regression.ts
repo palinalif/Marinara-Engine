@@ -482,14 +482,19 @@ assert.match(
   /if \(!tag \|\| tag\.resolvedResult\) return fullTag;\s*\n\s*if \(!isEngineRollableSkillCheckTag\(tag\)\) return fullTag;/u,
   "the endpoint rewrite must refuse a system the engine does not roll, not only a tag whose numbers held",
 );
+assert.match(
+  gameRoutes,
+  /if \(!isEngineRollableSkillCheckTag\(tag\)\) return fullTag;[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*if \(tag\.reason\) return fullTag;/u,
+  "a check the Engine settled as not attempted is never overwritten by a later roll",
+);
 
 // The client's fallback is the third door onto that same rewrite: it POSTs any
 // tag with no resolvedResult, and this endpoint only ever rolls a d20.
 const gameSurface = readFileSync(join(root, "packages/client/src/components/game/GameSurface.tsx"), "utf8");
 assert.match(
   gameSurface,
-  /isEngineRollableSkillCheckTag\(sc\)\s*&&\s*!poolModeActive\s*\?\s*\(\s*await skillCheck\.mutateAsync\(/u,
-  "the client must not ask the endpoint to roll a system the engine does not implement",
+  /isEngineRollableSkillCheckTag\(sc\)\s*&&\s*!sc\.reason\s*&&\s*!poolModeActive\s*\?\s*\(\s*await skillCheck\.mutateAsync\(/u,
+  "the client must not ask the endpoint to roll a system the engine does not implement, nor a check it settled",
 );
 // The one-request dice pool adds a second condition to that same arm, and it has to stay
 // a NARROWING one. With the sighted pool on, an overflowed check must be left sparse: a
@@ -506,7 +511,11 @@ assert.match(
 
 const generateRoutes = readFileSync(join(root, "packages/server/src/routes/generate.routes.ts"), "utf8");
 const resolutionAt = generateRoutes.indexOf("resolveSkillCheckTagsInContent(fullResponse");
-const contentReplaceAt = generateRoutes.indexOf(`type: "content_replace", data: fullResponse`);
+// The frame post-processing sends with the finished turn. A tool round may clear text it
+// streamed before that (#6951), but post-processing has not started then and sends its own frame.
+const postProcessingFrameAt = generateRoutes.indexOf("if (contentReplaced) {");
+assert.ok(postProcessingFrameAt > 0, "post-processing must still send its own content_replace frame");
+const contentReplaceAt = generateRoutes.indexOf(`type: "content_replace", data: fullResponse`, postProcessingFrameAt);
 assert.ok(resolutionAt > 0, "generation post-processing must roll the GM's checks");
 assert.ok(contentReplaceAt > 0);
 assert.ok(
@@ -715,8 +724,31 @@ assert.equal(untouched.sparse, 0);
 // through the error door.
 assert.match(
   generateRoutes,
-  /const rolled = await resolveSkillCheckTagsInContent\(fullResponse, \{[\s\S]*?\}\);\s*const generalRolls = resolveGameDiceRequests\(\s*rolled\.content,\s*toolDiceRollResults,\s*undefined,\s*dicePoolSession \?\? undefined,?\s*\);\s*if \(generalRolls\.content !== fullResponse\) \{/u,
+  // Between the two calls the route may keep what the resolver handed back, such as the purchases a
+  // check paid for, but it may not roll anything else in between and it may not swallow either one.
+  /const rolled = await resolveSkillCheckTagsInContent\(fullResponse, \{[\s\S]*?\}\);(?:[^;]*;){0,3}\s*const generalRolls = resolveGameDiceRequests\(\s*rolled\.content,\s*toolDiceRollResults,\s*undefined,\s*dicePoolSession \?\? undefined,\s*(?:\/\/[^\n]*\n\s*)*chatMeta\.gameRuleset != null,?\s*\);\s*if \(generalRolls\.content !== fullResponse\) \{/u,
   "the resolver's own output decides the frame and the save on both paths",
+);
+
+// Both passes of one turn start from the SAME live sheet state. The check pass spends before the
+// dice are thrown and the sheet pass spends after, so a turn that read "the newest stored row" in
+// one place and "the row this turn follows" in the other would pay twice out of two balances
+// whenever those differ, which is what a regenerate and a swipe are. One reader, used twice.
+assert.match(
+  generateRoutes,
+  /loadSkillCheckModifierContext\(app\.db, input\.chatId, await turnStartRulesetLive\(\)\)/u,
+  "the check pass reads the turn's own starting state, not the newest stored one",
+);
+assert.match(
+  generateRoutes,
+  /withSpends\(await turnStartRulesetLive\(\)\)/u,
+  "and the sheet pass starts from that same state with the check's purchases laid over it",
+);
+assert.equal(
+  generateRoutes.match(/parseStoredRulesetLive\(\(continuedRow \?\? baseGameStateSnapshot\)\?\.rulesetLive\)/gu)
+    ?.length ?? 0,
+  1,
+  "the turn-start row is resolved in exactly one place, so the two passes cannot drift apart",
 );
 
 // ── 13. The tag reader does not slow down on a long run of word characters ──

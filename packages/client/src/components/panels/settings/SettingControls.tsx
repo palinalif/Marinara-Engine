@@ -678,7 +678,7 @@ export function SettingsCheckbox({
     <label
       id={anchorId}
       className={cn(
-        "flex scroll-mt-3 cursor-pointer rounded-lg transition-colors hover:bg-[var(--secondary)]/50",
+        "flex scroll-mt-3 cursor-pointer rounded-lg transition-colors hover:bg-[var(--accent)]/50",
         align === "between" ? "items-center justify-between gap-3 p-1.5" : "items-start gap-2.5 p-1.5",
         disabled && "cursor-not-allowed opacity-60 hover:bg-transparent",
         className,
@@ -817,7 +817,7 @@ export function SettingsSwitch({
       id={anchorId}
       title={localizedTitle}
       className={cn(
-        "flex scroll-mt-3 items-center gap-3 rounded-xl p-2 transition-colors hover:bg-[var(--secondary)]/50",
+        "flex scroll-mt-3 items-center gap-3 rounded-xl p-2 transition-colors hover:bg-[var(--accent)]/50",
         disabled && "cursor-not-allowed opacity-60 hover:bg-transparent",
         className,
       )}

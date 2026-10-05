@@ -55,6 +55,8 @@ To learn more about styles, see [Image Style Profiles](../media/style-profiles.m
 
 **Attach Card Appearance** is a toggle that is off by default. When it is on, Marinara adds the character card's appearance text to the selfie description. This gives the model more detail about how the character looks.
 
+If the card or persona also has **Image Appearance Override** turned on, Marinara sends that override instead of the **Appearance** text. Turn it on under **Appearance** in the Character or Persona editor when the full **Appearance** description is written for the narrator rather than for an image model.
+
 ### Resolution
 
 **Resolution** sets the size of the selfie image. The **Resolution** buttons appear only after you pick a **Selfie Connection**. Pick one of the quick buttons. The default is **896x1152**, a tall portrait shape that suits most selfies.
@@ -74,11 +76,20 @@ The size options are:
 
 Once selfies are set up, a character can decide to send one during the chat on their own. You do not type a command. The character chooses the moment, and Marinara generates the picture and posts it in the chat.
 
+The model's response uses `[selfie]`, optionally with context:
+
+```text
+Here is a picture from my walk!
+[selfie: context="standing beside the river at sunset"]
+```
+
+`[selfie: "standing beside the river"]` and `[selfie: standing beside the river]` also work. The command is case-insensitive, so `[SELFIE:xxxxx.]` is valid syntax. It is a Conversation command, not a Roleplay or Game Mode image trigger. A literal marker left in the message can indicate that the chat is in another mode or **Commands** is disabled. Confirm that Illustrator is installed, **Generated Selfies** is enabled and **Selfie Connection** is selected. If generation starts but fails, inspect the reported connection or image-provider error; changing the marker's capitalization will not fix it.
+
 ## Asking for a selfie by hand
 
 You can also request a selfie yourself instead of waiting for the character.
 
-1. Open the chat **Gallery** panel.
+1. Open **Chat Settings** and expand the **Gallery** section.
 2. Click the **Selfie** button (the camera icon).
 3. If the chat has more than one character, pick who should take the selfie from the character list next to the button.
 4. If **Expose media prompts before sending** is enabled under **Settings**, **Generations**, **Image Generation**, review or edit the final compiled selfie prompt and click **Generate**. Canceling the review does not send an image request.

@@ -141,6 +141,8 @@ export interface PromptSection {
   // ── Overrides ──
   /** If true, character cards cannot override this section */
   forbidOverrides: boolean;
+  /** If true, this prompt block is sent without the preset's XML/Markdown wrapper (its group may still wrap it). Ignored for markers. */
+  skipWrap: boolean;
 }
 
 /** A preset-level variable — the user picks one option per chat, referenced via {{variableName}} in prompts. */

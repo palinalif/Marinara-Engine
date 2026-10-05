@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 7 * * *" # 07:17 UTC/GMT; avoid top-of-hour load; starts remain best-effort.
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Optional full main SHA: verify this exact revision without merging newer upstream"
+        required: false
+        type: string
 
 concurrency:
   group: fork-staging-sync
@@ -20,19 +25,30 @@ jobs:
     permissions:
       contents: write
     env:
-      TARGET_BRANCH: feat/connection-custom-voice-upload
+      TARGET_BRANCH: main
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: feat/connection-custom-voice-upload
+          ref: main
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Merge upstream staging without overwriting fork work
+      - name: Verify pinned revision or merge upstream without overwriting fork work
         id: merge
         shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
+          if [[ -n "$EXPECTED_SHA" ]]; then
+            [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ $(git rev-parse HEAD) == "$EXPECTED_SHA" ]] || {
+              echo 'main moved since the requested validation SHA' >&2
+              exit 1
+            }
+            echo "Validating pinned main revision $EXPECTED_SHA; skipping upstream merge"
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream https://github.com/Pasta-Devs/Marinara-Engine.git
@@ -76,6 +92,8 @@ jobs:
           for filter in active-character-reference character-id-macro-modes custom-voice tts; do
             node scripts/run-regressions.mjs --filter "$filter"
           done
+          bash scripts/regressions/fork-sync-conflict-review.regression.sh
+          bash scripts/regressions/fork-sync-pinned-main.regression.sh
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
       - name: Smoke and fork browser regressions

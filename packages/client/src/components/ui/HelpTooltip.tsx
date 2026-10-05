@@ -17,6 +17,8 @@ interface HelpTooltipProps {
   text: ReactNode;
   /** Optional visible label shown before the help icon */
   label?: string;
+  /** Accessible name for the help button when "Show help" alone would not say what the help is about */
+  ariaLabel?: string;
   /** Optional size of the icon (default "0.75rem") */
   size?: string | number;
   /** Preferred position */
@@ -30,17 +32,21 @@ interface HelpTooltipProps {
   /** Increment to programmatically open the tooltip (e.g. on a mobile tap where there's
    *  no hover). Opens it pinned; changes are ignored while equal to the previous value. */
   openSignal?: number;
+  /** When set, a click runs this action instead of pinning the tip open; hover and focus still show the text. */
+  onActivate?: () => void;
 }
 
 export function HelpTooltip({
   text,
   label,
+  ariaLabel,
   size = "0.75rem",
   side = "top",
   className,
   buttonClassName,
   wide,
   openSignal,
+  onActivate,
 }: HelpTooltipProps) {
   const { t: localizeUi } = useUiTranslation();
   const localize = useLocalizedUiText();
@@ -160,12 +166,13 @@ export function HelpTooltip({
       <button
         type="button"
         aria-label={
-          localizedLabel
+          ariaLabel ??
+          (localizedLabel
             ? localizeUi("ui.ui.customemojitagbutton.value1Value2", {
                 value1: localize("Show help"),
                 value2: localizedLabel,
               })
-            : localize("Show help")
+            : localize("Show help"))
         }
         aria-expanded={show}
         className={cn(
@@ -180,15 +187,28 @@ export function HelpTooltip({
         onPointerDown={(event) => {
           event.stopPropagation();
         }}
+        onKeyDown={(event) => {
+          // The open tip takes Escape first, so a surrounding window or panel stays open.
+          if (event.key !== "Escape" || !show) return;
+          event.preventDefault();
+          closeSelf();
+        }}
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          setPinned((current) => {
-            const nextPinned = !current;
-            if (nextPinned) openSelf();
-            else closeSelf();
-            return nextPinned;
-          });
+          if (onActivate) {
+            closeSelf();
+            onActivate();
+            return;
+          }
+          // Toggle from the rendered state: React may call a state updater twice, so opening or closing
+          // inside one could reopen the tip right after a click closed it.
+          if (pinned) {
+            closeSelf();
+            return;
+          }
+          openSelf();
+          setPinned(true);
         }}
       >
         {localizedLabel && <span>{localizedLabel}</span>}

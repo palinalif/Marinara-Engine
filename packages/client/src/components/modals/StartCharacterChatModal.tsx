@@ -1,5 +1,5 @@
 import { useStartChatFromCharacter } from "../../hooks/use-start-chat-from-character";
-import { useUIStore } from "../../stores/ui.store";
+import { isMobileShellViewport, useUIStore } from "../../stores/ui.store";
 import { ChatModeSelectorModal, type ChatLaunchMode } from "../chat/ChatModeSelectorModal";
 
 interface StartCharacterChatModalProps {
@@ -22,7 +22,7 @@ export function StartCharacterChatModal({ open, onClose, characterId, characterN
       shortcutMode: false,
       onSuccess: () => {
         closeAllDetails();
-        if (typeof window !== "undefined" && window.innerWidth < 768) closeRightPanel();
+        if (isMobileShellViewport()) closeRightPanel();
         onClose();
       },
     });

@@ -328,6 +328,7 @@ export interface CreatePresetSectionCommand {
   injectionDepth?: number;
   injectionOrder?: number;
   forbidOverrides?: boolean;
+  skipWrap?: boolean;
 }
 
 export interface CreatePresetGroupCommand {
@@ -967,6 +968,7 @@ function parseCreatePresetBlock(raw: string): CreatePresetCommand | null {
           injectionDepth: parseOptionalInteger(data.injectionDepth),
           injectionOrder: parseOptionalInteger(data.injectionOrder),
           forbidOverrides: typeof data.forbidOverrides === "boolean" ? data.forbidOverrides : undefined,
+          skipWrap: typeof data.skipWrap === "boolean" ? data.skipWrap : undefined,
         } satisfies CreatePresetSectionCommand;
       })
       .filter((section): section is CreatePresetSectionCommand => section !== null);

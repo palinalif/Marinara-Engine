@@ -125,6 +125,8 @@ Use **Depth** for reminders you want the AI to see near the newest messages, suc
 
 XML is a good default for most models. Try **MARKDOWN** or **NONE** only if a model seems to respond better without tags.
 
+To send one **Prompt Block** without its tag or heading while the rest of the preset stays wrapped, expand it on the **Sections** tab and turn on **Send without wrapper**. The block's content is sent exactly as written. If the block belongs to a group, the group's tag or heading can still surround it; remove it from the group when you want it fully bare. Markers always keep their wrapper, so the switch appears only on prompt blocks. It is also hidden when the preset's wrap format is **NONE**, because nothing is wrapped then.
+
 ## Assigning a preset to a chat
 
 A preset does nothing until you assign it to a chat. There are two ways to do this in a **Roleplay** chat.
@@ -138,7 +140,7 @@ From the **Presets** panel:
 From **Chat Settings**:
 
 1. Open the chat.
-2. Open **Chat Settings** (the gear).
+2. Open **Chat Settings**.
 3. Find the **Prompt Preset** section.
 4. Pick a preset from the dropdown.
 
@@ -161,6 +163,14 @@ Below the dropdown is a status row. It shows one of three states:
 Click **Edit Prompt** to type a prompt just for this chat. The editor opens as **Edit Conversation Prompt** or **Edit Game Prompt**. If your edit matches the preset or default exactly, Marinara treats it as not customized. Once a custom edit exists, a **Reset to default prompt** button appears to clear it.
 
 Game chats also have an **Extra instructions** box. Text there is added to the Game prompt. It has a limit of 2000 characters. A sample instruction is "Write in the style of Terry Pratchett."
+
+## Decision blocks and prompt caching
+
+A section can hold a decision block, `{{#if decision:"..."}}`, so that part of the preset is sent only on turns where a statement about the chat is true. See [Asking the Decision model](conditional-prompts.md#asking-the-decision-model).
+
+**Put changing decision blocks late in the prompt**, such as in post-history instructions. A changed branch can prevent a provider from reusing the prompt from that point onward, so an early change can lose most cache savings. An earlier unchanged prefix may still qualify; the whole prompt is not necessarily billed as new. Keep a decision near the top only when its answer rarely changes and its instructions belong there. Provider-specific details are in [Prompt caching](conditional-prompts.md#prompt-caching).
+
+Statements in disabled sections and groups are never asked, and do not count toward **Decision statements per turn**.
 
 ## Checking what the AI received
 

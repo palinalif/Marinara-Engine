@@ -14,6 +14,7 @@ import {
   resolveSpatialBreadcrumb,
   resolveSpatialDestinations,
   resolveSpatialRoute,
+  SPATIAL_CONTEXT_LIMITS,
   spatialContextDefinitionSchema,
   spatialContextSnapshotSchema,
   pendingSpatialTransitionSchema,
@@ -914,6 +915,11 @@ const deepLocations = Array.from({ length: 21 }, (_, index) =>
   }),
 );
 assert.ok(issueCodes(definition(deepLocations)).includes("maximum_depth_exceeded"));
+// A chain as long as the location limit is still reported, with the walk bounded at maxDepth.
+const locationLimitChain = Array.from({ length: SPATIAL_CONTEXT_LIMITS.maxLocations }, (_, index) =>
+  location(`chain_${index}`, `Chain ${index}`, { parentId: index === 0 ? null : `chain_${index - 1}` }),
+);
+assert.ok(issueCodes(definition(locationLimitChain)).includes("maximum_depth_exceeded"));
 
 const invalidLayers = definition(
   [
@@ -955,6 +961,18 @@ const tooManyLinks = definition([
 ]);
 assert.ok(issueCodes(tooManyLinks).includes("too_many_links"));
 assert.equal(spatialContextDefinitionSchema.safeParse(tooManyLinks).success, false);
+
+// Whole-world maps with floors and rooms outgrew 500 locations (Marinara-Agents#1132).
+const locationsAtLimit = Array.from({ length: SPATIAL_CONTEXT_LIMITS.maxLocations }, (_, index) =>
+  location(`place_${index}`, `Place ${index}`),
+);
+assert.equal(SPATIAL_CONTEXT_LIMITS.maxLocations, 5_000);
+assert.equal(spatialContextDefinitionSchema.safeParse(definition(locationsAtLimit)).success, true);
+assert.ok(
+  issueCodes(definition([...locationsAtLimit, location("one_too_many", "One Too Many")])).includes(
+    "too_many_locations",
+  ),
+);
 
 assert.equal(
   spatialContextDefinitionSchema.safeParse({

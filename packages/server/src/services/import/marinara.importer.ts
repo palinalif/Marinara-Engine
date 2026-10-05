@@ -1,3 +1,8 @@
+import {
+  decodeLorebookImages,
+  saveDecodedLorebookImages,
+  discardImportedLorebookImages,
+} from "../lorebook/lorebook-images.js";
 // ──────────────────────────────────────────────
 // Import: Marinara Engine native format (.marinara.json)
 // ──────────────────────────────────────────────
@@ -7,6 +12,7 @@ import {
   getFolderImportEntries,
   getFolderManifestConfig,
   isJsonRecord,
+  capImportedRulesetSheets,
   characterDataSchema,
   canonicalizeLegacyPersonaInput,
   normalizeAvatarCrop,
@@ -18,6 +24,7 @@ import {
   personaCreateInputSchema,
   lorebookFilterModeSchema,
   MAX_FILE_SIZES,
+  parseLorebookDecisionActivation,
 } from "@marinara-engine/shared";
 import type {
   CharacterData,
@@ -411,8 +418,27 @@ function unwrapFolderManifestEnvelope(value: unknown): ExportEnvelope | null {
 
 /** Validate and default a native character payload before it reaches storage. */
 export function normalizeNativeCharacterData(data: unknown): CharacterData | null {
-  const parsed = characterDataSchema.safeParse(data);
+  const parsed = characterDataSchema.safeParse(withCappedRulesetSheets(data));
   return parsed.success ? parsed.data : null;
+}
+
+/** A ruleset sheet the boundary would refuse costs the import that sheet, never the whole card.
+ *  Sheets for rulesets this install lacks are kept dormant under their key. */
+function withCappedRulesetSheets(data: unknown): unknown {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+  const extensions = (data as Record<string, unknown>).extensions;
+  if (!extensions || typeof extensions !== "object" || Array.isArray(extensions)) return data;
+  if (!("rulesetSheets" in extensions)) return data;
+  const { sheets, dropped } = capImportedRulesetSheets((extensions as Record<string, unknown>).rulesetSheets);
+  if (dropped.length > 0) {
+    logger.warn(
+      "[import] Dropped %d unusable ruleset sheet(s) from an imported character: %s",
+      dropped.length,
+      dropped.join(", "),
+    );
+  }
+  const { rulesetSheets: _removed, ...rest } = extensions as Record<string, unknown>;
+  return { ...(data as Record<string, unknown>), extensions: sheets ? { ...rest, rulesetSheets: sheets } : rest };
 }
 
 async function importCharacter(data: unknown, db: DB) {
@@ -602,6 +628,11 @@ async function importPersona(data: unknown, db: DB) {
     ...(d.savedStatusOptions === undefined ? {} : { savedStatusOptions: d.savedStatusOptions }),
     ...(d.convoBehavior === undefined ? {} : { convoBehavior: d.convoBehavior }),
     ...(typeof d.versioningEnabled === "boolean" ? { versioningEnabled: d.versioningEnabled } : {}),
+    // #7053: the export writes the public boolean contract for the image-appearance
+    // toggle. Without these the exported override was silently dropped on import,
+    // so a persona round-trip lost the switch and the text.
+    ...(typeof d.imageAppearanceEnabled === "boolean" ? { imageAppearanceEnabled: d.imageAppearanceEnabled } : {}),
+    ...(typeof d.imageAppearance === "string" ? { imageAppearance: d.imageAppearance } : {}),
   };
   for (const field of [
     "comment",
@@ -686,157 +717,173 @@ async function importLorebookPayload(data: unknown, db: DB) {
   if (!d?.lorebook) {
     return { success: false, type: "marinara_lorebook" as const, error: "Invalid lorebook data" };
   }
+  const decodedImages = new Map<Record<string, unknown>, Awaited<ReturnType<typeof decodeLorebookImages>>>();
+  for (const entry of d.entries ?? []) decodedImages.set(entry, await decodeLorebookImages(entry.images));
+  const savedImages = new Map<Record<string, unknown>, Awaited<ReturnType<typeof saveDecodedLorebookImages>>>();
   const lb = d.lorebook;
-  const newLb = (await storage.create(
-    {
-      name: String(lb.name ?? "Imported Lorebook"),
-      description: String(lb.description ?? ""),
-      category: (lb.category as any) ?? "uncategorized",
-      scanDepth: Number(lb.scanDepth ?? 2),
-      tokenBudget: Number(lb.tokenBudget ?? 2048),
-      entryLimit: Number(lb.entryLimit ?? 100),
-      recursiveScanning: Boolean(lb.recursiveScanning),
-      maxRecursionDepth: Number(lb.maxRecursionDepth ?? 3),
-      excludeFromVectorization: Boolean(lb.excludeFromVectorization),
-      vectorQueryDepth: Number(lb.vectorQueryDepth ?? 10),
-      vectorScoreThreshold: Number(lb.vectorScoreThreshold ?? 0.3),
-      vectorMaxResults: Number(lb.vectorMaxResults ?? 10),
-      characterId: typeof lb.characterId === "string" ? lb.characterId : null,
-      characterIds: Array.isArray(lb.characterIds)
-        ? lb.characterIds.filter((value): value is string => typeof value === "string")
-        : typeof lb.characterId === "string"
-          ? [lb.characterId]
-          : [],
-      personaId: typeof lb.personaId === "string" ? lb.personaId : null,
-      personaIds: Array.isArray(lb.personaIds)
-        ? lb.personaIds.filter((value): value is string => typeof value === "string")
-        : typeof lb.personaId === "string"
-          ? [lb.personaId]
-          : [],
-      chatId: typeof lb.chatId === "string" ? lb.chatId : null,
-      isGlobal: lb.isGlobal === true || lb.isGlobal === "true",
-      enabled: lb.enabled !== false,
-      scope: readLorebookScope(lb.scope),
-      tags: Array.isArray(lb.tags) ? lb.tags.map(String) : [],
-      generatedBy: "import",
-      sourceAgentId: typeof lb.sourceAgentId === "string" ? lb.sourceAgentId : null,
-    },
-    readTimestampOverrides(lb),
-  )) as Record<string, unknown> | null;
+  let newLb: Record<string, unknown> | null = null;
+  try {
+    for (const entry of d.entries ?? [])
+      savedImages.set(entry, await saveDecodedLorebookImages(decodedImages.get(entry)!));
+    newLb = (await storage.create(
+      {
+        name: String(lb.name ?? "Imported Lorebook"),
+        description: String(lb.description ?? ""),
+        category: (lb.category as any) ?? "uncategorized",
+        scanDepth: Number(lb.scanDepth ?? 2),
+        tokenBudget: Number(lb.tokenBudget ?? 2048),
+        entryLimit: Number(lb.entryLimit ?? 100),
+        recursiveScanning: Boolean(lb.recursiveScanning),
+        maxRecursionDepth: Number(lb.maxRecursionDepth ?? 3),
+        excludeFromVectorization: Boolean(lb.excludeFromVectorization),
+        vectorQueryDepth: Number(lb.vectorQueryDepth ?? 10),
+        vectorIncludeAssistant: lb.vectorIncludeAssistant === true,
+        vectorScoreThreshold: Number(lb.vectorScoreThreshold ?? 0.3),
+        vectorMaxResults: Number(lb.vectorMaxResults ?? 10),
+        characterId: typeof lb.characterId === "string" ? lb.characterId : null,
+        characterIds: Array.isArray(lb.characterIds)
+          ? lb.characterIds.filter((value): value is string => typeof value === "string")
+          : typeof lb.characterId === "string"
+            ? [lb.characterId]
+            : [],
+        personaId: typeof lb.personaId === "string" ? lb.personaId : null,
+        personaIds: Array.isArray(lb.personaIds)
+          ? lb.personaIds.filter((value): value is string => typeof value === "string")
+          : typeof lb.personaId === "string"
+            ? [lb.personaId]
+            : [],
+        chatId: typeof lb.chatId === "string" ? lb.chatId : null,
+        isGlobal: lb.isGlobal === true || lb.isGlobal === "true",
+        enabled: lb.enabled !== false,
+        scope: readLorebookScope(lb.scope),
+        tags: Array.isArray(lb.tags) ? lb.tags.map(String) : [],
+        generatedBy: "import",
+        sourceAgentId: typeof lb.sourceAgentId === "string" ? lb.sourceAgentId : null,
+      },
+      readTimestampOverrides(lb),
+    )) as Record<string, unknown> | null;
 
-  // Re-create folders in two passes so nesting survives the round-trip. A child
-  // folder can be listed before its parent, so pass 1 creates every folder at
-  // root and builds the old-ID → new-ID remap; pass 2 re-parents each folder
-  // through that remap. Every move is validated with canReparentFolder (the same
-  // guard the PATCH route uses), so a malformed/hand-edited export can never
-  // persist a cycle — an unresolvable or cyclic parent just leaves that folder at
-  // root. Older exports without `folders` skip both passes and entries land at root.
-  const folderIdRemap = new Map<string, string>();
-  if (newLb && Array.isArray(d.folders) && d.folders.length > 0) {
-    const lorebookId = newLb.id as string;
-    // Pass 1 — create at root, remembering each folder's exported parent (old ID).
-    const pendingReparents: Array<{ newId: string; oldParentId: string }> = [];
-    for (const f of d.folders) {
-      const oldId = typeof f.id === "string" ? f.id : null;
-      const created = (await storage.createFolder(lorebookId, {
-        name: String(f.name ?? "Folder"),
-        enabled: f.enabled !== false,
-        parentFolderId: null,
-        order: Number(f.order ?? 0),
-      })) as Record<string, unknown> | null;
-      const newId = created?.id;
-      if (oldId && typeof newId === "string") {
-        folderIdRemap.set(oldId, newId);
-        const oldParentId = typeof f.parentFolderId === "string" ? f.parentFolderId : null;
-        if (oldParentId) pendingReparents.push({ newId, oldParentId });
+    // Re-create folders in two passes so nesting survives the round-trip. A child
+    // folder can be listed before its parent, so pass 1 creates every folder at
+    // root and builds the old-ID → new-ID remap; pass 2 re-parents each folder
+    // through that remap. Every move is validated with canReparentFolder (the same
+    // guard the PATCH route uses), so a malformed/hand-edited export can never
+    // persist a cycle — an unresolvable or cyclic parent just leaves that folder at
+    // root. Older exports without `folders` skip both passes and entries land at root.
+    const folderIdRemap = new Map<string, string>();
+    if (newLb && Array.isArray(d.folders) && d.folders.length > 0) {
+      const lorebookId = newLb.id as string;
+      // Pass 1 — create at root, remembering each folder's exported parent (old ID).
+      const pendingReparents: Array<{ newId: string; oldParentId: string }> = [];
+      for (const f of d.folders) {
+        const oldId = typeof f.id === "string" ? f.id : null;
+        const created = (await storage.createFolder(lorebookId, {
+          name: String(f.name ?? "Folder"),
+          enabled: f.enabled !== false,
+          parentFolderId: null,
+          order: Number(f.order ?? 0),
+        })) as Record<string, unknown> | null;
+        const newId = created?.id;
+        if (oldId && typeof newId === "string") {
+          folderIdRemap.set(oldId, newId);
+          const oldParentId = typeof f.parentFolderId === "string" ? f.parentFolderId : null;
+          if (oldParentId) pendingReparents.push({ newId, oldParentId });
+        }
+      }
+      // Pass 2 — re-parent through the remap. `folderRows` mirrors the DB state so
+      // canReparentFolder sees each applied move; an invalid move (dangling or
+      // cyclic parent) is skipped, leaving that folder at root like the editor does.
+      const folderRows = Array.from(folderIdRemap.values()).map((id) => ({
+        id,
+        lorebookId,
+        parentFolderId: null as string | null,
+      }));
+      const rowById = new Map(folderRows.map((row) => [row.id, row]));
+      for (const { newId, oldParentId } of pendingReparents) {
+        const newParentId = folderIdRemap.get(oldParentId);
+        if (!newParentId) continue; // parent wasn't part of the export → leave at root
+        if (!canReparentFolder(folderRows, newId, newParentId).ok) continue;
+        await storage.updateFolder(newId, { parentFolderId: newParentId }, lorebookId);
+        const row = rowById.get(newId);
+        if (row) row.parentFolderId = newParentId;
       }
     }
-    // Pass 2 — re-parent through the remap. `folderRows` mirrors the DB state so
-    // canReparentFolder sees each applied move; an invalid move (dangling or
-    // cyclic parent) is skipped, leaving that folder at root like the editor does.
-    const folderRows = Array.from(folderIdRemap.values()).map((id) => ({
-      id,
-      lorebookId,
-      parentFolderId: null as string | null,
-    }));
-    const rowById = new Map(folderRows.map((row) => [row.id, row]));
-    for (const { newId, oldParentId } of pendingReparents) {
-      const newParentId = folderIdRemap.get(oldParentId);
-      if (!newParentId) continue; // parent wasn't part of the export → leave at root
-      if (!canReparentFolder(folderRows, newId, newParentId).ok) continue;
-      await storage.updateFolder(newId, { parentFolderId: newParentId }, lorebookId);
-      const row = rowById.get(newId);
-      if (row) row.parentFolderId = newParentId;
+
+    if (newLb && Array.isArray(d.entries) && d.entries.length > 0) {
+      const entries = [];
+      for (const e of d.entries) {
+        const oldFolderId = typeof e.folderId === "string" ? e.folderId : null;
+        const newFolderId = oldFolderId ? (folderIdRemap.get(oldFolderId) ?? null) : null;
+        entries.push({
+          name: String(e.name ?? ""),
+          content: String(e.content ?? ""),
+          images: savedImages.get(e) ?? [],
+          // CodeRabbit-flagged: description, ephemeral, locked, and recursion flags
+          // were absent from the previous map, so an exported lorebook would lose
+          // these fields on re-import. Knowledge-router matching uses description,
+          // ephemeral controls auto-disable countdown, locked protects entries
+          // from the Lorebook Keeper agent, and recursion flags gate recursive
+          // scanning — all behaviors that should round-trip.
+          description: String(e.description ?? ""),
+          keys: Array.isArray(e.keys) ? e.keys.map(String) : [],
+          secondaryKeys: Array.isArray(e.secondaryKeys) ? e.secondaryKeys.map(String) : [],
+          enabled: e.enabled !== false,
+          constant: Boolean(e.constant),
+          selective: Boolean(e.selective),
+          selectiveLogic: resolveNativeSelectiveLogic(e.selectiveLogic),
+          probability: e.probability != null ? Number(e.probability) : null,
+          scanDepth: e.scanDepth != null ? Number(e.scanDepth) : null,
+          matchWholeWords: Boolean(e.matchWholeWords),
+          caseSensitive: Boolean(e.caseSensitive),
+          useRegex: Boolean(e.useRegex),
+          characterFilterMode: readFilterMode(e.characterFilterMode),
+          characterFilterIds: Array.isArray(e.characterFilterIds) ? e.characterFilterIds.map(String) : [],
+          characterTagFilterMode: readFilterMode(e.characterTagFilterMode),
+          characterTagFilters: Array.isArray(e.characterTagFilters) ? e.characterTagFilters.map(String) : [],
+          generationTriggerFilterMode: readFilterMode(e.generationTriggerFilterMode),
+          generationTriggerFilters: Array.isArray(e.generationTriggerFilters)
+            ? e.generationTriggerFilters.map(String)
+            : [],
+          additionalMatchingSources: readMatchingSources(e.additionalMatchingSources),
+          position: resolveNativePosition(e.position),
+          outletName: String(e.outletName ?? ""),
+          depth: Number(e.depth ?? 4),
+          order: Number(e.order ?? 100),
+          role: resolveLorebookEntryRole(e.role),
+          sticky: e.sticky != null ? Number(e.sticky) : null,
+          cooldown: e.cooldown != null ? Number(e.cooldown) : null,
+          delay: e.delay != null ? Number(e.delay) : null,
+          ephemeral: e.ephemeral != null ? Number(e.ephemeral) : null,
+          group: String(e.group ?? ""),
+          groupWeight: e.groupWeight != null ? Number(e.groupWeight) : null,
+          folderId: newFolderId,
+          locked: Boolean(e.locked),
+          preventRecursion: e.preventRecursion == null ? true : Boolean(e.preventRecursion),
+          excludeRecursion: Boolean(e.excludeRecursion),
+          delayUntilRecursion: Boolean(e.delayUntilRecursion),
+          excludeFromVectorization: Boolean(e.excludeFromVectorization),
+          tag: String(e.tag ?? ""),
+          relationships: (e.relationships as any) ?? {},
+          dynamicState: (e.dynamicState as any) ?? {},
+          activationConditions: (e.activationConditions as any) ?? [],
+          schedule: (e.schedule as any) ?? null,
+          ...parseLorebookDecisionActivation(e),
+        });
+      }
+      await storage.bulkCreateEntries(newLb.id as string, entries);
     }
-  }
 
-  if (newLb && Array.isArray(d.entries) && d.entries.length > 0) {
-    const entries = d.entries.map((e) => {
-      const oldFolderId = typeof e.folderId === "string" ? e.folderId : null;
-      const newFolderId = oldFolderId ? (folderIdRemap.get(oldFolderId) ?? null) : null;
-      return {
-        name: String(e.name ?? ""),
-        content: String(e.content ?? ""),
-        // CodeRabbit-flagged: description, ephemeral, locked, and recursion flags
-        // were absent from the previous map, so an exported lorebook would lose
-        // these fields on re-import. Knowledge-router matching uses description,
-        // ephemeral controls auto-disable countdown, locked protects entries
-        // from the Lorebook Keeper agent, and recursion flags gate recursive
-        // scanning — all behaviors that should round-trip.
-        description: String(e.description ?? ""),
-        keys: Array.isArray(e.keys) ? e.keys.map(String) : [],
-        secondaryKeys: Array.isArray(e.secondaryKeys) ? e.secondaryKeys.map(String) : [],
-        enabled: e.enabled !== false,
-        constant: Boolean(e.constant),
-        selective: Boolean(e.selective),
-        selectiveLogic: resolveNativeSelectiveLogic(e.selectiveLogic),
-        probability: e.probability != null ? Number(e.probability) : null,
-        scanDepth: e.scanDepth != null ? Number(e.scanDepth) : null,
-        matchWholeWords: Boolean(e.matchWholeWords),
-        caseSensitive: Boolean(e.caseSensitive),
-        useRegex: Boolean(e.useRegex),
-        characterFilterMode: readFilterMode(e.characterFilterMode),
-        characterFilterIds: Array.isArray(e.characterFilterIds) ? e.characterFilterIds.map(String) : [],
-        characterTagFilterMode: readFilterMode(e.characterTagFilterMode),
-        characterTagFilters: Array.isArray(e.characterTagFilters) ? e.characterTagFilters.map(String) : [],
-        generationTriggerFilterMode: readFilterMode(e.generationTriggerFilterMode),
-        generationTriggerFilters: Array.isArray(e.generationTriggerFilters)
-          ? e.generationTriggerFilters.map(String)
-          : [],
-        additionalMatchingSources: readMatchingSources(e.additionalMatchingSources),
-        position: resolveNativePosition(e.position),
-        outletName: String(e.outletName ?? ""),
-        depth: Number(e.depth ?? 4),
-        order: Number(e.order ?? 100),
-        role: resolveLorebookEntryRole(e.role),
-        sticky: e.sticky != null ? Number(e.sticky) : null,
-        cooldown: e.cooldown != null ? Number(e.cooldown) : null,
-        delay: e.delay != null ? Number(e.delay) : null,
-        ephemeral: e.ephemeral != null ? Number(e.ephemeral) : null,
-        group: String(e.group ?? ""),
-        groupWeight: e.groupWeight != null ? Number(e.groupWeight) : null,
-        folderId: newFolderId,
-        locked: Boolean(e.locked),
-        preventRecursion: e.preventRecursion == null ? true : Boolean(e.preventRecursion),
-        excludeRecursion: Boolean(e.excludeRecursion),
-        delayUntilRecursion: Boolean(e.delayUntilRecursion),
-        excludeFromVectorization: Boolean(e.excludeFromVectorization),
-        tag: String(e.tag ?? ""),
-        relationships: (e.relationships as any) ?? {},
-        dynamicState: (e.dynamicState as any) ?? {},
-        activationConditions: (e.activationConditions as any) ?? [],
-        schedule: (e.schedule as any) ?? null,
-      };
-    });
-    await storage.bulkCreateEntries(newLb.id as string, entries);
+    return {
+      success: true,
+      type: "marinara_lorebook" as const,
+      id: newLb?.id as string,
+      name: String(lb.name ?? "Imported Lorebook"),
+    };
+  } catch (error) {
+    if (newLb) await storage.remove(newLb.id as string);
+    await discardImportedLorebookImages(savedImages.values(), decodedImages.values());
+    throw error;
   }
-
-  return {
-    success: true,
-    type: "marinara_lorebook" as const,
-    id: newLb?.id as string,
-    name: String(lb.name ?? "Imported Lorebook"),
-  };
 }
 
 // ── Preset ───────────────────────────────────
@@ -919,6 +966,7 @@ async function importPreset(data: unknown, db: DB) {
         injectionDepth: Number(s.injectionDepth ?? 0),
         injectionOrder: Number(s.injectionOrder ?? 100),
         forbidOverrides: s.forbidOverrides === true || s.forbidOverrides === "true",
+        skipWrap: s.skipWrap === true || s.skipWrap === "true",
       });
       if (newSection) sectionMap.set(String(s.id), newSection.id);
     }

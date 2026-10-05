@@ -7,46 +7,22 @@ import type { Message } from "@marinara-engine/shared";
 import { toast } from "sonner";
 import { api } from "../lib/api-client";
 import { parseMessageExtraRecord } from "../lib/chat-message-extra";
-import { parseChatMetadata } from "../lib/chat-display";
 import { useTranslationStore, type TranslationConfig } from "../stores/translation.store";
 import { chatKeys, replaceCachedMessage } from "./use-chats";
 
 const translationPersistenceQueues = new Map<string, Promise<void>>();
-const pendingTranslations = new Map<string, Promise<void>>();
+const pendingTranslations = new Map<
+  string,
+  { messageId: string; text: string; request: Promise<void>; invalidated: boolean }
+>();
+const queuedTranslations = new Set<{ messageId: string; invalidated: boolean }>();
 
-export function getChatTranslationConfig(chatId: string, metadata: unknown): TranslationConfig {
-  const chatMeta = parseChatMetadata(metadata);
-  const legacyTargetLanguage =
-    (typeof chatMeta.translationTargetLang === "string" ? chatMeta.translationTargetLang.trim() : "") || "en";
-  const legacySystemPrompt = typeof chatMeta.translationPrompt === "string" ? chatMeta.translationPrompt : undefined;
-  const inputSystemPrompt =
-    chatMeta.translationInputPrompt === undefined
-      ? legacySystemPrompt
-      : typeof chatMeta.translationInputPrompt === "string"
-        ? chatMeta.translationInputPrompt
-        : undefined;
-  const outputSystemPrompt =
-    chatMeta.translationOutputPrompt === undefined
-      ? legacySystemPrompt
-      : typeof chatMeta.translationOutputPrompt === "string"
-        ? chatMeta.translationOutputPrompt
-        : undefined;
-  return {
-    chatId,
-    provider: chatMeta.translationProvider ?? "google",
-    // Cleared fields retain the legacy/default language.
-    inputTargetLanguage:
-      (typeof chatMeta.translationInputTargetLang === "string" ? chatMeta.translationInputTargetLang.trim() : "") ||
-      legacyTargetLanguage,
-    outputTargetLanguage:
-      (typeof chatMeta.translationOutputTargetLang === "string" ? chatMeta.translationOutputTargetLang.trim() : "") ||
-      legacyTargetLanguage,
-    connectionId: chatMeta.translationConnectionId,
-    inputSystemPrompt,
-    outputSystemPrompt,
-    deeplApiKey: chatMeta.translationDeeplApiKey,
-    deeplxUrl: chatMeta.translationDeeplxUrl,
-  };
+/** Editing a source also invalidates requests that have not returned yet. */
+export function invalidateTranslation(messageId: string) {
+  for (const pending of [...pendingTranslations.values(), ...queuedTranslations]) {
+    if (pending.messageId === messageId) pending.invalidated = true;
+  }
+  useTranslationStore.getState().invalidateTranslation(messageId);
 }
 
 function enqueueTranslationPersistence(
@@ -54,13 +30,16 @@ function enqueueTranslationPersistence(
   chatId: string,
   messageId: string,
   extra: Record<string, unknown>,
+  isValid: () => boolean = () => true,
 ) {
   const queueKey = `${chatId}:${messageId}`;
   const previous = translationPersistenceQueues.get(queueKey) ?? Promise.resolve();
   const request = previous
     .catch(() => undefined)
     .then(async () => {
+      if (!isValid()) return;
       await api.patch(`/chats/${chatId}/messages/${messageId}/extra`, extra);
+      if (!isValid()) return;
       queryClient.setQueryData<InfiniteData<Message[]>>(chatKeys.messages(chatId), (old) =>
         replaceCachedMessage(old, messageId, (message) => ({
           ...message,
@@ -92,14 +71,27 @@ export function translateMessage(
   const requestChatId = chatId ?? config.chatId;
   const key = `${requestChatId ?? ""}:${messageId}`;
   const pending = pendingTranslations.get(key);
-  if (pending) return pending;
+  if (pending) {
+    // Finish the previous source (including persistence) before translating a regenerated reply.
+    if (pending.text === text && !pending.invalidated) return pending.request;
+    const queued = { messageId, invalidated: false };
+    queuedTranslations.add(queued);
+    return pending.request
+      .catch(() => undefined)
+      .then(() => {
+        queuedTranslations.delete(queued);
+        if (!queued.invalidated) return translateMessage(queryClient, messageId, text, config, chatId);
+      });
+  }
   const store = useTranslationStore.getState();
   const isCurrentChat = () => useTranslationStore.getState().config.chatId === requestChatId;
   if (isCurrentChat()) store.setTranslating(messageId, true);
+  const attempt = { messageId, text, request: Promise.resolve(), invalidated: false };
   const request = (async () => {
     let translatedText: string;
     try {
       const result = await api.post<{ translatedText: string }>("/translate", {
+        chatId: requestChatId,
         text,
         provider: config.provider,
         targetLanguage: config.outputTargetLanguage,
@@ -108,23 +100,29 @@ export function translateMessage(
         deeplApiKey: config.deeplApiKey,
         deeplxUrl: config.deeplxUrl,
       });
+      if (attempt.invalidated) return;
       translatedText = result.translatedText;
-      if (isCurrentChat()) store.setTranslation(messageId, translatedText, text);
+      if (chatId) {
+        await enqueueTranslationPersistence(
+          queryClient,
+          chatId,
+          messageId,
+          { translation: translatedText, translationSource: text, translationHidden: false },
+          () => !attempt.invalidated,
+        ).catch(() => {});
+      }
+      // Navigation can return to this chat while its extras are being saved.
+      // Publish after persistence so a seeded, older translation cannot win.
+      if (!attempt.invalidated && isCurrentChat()) store.setTranslation(messageId, translatedText, text);
     } finally {
       if (isCurrentChat()) store.setTranslating(messageId, false);
     }
-    if (chatId) {
-      await enqueueTranslationPersistence(queryClient, chatId, messageId, {
-        translation: translatedText,
-        translationSource: text,
-        translationHidden: false,
-      }).catch(() => {});
-    }
   })();
-  pendingTranslations.set(key, request);
+  attempt.request = request;
+  pendingTranslations.set(key, attempt);
   void request
     .finally(() => {
-      if (pendingTranslations.get(key) === request) pendingTranslations.delete(key);
+      if (pendingTranslations.get(key)?.request === request) pendingTranslations.delete(key);
     })
     .catch(() => {});
   return request;

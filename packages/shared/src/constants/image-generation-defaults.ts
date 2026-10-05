@@ -39,6 +39,7 @@ export const DEFAULT_COMFYUI_DEFAULTS: ComfyUiDefaults = {
   denoisingStrength: 1,
   clipSkip: null,
   uploadPlaceholderOnMissingReference: false,
+  saveToBackend: false,
   loras: [],
 };
 
@@ -150,7 +151,7 @@ export function imageSourceToDefaultsService(value: unknown): ImageDefaultsServi
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
   if (normalized === "drawthings" || normalized === "arli") return "automatic1111";
-  if (normalized === "swarmui") return "comfyui";
+  if (normalized === "swarmui" || normalized === "runpod_comfyui") return "comfyui";
   return isImageDefaultsService(normalized) ? normalized : null;
 }
 
@@ -312,6 +313,7 @@ function normalizeComfyUiDefaults(rawDefaults: unknown): ComfyUiDefaults {
       DEFAULT_COMFYUI_DEFAULTS.uploadPlaceholderOnMissingReference,
     ),
     loras: normalizeComfyUiLoraSettings(raw.loras),
+    saveToBackend: readBoolean(raw.saveToBackend, false),
   };
 }
 

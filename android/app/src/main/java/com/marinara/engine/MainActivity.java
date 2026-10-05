@@ -118,6 +118,9 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private Button manualServerButton;
     private ValueCallback<Uri[]> fileUploadCallback;
+    /** The empty photo the camera choice of the current file chooser writes into, if it offered one. */
+    private Uri pendingCameraPhoto;
+    private static final String PENDING_CAMERA_PHOTO_STATE = "pendingCameraPhoto";
     private byte[] pendingFileSaveData;
     private String pendingFileSaveName;
     private boolean isDownloadingTermux;
@@ -138,6 +141,10 @@ public class MainActivity extends Activity {
     @SuppressLint("SetJavaScriptEnabled")
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Android may close the app while the camera is open; keep the photo's address so a cancelled
+        // capture can still be cleaned up when it returns. The page's upload itself can't be resumed.
+        String pendingPhoto = savedInstanceState == null ? null : savedInstanceState.getString(PENDING_CAMERA_PHOTO_STATE);
+        if (pendingPhoto != null) pendingCameraPhoto = Uri.parse(pendingPhoto);
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         applyStatusBarVisibility(isStatusBarVisible());
@@ -343,10 +350,10 @@ public class MainActivity extends Activity {
                     fileUploadCallback.onReceiveValue(null);
                 }
                 fileUploadCallback = callback;
-                Intent intent = params.createIntent();
                 try {
-                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                    startActivityForResult(withCameraChoice(params), FILE_CHOOSER_REQUEST);
                 } catch (Exception e) {
+                    discardPendingCameraPhoto();
                     fileUploadCallback = null;
                     return false;
                 }
@@ -1365,6 +1372,71 @@ public class MainActivity extends Activity {
         return message == null || message.trim().isEmpty() ? error.getClass().getSimpleName() : message;
     }
 
+    /**
+     * Adds a Camera choice next to the file picker when the page asks for images, as Chrome does
+     * (#6953). The photo goes to Pictures/Marinara like the app's other saved images; Android 9 and
+     * older keep the plain file picker.
+     */
+    private Intent withCameraChoice(WebChromeClient.FileChooserParams params) {
+        Intent picker = params.createIntent();
+        discardPendingCameraPhoto();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || !acceptsImages(params.getAcceptTypes())) return picker;
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, "Marinara_" + System.currentTimeMillis() + ".jpg");
+        values.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Marinara");
+        Uri photo;
+        try {
+            photo = getContentResolver().insert(
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+        } catch (Exception error) {
+            return picker;
+        }
+        if (photo == null) return picker;
+        Intent camera = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        camera.putExtra(MediaStore.EXTRA_OUTPUT, photo);
+        camera.setClipData(ClipData.newRawUri("", photo));
+        camera.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        pendingCameraPhoto = photo;
+        Intent chooser = Intent.createChooser(picker, null);
+        chooser.putExtra(Intent.EXTRA_INITIAL_INTENTS, new Intent[] { camera });
+        return chooser;
+    }
+
+    private static boolean acceptsImages(String[] acceptTypes) {
+        if (acceptTypes == null || acceptTypes.length == 0) return true;
+        for (String type : acceptTypes) {
+            String value = type == null ? "" : type.trim().toLowerCase();
+            if (value.isEmpty() || value.equals("*/*") || value.startsWith("image/")) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsUri(Uri[] uris, Uri target) {
+        if (uris == null) return false;
+        for (Uri uri : uris) {
+            if (target.equals(uri)) return true;
+        }
+        return false;
+    }
+
+    /** Removes the empty photo file when the camera wasn't used. */
+    private void discardPendingCameraPhoto() {
+        if (pendingCameraPhoto == null) return;
+        try {
+            getContentResolver().delete(pendingCameraPhoto, null, null);
+        } catch (Exception ignored) {
+            // Nothing else to clean up.
+        }
+        pendingCameraPhoto = null;
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (pendingCameraPhoto != null) outState.putString(PENDING_CAMERA_PHOTO_STATE, pendingCameraPhoto.toString());
+    }
+
     /** Writes a download into the app's Pictures or Downloads collection on Android 10 and newer. */
     private void saveFileToMediaStore(byte[] data, String mimeType, String filename) throws Exception {
         ContentResolver resolver = getContentResolver();
@@ -1599,8 +1671,17 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == FILE_CHOOSER_REQUEST) {
+            Uri cameraPhoto = pendingCameraPhoto;
+            pendingCameraPhoto = null;
+            Uri[] result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+            // The camera usually answers without data: its photo is already in the file made for it.
+            if (result == null && resultCode == RESULT_OK && cameraPhoto != null) {
+                result = new Uri[] { cameraPhoto };
+            } else if (cameraPhoto != null && !containsUri(result, cameraPhoto)) {
+                pendingCameraPhoto = cameraPhoto;
+                discardPendingCameraPhoto();
+            }
             if (fileUploadCallback != null) {
-                Uri[] result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
                 fileUploadCallback.onReceiveValue(result);
                 fileUploadCallback = null;
             }

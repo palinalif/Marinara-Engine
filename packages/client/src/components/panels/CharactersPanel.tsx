@@ -57,21 +57,30 @@ import {
   parseCardLibrarySearchQuery,
 } from "../../lib/card-library-search";
 import { useUIStore, type CharacterLibrarySort } from "../../stores/ui.store";
+import { sortPanelFolders } from "../../lib/panel-sort";
 import { handleFolderRenameKeyDown, useFolderRenameGesture } from "../../hooks/use-folder-rename-gesture";
 import { useTouchFolderDrag } from "../../hooks/use-touch-folder-drag";
 import { normalizeAvatarCrop } from "@marinara-engine/shared";
 import type { CharacterCatalogEntry } from "@marinara-engine/shared";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
-import { estimateCharacterCardTokens, formatEstimatedTokens } from "../../lib/character-token-count";
+import { formatEstimatedTokens } from "../../lib/character-token-count";
 import { SelectionActionBar } from "../ui/SelectionActionBar";
 import { SmoothFolderContent } from "../ui/SmoothFolderContent";
 import { TouchDragHandle } from "../ui/TouchDragHandle";
 import { PanelLoadMoreBar } from "./PanelLoadMoreBar";
 import { clearActiveChatResourceDrag, writeChatResourceDragPayload } from "../../lib/chat-resource-drag";
 import { ChatResourceActionButton } from "../chat/ChatResourceActionButton";
+import { CharacterBulkTagsModal } from "../characters/CharacterBulkTagsModal";
 
 type CharacterRow = CharacterCatalogEntry;
-type GroupRow = { id: string; name: string; description: string; characterIds: string; avatarPath: string | null };
+type GroupRow = {
+  id: string;
+  name: string;
+  description: string;
+  characterIds: string;
+  avatarPath: string | null;
+  createdAt: string;
+};
 type ParsedCharacterRow = CharacterRow & { parsed: Record<string, any> };
 type ParsedGroupRow = GroupRow & { memberIds: string[] };
 
@@ -111,7 +120,7 @@ function parseCharacterRow(char: CharacterRow): ParsedCharacterRow {
       character_version: char.version,
       extensions: { fav: char.favorite, avatarCrop: char.avatarCrop, nameColor: char.nameColor },
     };
-    return { ...char, parsed: (parsed as unknown as ParsedCharacterRow["parsed"]) ?? {} };
+    return { ...char, parsed: parsed as unknown as ParsedCharacterRow["parsed"] };
   } catch {
     return { ...char, parsed: { name: "Unknown", description: "" } };
   }
@@ -209,6 +218,7 @@ export function CharactersPanel() {
   const [selectedCharacterIds, setSelectedCharacterIds] = useState<Set<string>>(new Set());
   const [exportingSelected, setExportingSelected] = useState(false);
   const [movingSelected, setMovingSelected] = useState(false);
+  const [bulkTagsOpen, setBulkTagsOpen] = useState(false);
 
   // Parse character data and filter by search
   const parsedCharacters = useMemo(() => {
@@ -456,6 +466,18 @@ export function CharactersPanel() {
     });
   }, [groups]);
 
+  const sortedGroups = useMemo(() => {
+    const folders = sortPanelFolders(parsedGroups, sort === "favorites" ? "name-asc" : sort);
+    if (sort !== "favorites") return folders;
+    const favorites = new Set(
+      sortedCharacters.filter((character) => character.parsed.extensions?.fav).map((character) => character.id),
+    );
+    return folders.sort(
+      (a, b) =>
+        Number(b.memberIds.some((id) => favorites.has(id))) - Number(a.memberIds.some((id) => favorites.has(id))),
+    );
+  }, [parsedGroups, sort, sortedCharacters]);
+
   const folderedCharacterIds = useMemo(() => {
     const ids = new Set<string>();
     for (const folder of parsedGroups) {
@@ -463,8 +485,8 @@ export function CharactersPanel() {
     }
     return ids;
   }, [parsedGroups]);
-  const visibleCharacterById = useMemo(
-    () => new Map(sortedCharacters.map((character) => [character.id, character])),
+  const characterOrder = useMemo(
+    () => new Map(sortedCharacters.map((character, index) => [character.id, index])),
     [sortedCharacters],
   );
   const folderFilterActive =
@@ -633,7 +655,7 @@ export function CharactersPanel() {
     }
   }, []);
 
-  const { startTouchDrag: startCharacterTouchDrag } = useTouchFolderDrag({
+  const { startTouchDrag: startCharacterTouchDrag, startMouseDrag: startCharacterMouseDrag } = useTouchFolderDrag({
     onActivate: (characterId) => {
       suppressCharacterClickRef.current = true;
       setDraggedCharacterId(characterId);
@@ -962,10 +984,15 @@ export function CharactersPanel() {
       )}
 
       <div className="flex flex-col gap-0.5">
-        {parsedGroups.map((group) => {
-          const folderMemberIds = folderFilterActive
-            ? group.memberIds.filter((memberId) => visibleCharacterById.has(memberId))
-            : group.memberIds;
+        {sortedGroups.map((group) => {
+          const folderMemberIds = (
+            folderFilterActive
+              ? group.memberIds.filter((memberId) => characterOrder.has(memberId))
+              : [...group.memberIds]
+          ).sort(
+            (a, b) =>
+              (characterOrder.get(a) ?? sortedCharacters.length) - (characterOrder.get(b) ?? sortedCharacters.length),
+          );
           if (folderFilterActive && folderMemberIds.length === 0) return null;
           const isExpanded = (folderFilterActive && folderMemberIds.length > 0) || expandedGroupId === group.id;
           const isEditing = editingGroupId === group.id;
@@ -1037,6 +1064,7 @@ export function CharactersPanel() {
                       onKeyDown={(e) => {
                         if (e.key === "Enter") e.currentTarget.blur();
                         if (e.key === "Escape") {
+                          e.preventDefault();
                           setEditingGroupId(null);
                           setEditGroupName("");
                         }
@@ -1106,13 +1134,29 @@ export function CharactersPanel() {
                     : getCharacterTitle(member);
                   const memberPreviewMetadata = fullMember ? getCharacterPreviewMetadata(fullMember) : null;
                   const memberTags = fullMember ? getCharacterTags(fullMember) : [];
-                  const memberTokenEstimate = fullMember ? estimateCharacterCardTokens(fullMember.parsed) : null;
+                  const memberTokenEstimate = fullMember?.tokenEstimate ?? null;
                   const memberNameColor = (fullMember?.parsed.extensions?.nameColor as string) || undefined;
                   const memberAvatarCrop = normalizeAvatarCrop(fullMember?.parsed.extensions?.avatarCrop) ?? undefined;
                   return (
                     <div
                       key={memberId}
                       data-touch-drag-card="character"
+                      onMouseDown={(event) => {
+                        const ids = getDraggedCharacterIds(memberId);
+                        startCharacterMouseDrag(event, memberId, {
+                          chatResourcePayload: {
+                            version: 1,
+                            kind: "character",
+                            ids,
+                            label:
+                              ids.length === 1
+                                ? memberName
+                                : localizeUi("ui.chat.chatresourcedropoverlay.characterCount", {
+                                    count: ids.length,
+                                  }),
+                          },
+                        });
+                      }}
                       onClick={() => {
                         if (suppressCharacterClickRef.current) return;
                         if (selectionMode) {
@@ -1457,13 +1501,29 @@ export function CharactersPanel() {
           const isFavorite = !!char.parsed.extensions?.fav;
           const avatarUrl = char.avatarPath;
           const previewMetadata = getCharacterPreviewMetadata(char);
-          const tokenEstimate = estimateCharacterCardTokens(char.parsed);
+          const tokenEstimate = char.tokenEstimate;
 
           return (
             <div
               key={char.id}
               data-character-id={char.id}
               data-touch-drag-card="character"
+              onMouseDown={(event) => {
+                const ids = getDraggedCharacterIds(char.id);
+                startCharacterMouseDrag(event, char.id, {
+                  chatResourcePayload: {
+                    version: 1,
+                    kind: "character",
+                    ids,
+                    label:
+                      ids.length === 1
+                        ? charName
+                        : localizeUi("ui.chat.chatresourcedropoverlay.characterCount", {
+                            count: ids.length,
+                          }),
+                  },
+                });
+              }}
               onClick={() => {
                 if (suppressCharacterClickRef.current) return;
                 if (selectionMode) {
@@ -1730,22 +1790,46 @@ export function CharactersPanel() {
           placement="panel"
           selectedCount={selectedCharacterIds.size}
           extraAction={
-            <button
-              type="button"
-              onClick={() => void handleMoveSelected()}
-              disabled={selectedCharacterIds.size === 0 || parsedGroups.length === 0 || movingSelected}
-              className="mari-chrome-control flex-1 px-3 py-2 text-xs"
-              title={localizeUi("lorebook.editor.batch.move")}
-            >
-              <FolderInput size="0.75rem" />
-              {localizeUi("lorebook.editor.batch.move")}
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => void handleMoveSelected()}
+                disabled={selectedCharacterIds.size === 0 || parsedGroups.length === 0 || movingSelected}
+                className="mari-chrome-control flex-1 px-3 py-2 text-xs"
+                title={localizeUi("lorebook.editor.batch.move")}
+              >
+                <FolderInput size="0.75rem" />
+                {localizeUi("lorebook.editor.batch.move")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setBulkTagsOpen(true)}
+                disabled={selectedCharacterIds.size === 0}
+                className="mari-chrome-control flex-1 px-3 py-2 text-xs"
+              >
+                <Tag size="0.75rem" />
+                {localizeUi("characters.bulkTags.actionShort")}
+              </button>
+            </>
           }
           onExport={() => void handleExportSelected()}
           onDelete={handleDeleteSelected}
           exporting={exportingSelected}
         />
       )}
+      <CharacterBulkTagsModal
+        open={bulkTagsOpen}
+        onClose={() => setBulkTagsOpen(false)}
+        selectedIds={selectedCharacterIds}
+        onApplied={(failedIds) => {
+          setBulkTagsOpen(false);
+          if (failedIds.length > 0) {
+            setSelectedCharacterIds(new Set(failedIds));
+            return;
+          }
+          exitSelectionMode();
+        }}
+      />
     </div>
   );
 }

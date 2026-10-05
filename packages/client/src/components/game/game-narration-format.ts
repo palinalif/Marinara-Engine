@@ -1,6 +1,8 @@
 import DOMPurify from "dompurify";
+import { stripSheetCommandTags } from "@marinara-engine/shared";
 import { escapeStandaloneGameNarrationAngleLines } from "../../lib/game-tag-parser";
 import { HTML_SAFE_DIALOGUE_QUOTE_PATTERN_SOURCE } from "../../lib/dialogue-quotes";
+import { translate } from "../../localization/i18n";
 
 function commandBadge(className: string, label: string, detail?: string): string {
   return `<span class="inline-flex max-w-full flex-wrap items-center gap-1 rounded px-1.5 py-0.5 text-xs ${className}">${label}${
@@ -25,10 +27,21 @@ function formatSignedNumber(value: string): string {
 }
 
 export function formatNarration(content: string, boldDialogue = true): string {
-  let html = escapeStandaloneGameNarrationAngleLines(content)
+  // Sheet commands get no badge: the Engine has already applied them and the sheet shows the
+  // result, so leaving them in would narrate the bookkeeping twice. Stripped here as well as in
+  // the tag parser because this formatter is also handed content that never passed through it
+  // (a translated turn, a storyboard line).
+  let html = escapeStandaloneGameNarrationAngleLines(stripSheetCommandTags(content))
     .replace(/\[combat_result]\s*([\s\S]*?)\s*\[\/combat_result]/gi, (_match, recap: string) => {
       const cleaned = recap.trim();
       return `${commandBadge("bg-red-500/15 text-red-200 ring-1 ring-red-400/20", "⚔ Combat Result")}${
+        cleaned ? `\n${cleaned}` : ""
+      }`;
+    })
+    // What the Engine did when the player used an item, which the Game Master narrates.
+    .replace(/\[item_used]\s*([\s\S]*?)\s*\[\/item_used]/gi, (_match, report: string) => {
+      const cleaned = report.trim();
+      return `${commandBadge("bg-amber-500/15 text-amber-200 ring-1 ring-amber-400/20", translate("game.narration.itemUsed"))}${
         cleaned ? `\n${cleaned}` : ""
       }`;
     })
@@ -49,7 +62,8 @@ export function formatNarration(content: string, boldDialogue = true): string {
     .replace(/\[skill_check:\s*([^\]]+)\]/gi, (_match, rawAttrs: string) => {
       const attrs = parseCommandAttributes(rawAttrs);
       const skill = attrs.skill || "Skill";
-      const dc = attrs.dc ? `DC ${attrs.dc}` : "";
+      // A check that names its ladder step instead of a number shows the step's own name.
+      const dc = attrs.dc ? `DC ${attrs.dc}` : attrs.difficulty || "";
       const total = attrs.total ? `total ${attrs.total}` : "";
       const result = attrs.result ? attrs.result.replace(/_/g, " ") : "";
       return commandBadge(
@@ -98,6 +112,14 @@ export function formatNarration(content: string, boldDialogue = true): string {
         "bg-lime-500/15 text-lime-200 ring-1 ring-lime-400/20",
         "🎒 Inventory",
         [attrs.action, attrs.item].filter(Boolean).join(": "),
+      );
+    })
+    .replace(/\[loot:\s*([^\]]+)\]/gi, (_match, rawAttrs: string) => {
+      const attrs = parseCommandAttributes(rawAttrs);
+      return commandBadge(
+        "bg-lime-500/15 text-lime-200 ring-1 ring-lime-400/20",
+        translate("game.narration.loot"),
+        attrs.table || rawAttrs.trim(),
       );
     })
     .replace(/\[map_update:\s*([^\]]+)\]/gi, (_match, rawAttrs: string) => {

@@ -1,5 +1,6 @@
-import { getRoleplayDocuments, type WrapFormat } from "@marinara-engine/shared";
+import { getRoleplayDocuments, getRoleplayWhispers, type WrapFormat } from "@marinara-engine/shared";
 
+import { parseRoleplayUserCommands } from "../../services/generation/roleplay-commands.js";
 import type { GenerationPromptMessage } from "../../services/generation/prompt-message-scope.js";
 import { wrapContent } from "../../services/prompt/format-engine.js";
 import { parseExtra } from "./generate-route-utils.js";
@@ -90,11 +91,17 @@ export function conversationPromptHistoryContent(
   message: { role?: unknown; content?: unknown; extra?: unknown },
   chatMode: string,
 ): string {
+  if (chatMode === "roleplay" && message.role === "user") {
+    const content = parseRoleplayUserCommands(typeof message.content === "string" ? message.content : "").content;
+    return content.trim() || !getRoleplayWhispers(parseExtra(message.extra)).length ? content : "[Private whisper]";
+  }
   if (chatMode === "roleplay" && message.role === "assistant") {
-    const documents = getRoleplayDocuments(parseExtra(message.extra));
+    const extra = parseExtra(message.extra);
+    const documents = getRoleplayDocuments(extra);
+    const content = typeof message.content === "string" ? message.content : "";
     if (Array.isArray(documents))
       return [
-        typeof message.content === "string" ? message.content : "",
+        content.trim() || !getRoleplayWhispers(extra).length ? content : "[Private whisper]",
         ...documents
           .filter((document) => document && typeof document.title === "string" && typeof document.content === "string")
           .map((document) => `Document: ${document.title}\n${document.content}`),

@@ -27,7 +27,7 @@ import {
   Folder,
 } from "lucide-react";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
-import { useConnections } from "../../hooks/use-connections";
+import { useConnections, useModelParameterCapabilities } from "../../hooks/use-connections";
 import { usePresets, usePresetFull, useDefaultPreset } from "../../hooks/use-presets";
 import { useCharacterGroups, useCharacters, usePersonas } from "../../hooks/use-characters";
 import { useLorebooks } from "../../hooks/use-lorebooks";
@@ -109,6 +109,7 @@ import {
 import { ConversationTimeZoneSelect } from "./ConversationTimeZoneSelect";
 import { AdvancedMemorySettings } from "./AdvancedMemorySettings";
 import { useTranslation as useUiTranslation } from "react-i18next";
+import { MultiplayerPrepareButton } from "../../features/multiplayer/MultiplayerPrepareButton";
 
 // ─── Step definitions ─────────────────────────
 
@@ -262,7 +263,7 @@ type AgentAddPreview = {
 
 const WIZARD_PANEL_CLASS = cn(
   NEUTRAL_PANEL_SHELL,
-  "mari-chat-setup-wizard pointer-events-auto flex max-h-[calc(100dvh-1.5rem)] w-full max-w-lg flex-col overflow-hidden sm:max-h-[min(90dvh,44rem)]",
+  "mari-chat-setup-wizard pointer-events-auto flex max-h-full w-full max-w-lg flex-col overflow-hidden sm:max-h-[min(100%,44rem)]",
 );
 
 const WIZARD_FIELD_LABEL = "text-[0.6875rem] font-medium uppercase tracking-wider text-[var(--muted-foreground)]";
@@ -791,11 +792,11 @@ function PersonaPicker({
                             )}
                           >
                             {character.avatarPath ? (
-                              <img
+                              <CroppedAvatarImage
                                 src={character.avatarPath}
                                 alt=""
-                                className="h-7 w-7 shrink-0 rounded-full object-cover"
-                                style={getAvatarCropStyle(parseCharacterDisplayData(character).avatarCrop)}
+                                className="h-7 w-7 rounded-full"
+                                crop={parseCharacterDisplayData(character).avatarCrop ?? null}
                               />
                             ) : (
                               <PersonaAvatar persona={null} />
@@ -823,17 +824,19 @@ function PersonaPicker({
 function SetupGenerationParametersPanel({
   enabled,
   value,
-  showServiceTier,
+  connection,
   onEnabledChange,
   onChange,
 }: {
   enabled: boolean;
   value: EditableGenerationParameters;
-  showServiceTier: boolean;
+  /** The selected connection; its provider and model decide which settings are offered. */
+  connection: { id?: string | null; provider?: string | null; model?: string | null; baseUrl?: unknown } | null;
   onEnabledChange: (enabled: boolean) => void;
   onChange: (next: EditableGenerationParameters) => void;
 }) {
   const { t: localizeUi } = useUiTranslation();
+  const modelCapabilities = useModelParameterCapabilities(enabled ? connection : null);
   return (
     <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-3">
       <button
@@ -860,7 +863,14 @@ function SetupGenerationParametersPanel({
       </button>
       {enabled && (
         <div className="mt-3 border-t border-[var(--border)] pt-3">
-          <GenerationParametersFields value={value} showServiceTier={showServiceTier} onChange={onChange} />
+          <GenerationParametersFields
+            value={value}
+            provider={connection?.provider ?? null}
+            model={connection?.model ?? null}
+            baseUrl={typeof connection?.baseUrl === "string" ? connection.baseUrl : null}
+            modelCapabilities={modelCapabilities}
+            onChange={onChange}
+          />
         </div>
       )}
     </div>
@@ -890,8 +900,16 @@ function SavedChatSetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
   const queryClient = useQueryClient();
   const apply = useCallback(
     async (defaults: ChatWizardDefaults, reset = false) => {
-      const { metadata, ...fields } = defaults;
-      await updateChat.mutateAsync({ id: chat.id, ...fields });
+      const { metadata, connectionId, promptPresetId, personaId, personaCharacterId, characterIds } = defaults;
+      // Older saved templates still contain a name. Apply only reusable setup fields.
+      await updateChat.mutateAsync({
+        id: chat.id,
+        connectionId,
+        promptPresetId,
+        personaId,
+        personaCharacterId,
+        characterIds,
+      });
       const latest = queryClient.getQueryData<Chat>(chatKeys.detail(chat.id)) ?? chat;
       await updateMeta.mutateAsync({
         id: chat.id,
@@ -909,7 +927,11 @@ function SavedChatSetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
       return;
     }
     let active = true;
-    pendingApply.current ??= apply(saved);
+    pendingApply.current ??= apply({
+      ...saved,
+      // A card launch is an explicit participant choice, ahead of saved defaults.
+      characterIds: initial.characterIds.length ? initial.characterIds : saved.characterIds,
+    });
     void pendingApply.current
       .then(() => {
         if (!active) return;
@@ -927,7 +949,7 @@ function SavedChatSetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
     return () => {
       active = false;
     };
-  }, [apply, saved, settingsSyncReady, t]);
+  }, [apply, initial.characterIds, saved, settingsSyncReady, t]);
 
   const defaultsAction = (metadata: Record<string, unknown>) => (
     <button
@@ -1138,8 +1160,13 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
     [connectionOptions, selectedConnectionId],
   );
   const parameterDefaults = useMemo(
-    () => getEditableGenerationParameters(CHAT_PARAMETER_DEFAULTS, selectedConnection?.defaultParameters),
-    [selectedConnection?.defaultParameters],
+    () =>
+      getEditableGenerationParameters(
+        CHAT_PARAMETER_DEFAULTS,
+        selectedConnection?.defaultParameters,
+        selectedConnection?.provider,
+      ),
+    [selectedConnection?.defaultParameters, selectedConnection?.provider],
   );
   const [customizeParameters, setCustomizeParameters] = useState(
     () => !!parseEditableGenerationParameters(metadata.chatParameters),
@@ -1376,7 +1403,7 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
   }, []);
 
   const handleStartChatting = useCallback(async () => {
-    if (!hasConnection || !hasCharacters) return;
+    if (metadata.multiplayerSetup !== true && (!hasConnection || !hasCharacters)) return;
     const trimmedConversationSystemPrompt = conversationSystemPromptDraft.trim();
     const baseConversationPromptText = baseConversationPrompt.trim();
     const customSystemPrompt =
@@ -1399,7 +1426,7 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
     await updateMeta.mutateAsync({
       id: chat.id,
       autonomousMessages: autonomousEnabled,
-      conversationSchedulesEnabled: autonomousEnabled && generateSchedule,
+      conversationSchedulesEnabled: generateSchedule,
       characterCommands: hasConversationCommands && commandsEnabled,
       conversationCommandToggles: selfieSetup.conversationCommandToggles,
       conversationSetupComplete: true,
@@ -1407,7 +1434,7 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
       customSystemPrompt,
       ...(selfieSetup.imageGenConnectionId ? { imageGenConnectionId: selfieSetup.imageGenConnectionId } : {}),
     });
-    if (autonomousEnabled && generateSchedule) {
+    if (autonomousEnabled && generateSchedule && metadata.multiplayerSetup !== true) {
       setScheduleState("generating");
       try {
         const scheduleGenerationPreferences = useUIStore.getState().scheduleGenerationPreferences;
@@ -1449,10 +1476,12 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
     availableConversationCommandIds,
     connectionOptions,
     metadata.imageGenConnectionId,
+    metadata.multiplayerSetup,
   ]);
 
   const renderConnectionStep = () => (
     <div className="space-y-4">
+      <MultiplayerPrepareButton chatId={chat.id} prepared={metadata.multiplayerSetup === true} />
       <div className="space-y-1.5">
         <label className={WIZARD_FIELD_LABEL}>{localizeUi("ui.characters.metadatatab.name")}</label>
         <input
@@ -1498,7 +1527,7 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
         <SetupGenerationParametersPanel
           enabled={customizeParameters}
           value={generationParameters}
-          showServiceTier={selectedConnection?.provider === "openrouter" || selectedConnection?.provider === "nanogpt"}
+          connection={selectedConnection}
           onEnabledChange={setCustomizeParameters}
           onChange={setGenerationParameters}
         />
@@ -2006,7 +2035,7 @@ function ConversationQuickSetup({ chat, onFinish, defaultsApplied, defaultsActio
         onPrimary={isLast ? handleStartChatting : goNext}
         primaryLabel={isLast ? "Start Chatting" : "Next"}
         primaryIcon={isLast ? <MessageCircle size="0.75rem" /> : <ChevronRight size="0.75rem" />}
-        primaryDisabled={isLast && (!hasConnection || !hasCharacters)}
+        primaryDisabled={metadata.multiplayerSetup !== true && isLast && (!hasConnection || !hasCharacters)}
         secondaryAction={
           isLast
             ? defaultsAction({
@@ -2112,8 +2141,13 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
     [connectionOptions, chat.connectionId],
   );
   const parameterDefaults = useMemo(
-    () => getEditableGenerationParameters(ROLEPLAY_PARAMETER_DEFAULTS, selectedConnection?.defaultParameters),
-    [selectedConnection?.defaultParameters],
+    () =>
+      getEditableGenerationParameters(
+        ROLEPLAY_PARAMETER_DEFAULTS,
+        selectedConnection?.defaultParameters,
+        selectedConnection?.provider,
+      ),
+    [selectedConnection?.defaultParameters, selectedConnection?.provider],
   );
 
   const metadata = useMemo(() => {
@@ -2467,8 +2501,8 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
       id: chat.id,
       chatParameters: customizeParameters ? generationParameters : null,
     });
-    for (const charId of chatCharIds) {
-      await createInitialGreetingForCharacter(charId);
+    if (metadata.multiplayerSetup !== true) {
+      for (const charId of chatCharIds) await createInitialGreetingForCharacter(charId);
     }
     onFinish();
   }, [
@@ -2479,9 +2513,11 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
     generationParameters,
     onFinish,
     updateMeta,
+    metadata.multiplayerSetup,
   ]);
 
   const seedInitialGreetingsIfEmpty = useCallback(async () => {
+    if (metadata.multiplayerSetup === true) return;
     if (chatCharIds.length === 0) return;
     try {
       const messages = await api.get<Array<Pick<Message, "role">>>(`/chats/${chat.id}/messages`);
@@ -2493,7 +2529,7 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
     for (const charId of chatCharIds) {
       await createInitialGreetingForCharacter(charId);
     }
-  }, [chat.id, chatCharIds, createInitialGreetingForCharacter]);
+  }, [chat.id, chatCharIds, createInitialGreetingForCharacter, metadata.multiplayerSetup]);
 
   const handleShortcutApply = useCallback(async () => {
     if (!shortcutPresetId) {
@@ -2683,6 +2719,7 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
   function renderConnection() {
     return (
       <div className="space-y-4">
+        <MultiplayerPrepareButton chatId={chat.id} prepared={metadata.multiplayerSetup === true} />
         <fieldset className="space-y-2">
           <legend className={WIZARD_FIELD_LABEL}>{localizeUi("chat.roleplayVn.displayStyle")}</legend>
           <div className="grid grid-cols-2 gap-2">
@@ -2758,7 +2795,7 @@ function RoleplaySetupWizard({ chat, onFinish, defaultsApplied, defaultsAction }
         <SetupGenerationParametersPanel
           enabled={customizeParameters}
           value={generationParameters}
-          showServiceTier={selectedConnection?.provider === "openrouter" || selectedConnection?.provider === "nanogpt"}
+          connection={selectedConnection}
           onEnabledChange={setCustomizeParameters}
           onChange={setGenerationParameters}
         />

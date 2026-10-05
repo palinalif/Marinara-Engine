@@ -1,12 +1,67 @@
 # Game Mode: Combat
 
-This guide explains combat in Marinara Engine Game Mode. It covers how a fight starts, the action menu, and the dice math behind every hit. It also explains status effects, elemental reactions, boss mechanics, loot, the Interrupt control, and Quick-Time Events. Combat is run by the AI Game Master (GM), the character who narrates your adventure.
+This guide explains combat in Marinara Engine Game Mode. Choose **Classic** menu battles or **Tactical** grid battles under **Combat Preference** in the setup wizard's **World** step. The AI Game Master (GM) establishes the encounter and narrates the results; the engine resolves battle actions.
+
+## Tactical battles and terrain
+
+Tactical combat places your party and enemies on a battlefield. Select a party unit, inspect its movement range, choose a destination and action, then confirm. Each party unit can act before the enemy phase. Attack forecasts show expected consequences before you commit.
+
+When creating a Tactical game, optional battlefield settings let you choose a seed, a size and terrain guidance for the GM. Leave the seed blank for a generated seed. A seed is a whole number from 0 to 4294967295, including zero. It reproduces the board when the encounter's combatants, terrain brief and other generation inputs are the same; it does not force the GM to generate the same story or enemies.
+
+The GM supplies the scene's environment, formation and a short terrain brief. The engine then creates the exact tiles and spawn positions. Briefs can request terrain patches and barriers near the center or an edge of the map. Terrain guidance is a request to the GM, not a guarantee that every word becomes a tile. The accepted battlefield is saved, so refreshing restores that board rather than generating another one.
+
+The engine checks the brief and the resulting layout. It preserves requested terrain while making the generated encounter reachable. If those constraints cannot fit together, the battle reports the problem. **Use generated terrain** explicitly starts without the rejected terrain features; it does not quietly erase them. Exact hand-painted maps and a battlefield editor are not available yet.
+
+| Terrain               | Walking                 | Defense and evasion                       |
+| --------------------- | ----------------------- | ----------------------------------------- |
+| Plains                | Costs 1 movement point  | No bonus                                  |
+| Forest                | Costs 2 movement points | +1 defense, +15 percentage points evasion |
+| Ruins                 | Costs 1 movement point  | +1 defense, +10 percentage points evasion |
+| Mountain, water, wall | Blocks walking          | No bonus                                  |
+
+Units with an established flying or teleportation capability can move differently:
+
+- **Walking** follows reachable ground tiles. Enemy units block the path; units cannot finish on an occupied tile.
+- **Flying** crosses terrain and intervening units at one movement point per tile, including forests. A flying unit can hover over an otherwise blocked tile, but cannot finish on another unit.
+- **Teleportation** ignores intervening terrain and units. Its destination must be within movement range, unoccupied and walkable. It cannot end inside a wall, on a mountain tile or over unsupported water.
+
+Both special movement modes use the current movement allowance and orthogonal tile distance. They retain the destination terrain's defense/evasion bonuses. This is a simple flat-grid movement model; altitude, ceilings, spell-specific costs and spell-specific sight requirements are not modeled.
+
+Tactical combat uses party and enemy phases, rather than individual tabletop initiative. Movement-blocking walls do not yet block ranged attacks by line of sight. Cover, tabletop rule profiles and full summoning combat are separate future work.
+
+## Classic battles
+
+The remaining action-menu and dice-math sections describe Classic combat. All party members participate, but your selected command controls the first living party combatant; other companions act automatically.
 
 ## Starting an encounter
 
 You do not start combat yourself. The GM starts a fight when the story calls for one, such as when you provoke an enemy or walk into an ambush. When that happens, a full battle screen opens over the narration. The engine builds the fight (your party, the enemies, their stats, and any special rules) from what is happening in the story.
 
 The battle screen shows your party on one side and the enemies on the other. Each fighter has a health bar (HP, hit points) and, if they use skills, a magic bar (MP, magic points). The turn order is shown at the top as **Next:** followed by the name of whoever acts next. A round counter shows **Round** and the current round number.
+
+### Games whose ruleset resolves its own fights
+
+A ruleset may resolve a whole fight by its own rules rather than lending Marinara's combat a few numbers. When it does, the battle screen is that ruleset's: your character's own attacks and abilities on the menu, its own action economy, its own conditions, and a log with the real arithmetic. Everything is written to the character sheet the moment it lands.
+
+What one turn of such a fight may hold is the ruleset's too. A blow can carry more than one kind of harm at once, each part rolled, resisted and saved against on its own while the whole blow is still one blow. One spend of an action can buy several strikes, and while any are left the menu offers them free, saying how many are in hand, so you can swing with something else or walk between them. An ability can cost nothing at all, hand you a second action for this turn only, or let you dash, disengage or hide with a smaller part of your turn. Something your character always does, such as extra damage on the first telling blow of a turn, adds itself without being chosen and says so in the log. And a condition can now make your own saving throws harder or easier, halve every kind of harm, keep you from turning on whoever put it on you, keep you from walking any nearer to them, or lift the moment they go down. A condition can also change a number: add to your defense, add dice to or take them from your attack rolls, saving throws and contests, or slow you down. The log shows each one beside the roll it changed, and the menu's chances count it. Some conditions last until the start of your next turn, or only until the next attack or save they are about. And a ruleset can count something such as exhaustion on a track on your sheet, so that each level you reach makes things a little worse for as long as it lasts.
+
+A ruleset whose checks throw a handful of dice and count the ones that reach a target can fight the same way. Then an attack throws your pool and needs a number of successes to land, never fewer than one, and every success past those adds a die to the damage. The damage is thrown as dice too, and the one it hits may soak some of it by the kind of harm, either rolling soak dice that each take one off or taking dice off before the damage is thrown; what is left marks their wounds. Your wound penalty takes dice off your pools as it does off your checks, and a condition adds dice or takes them away. Saving throws and contests are pools as well. The log says how many dice went in, what they had to reach, how many successes they found and what soak took off. Such a ruleset may also throw initiative again at the start of every round, and may limit how much of a resource you can spend in one turn, so something that would go past the limit is simply not on the menu until your next turn. A pool ruleset can also keep initiative as a number for the whole fight that attacks move: you choose how to make each attack, either taking some of your target's number for yourself instead of hurting them or spending your own number as the damage dice. A spending attack that hits resets your number; one that misses costs you as much of it as the ruleset says. Whoever falls to the ruleset's crash line has crashed and cannot spend until they recover. The order follows the numbers each round, and everybody's number is shown beside their health.
+
+A ruleset may also let anybody in a fight start a contest: grab someone, shove them over or push them back, or break free of a hold. Both sides roll and add their own number, the higher total wins, and the menu shows your chance to win before you choose. Winning a grab holds your opponent in place until they break free or you go down; losing does nothing. Breaking free appears on the menu only while something holds you, and only against whoever is holding on. A push only moves anybody on a battlefield, and stops at walls and at anyone in the way.
+
+Some abilities answer somebody else's move instead of being taken on your own turn. When an opponent is about to use something, when something is aimed at you, when an attack has just hit you, or when something has just hurt you, and you hold an answer for that moment, the fight pauses and the menu offers it beside **Pass**. After a hit, the log says what the attack rolled and what it was made against, so you can see whether an answer such as Shield would turn it into a miss; if you take it, the same roll is checked again and the log says whether it still lands. Opponents can answer like this too, with a parry of their own. A counter can stop an opponent's ability before it happens, whoever it was aimed at, as long as the opponent is within the counter's reach; a ruleset may say it answers only some kinds of ability, such as spells. Whatever the stopped ability cost is still spent, and nothing can answer a counter.
+
+Such a ruleset may also say what one square of a battlefield is worth in its own distance, in feet, paces or whatever it calls them. When it does, and your game's **Combat Preference** is **Tactical**, the fight is fought on a generated battlefield: the same boards, the same terrain and the same deployment the Tactical battles above use. Your **Combat Preference** means something again for these games, and a ruleset that says nothing about distance, or a game set to **Classic**, fights exactly as it did before, with anybody able to be pointed at anybody.
+
+On that battlefield the ruleset's own numbers decide everything. How far a turn may walk comes from the ruleset's own movement rule or a creature's own speed; how far a weapon reaches or carries comes from its own rows; an ability's area becomes a real burst, cone or line; a wall blocks a shot; standing behind something adds what the ruleset says cover adds; and walking out of somebody's reach lets them strike at you when the ruleset says such a strike costs something. Movement runs in eight directions at one square each, which is how the tabletop grids these rules are written for are played, and it is not the four-direction model Marinara's own Tactical battles use above.
+
+The battlefield is on screen. Every square is its own button, so the board can be walked with the pointer or with the arrow keys, and each one says what it is, who is standing on it and what it would cost to walk there. Choosing **Move** lights up the squares you can reach with their cost in the ruleset's own distance, draws the way there as you hover or focus one, and marks in amber any square whose path someone would strike at, naming them under the board. Choosing something that needs a target lights up who may be chosen and lets you click them on the board as well as in the list, and an attack that reaches nobody says **Nobody is in reach. Move closer.** rather than offering a swing at nothing. Something that lands as a shape is aimed at a square: the squares it may be aimed at are lit, and the one under your pointer says who it would catch, friends included. Movement may be spent before and after an action, so the menu simply comes back with what is left, and the panel below shows it as **Movement** in the ruleset's own unit. Escape leaves a half-made choice and puts the keyboard back on the menu.
+
+Three-quarter cover, elevation, flying over obstacles, hiding, forced movement other than a contest's push (dragging somebody you hold, for one) and choosing whether to take a strike at somebody walking away are all separate future work.
+
+### Games that use a ruleset
+
+If your game uses a ruleset (see [The ruleset sheet](party-and-npcs.md#the-ruleset-sheet)) and that ruleset says battles may read the sheet, each party member starts the fight with whichever resource pool and spell slots the ruleset set up for battles, as their sheet has them right now. The abilities they picked from the ruleset's catalogs become skills when Marinara's combat can use them: an entry that only describes something out of combat, a reaction, or one whose cost the battle cannot charge is left out. Hit points are carried as a share of the maximum rather than as the sheet's own number: a character at half health on the sheet starts the fight at half the health bar the battle screen gives them, because the numbers in battle are Marinara's. A sheet with 9 health does not walk into a fight where one hit does 12. When the fight ends, the health lost or regained is carried back the same way, and the slots and resources spent are written back as they are. The rest of the battle is unchanged: the dice math on this page is still Marinara's, and attack rolls, saving throws and concentration from the tabletop system are not applied. A fight you leave by deleting the message it started in writes nothing back, because it did not happen. A ruleset that says nothing about battles leaves combat exactly as it is described here.
 
 ## The action menu
 
@@ -16,7 +71,7 @@ On your turn, you pick one action from the menu. The six actions are:
 - **Skills**: use a special ability. Skills can cost MP. Some heal an ally, some hit an enemy, and some apply a buff or debuff.
 - **Special**: type a free-form action in your own words, then press **Ask GM**. For example, "I kick sand into the Ruin Guard's cracked lens." The GM decides what happens.
 - **Defend**: raise your Defense for the rest of the round to take less damage.
-- **Items**: use an item from your bag. Choose **Full inventory** to open your full item list from here.
+- **Items**: use an item from your bag. Choose **Full inventory** to open your full item list from here. In a game with a ruleset, the ruleset's own items do what the ruleset says: how much they heal or harm, and the conditions they put on. One that holds charges is offered while a use is left, and one that asks a check first has it rolled when it is used: failed, it is spent for nothing. One the ruleset gives no use to is not offered. The rest of your items do what the Game Master judged when the fight began, unless the ruleset turns off Game Mode's own items.
 - **Flee**: leave the fight at once. Fleeing ends combat immediately.
 
 After you choose, the round plays out. The results appear as floating damage numbers, changing health bars, and lines in the combat log.
@@ -47,11 +102,11 @@ On a hit, base damage comes from the attacker's Attack stat and grows with their
 The last step scales damage by the game's Difficulty, which you set in the setup wizard. The four settings multiply final damage like this:
 
 | Difficulty | Damage multiplier |
-|---|---|
-| Casual | 0.6 |
-| Normal | 1.0 |
-| Hard | 1.3 |
-| Brutal | 1.6 |
+| ---------- | ----------------- |
+| Casual     | 0.6               |
+| Normal     | 1.0               |
+| Hard       | 1.3               |
+| Brutal     | 1.6               |
 
 Higher difficulty means both sides hit harder, so fights are shorter and riskier.
 
@@ -67,7 +122,7 @@ Example reactions include Melt, Shatter, Overload, Superconduct, Toxic Blaze, Pu
 
 Strong enemies can have boss mechanics, which are special rules the GM writes for that fight. A mechanic can trigger on a schedule, such as every few rounds, or when the boss drops below a set health level. Mechanics can hit your whole party, buff the boss, or apply a status effect. When one triggers, the effect appears in the combat log so you can react.
 
-When you win a fight, the enemies drop loot. Each item has a rarity, from most to least common: common, uncommon, rare, epic, and legendary. Harder difficulty tilts the drops toward rarer items and hands out slightly more of them. A **Victory!** banner appears when you win, and a **Defeat...** banner appears if your party falls.
+When you win a fight, the enemies drop loot, and it goes straight into the party's bags once the fight ends. Each item has a rarity, from most to least common: common, uncommon, rare, epic, and legendary. Harder difficulty tilts the drops toward rarer items and hands out slightly more of them. A notification says what dropped, and the Game Master is told it is already in your bags. In a game whose ruleset has its own loot tables, the enemies drop the ruleset's items instead, and a ruleset that turns Game Mode's own items off drops only its own. A **Victory!** banner appears when you win, and a **Defeat...** banner appears if your party falls.
 
 ## Interrupting the GM
 

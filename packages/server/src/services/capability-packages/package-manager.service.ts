@@ -6,12 +6,18 @@ import AdmZip from "adm-zip";
 import { z } from "zod";
 import {
   APP_VERSION,
+  containsDecisionStatements,
   parseCapabilityCatalogWithCompat,
   capabilityPackageManifestSchema,
   compareCapabilityPackageVersions,
   getCapabilityApiCompatibilityIssue,
   GM_VERB_TABLE_ASSET_PATH,
   GM_VERB_TABLE_MAX_BYTES,
+  RULESET_ASSET_PATH,
+  RULESET_CATALOG_MAX_BYTES,
+  RULESET_MAX_BYTES,
+  rulesetCatalogAssetPath,
+  isRulesetCatalogAssetPath,
   isInstalledCapabilityReady,
   installedCapabilityRegistrySchema,
   installedCapabilityPackageSchema,
@@ -238,6 +244,16 @@ export function normalizeArchivePath(value: string): string {
     throw new Error("Package contains an unsafe path");
   }
   return parts.join("/");
+}
+
+/** `normalizeArchivePath` for a caller that treats an unusable path as "not this one" instead of as
+ *  an error: matching a declared asset path against a reserved name. */
+function tryNormalizeArchivePath(path: string): string | null {
+  try {
+    return normalizeArchivePath(path);
+  } catch {
+    return null;
+  }
 }
 
 function isSymlink(entry: AdmZip.IZipEntry): boolean {
@@ -480,13 +496,1064 @@ function supportsEngineVersion(entry: CapabilityCatalogPackage, engineVersion: s
   );
 }
 
-export function getCapabilityPackageInstallIssue(manifest: CapabilityCatalogPackage["manifest"]): string | null {
+/** Whether any row of these entries names a column the ruleset keeps up to date. Read structurally
+ *  rather than parsed: the install gate looks at documents nothing has validated yet, and a shape it
+ *  does not recognise is not its problem to report. */
+function entriesCarryScaledRows(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const rows = entry && typeof entry === "object" ? (entry as { rows?: unknown }).rows : undefined;
+    return (
+      Array.isArray(rows) &&
+      rows.some((row) => !!row && typeof row === "object" && (row as { scaled?: unknown }).scaled !== undefined)
+    );
+  });
+}
+
+/** The `mechanics` keys a fight reads, which are new keys in the same strict file: an Engine that
+ *  does not know them refuses whichever file holds them. Read structurally, for the same reason
+ *  `entriesCarryScaledRows` is. */
+const COMBAT_MECHANICS_KEYS = ["targetCount", "autoHit", "applies", "temporary", "scales", "budget"] as const;
+
+function entriesCarryCombatMechanics(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    if (!mechanics || typeof mechanics !== "object") return false;
+    return COMBAT_MECHANICS_KEYS.some((key) => (mechanics as Record<string, unknown>)[key] !== undefined);
+  });
+}
+
+/** What a picked entry does to a CHECK rather than to a fight, which is `mechanics.check` and is
+ *  new in 1.30. Read the same structural way, for the same reason: an Engine that does not know the
+ *  key refuses the whole file that holds it, inline or in a catalog asset. */
+function entriesCarryCheckEffects(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    return !!mechanics && typeof mechanics === "object" && (mechanics as Record<string, unknown>).check !== undefined;
+  });
+}
+
+/** An opponent in place of rows: another new key in the same strict file, read structurally for the
+ *  same reason the two above are. */
+function entriesCarryCreatures(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some(
+    (entry) => !!entry && typeof entry === "object" && (entry as { creature?: unknown }).creature !== undefined,
+  );
+}
+
+/** The `mechanics` keys that say what one turn can do, which are new keys in the same strict file.
+ *  Read structurally, for the same reason the ones above are. */
+const TURN_ECONOMY_MECHANICS_KEYS = ["plus", "free", "gives", "standard", "rider"] as const;
+
+/** The condition effects an Engine before 1.29 knew. Written out rather than read off the shared
+ *  enum, because the question this asks is what an OLDER Engine would refuse, which is a fixed list
+ *  and not whatever this build happens to implement. */
+const OLD_CONDITION_EFFECTS: ReadonlySet<string> = new Set([
+  "own-attacks-advantage",
+  "own-attacks-disadvantage",
+  "attacks-against-advantage",
+  "attacks-against-disadvantage",
+  "attacks-against-adjacent-advantage",
+  "attacks-against-far-disadvantage",
+  "attacks-from-adjacent-critical",
+  "cannot-act",
+  "cannot-react",
+  "speed-zero",
+  "half-move-to-stand",
+  "ends-on-damage",
+]);
+
+/** A creature described by a sheet in the ruleset's own terms. The key is new in 1.34, and an Engine
+ *  before it refuses the whole strict catalog file, both for the key and for the fixed numbers such
+ *  a creature no longer carries. */
+function entriesCarryCreatureSheets(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const creature = entry && typeof entry === "object" ? (entry as { creature?: unknown }).creature : undefined;
+    return !!creature && typeof creature === "object" && (creature as { sheet?: unknown }).sheet !== undefined;
+  });
+}
+
+/** A creature that gives its own contest checks, which is 1.43: a new key on the strict creature. */
+function entriesCarryCreatureChecks(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const creature = entry && typeof entry === "object" ? (entry as { creature?: unknown }).creature : undefined;
+    return !!creature && typeof creature === "object" && (creature as { checks?: unknown }).checks !== undefined;
+  });
+}
+
+/** A reaction that waits for somebody USING something, or answers only some catalogs' entries,
+ *  which is 1.44: a new value and a new key in the same strict reaction object. */
+function entriesCarryUsedMoments(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    const reaction =
+      mechanics && typeof mechanics === "object" ? (mechanics as Record<string, unknown>).reaction : undefined;
+    if (!reaction || typeof reaction !== "object") return false;
+    const moment = reaction as Record<string, unknown>;
+    return moment.on === "used" || moment.against !== undefined;
+  });
+}
+
+const USED_MOMENTS_ISSUE =
+  "A ruleset whose reactions answer something being used, or only some catalogs' entries, requires schemaVersion 2 and capabilityApi 1.44 or newer";
+
+/** An entry that says WHICH moment it waits for. `reaction: true` has been legal since the key
+ *  existed and says only that much; an OBJECT there is 1.33, and an Engine that knows only the
+ *  boolean refuses the whole strict catalog file. */
+function entriesCarryReactionMoments(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    if (!mechanics || typeof mechanics !== "object") return false;
+    const reaction = (mechanics as Record<string, unknown>).reaction;
+    return !!reaction && typeof reaction === "object";
+  });
+}
+
+/** An entry that moves a pool rule's face for the check it is used on, which is 1.37: new keys in
+ *  the same strict `mechanics.check`. Read structurally, for the same reason the ones above are. */
+function entriesCarryCheckFaces(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    const check = mechanics && typeof mechanics === "object" ? (mechanics as Record<string, unknown>).check : undefined;
+    if (!check || typeof check !== "object") return false;
+    return (["explode", "double"] as const).some((key) => (check as Record<string, unknown>)[key] !== undefined);
+  });
+}
+
+function entriesCarryTurnEconomy(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const mechanics = entry && typeof entry === "object" ? (entry as { mechanics?: unknown }).mechanics : undefined;
+    if (!mechanics || typeof mechanics !== "object") return false;
+    const record = mechanics as Record<string, unknown>;
+    // The kind counts too: `rider` is a new value for an old key, and an Engine that knows only the
+    // five it had refuses the file whichever way round it is written.
+    if (record.kind === "rider") return true;
+    return TURN_ECONOMY_MECHANICS_KEYS.some((key) => record[key] !== undefined);
+  });
+}
+
+/** A creature whose blow carries a second clause, or that carries riders of its own: new keys in
+ *  the same strict file again, read the same way. */
+function entriesCarryCreatureEconomy(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const creature = entry && typeof entry === "object" ? (entry as { creature?: unknown }).creature : undefined;
+    if (!creature || typeof creature !== "object") return false;
+    const record = creature as { actions?: unknown; riders?: unknown };
+    if (record.riders !== undefined) return true;
+    if (!Array.isArray(record.actions)) return false;
+    return record.actions.some((action) => {
+      const damage = action && typeof action === "object" ? (action as { damage?: unknown }).damage : undefined;
+      return !!damage && typeof damage === "object" && (damage as { plus?: unknown }).plus !== undefined;
+    });
+  });
+}
+
+/** A creature action whose `range` is an ordinary distance with a longer one beyond it, which is a
+ *  new SHAPE for an old key, or one that carries the `area` it lands in, which is a new key: either
+ *  way an Engine that knows neither refuses the file they sit in. Read structurally, for the same
+ *  reason the three above are. */
+function entriesCarryCreatureRanges(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const creature = entry && typeof entry === "object" ? (entry as { creature?: unknown }).creature : undefined;
+    const actions = creature && typeof creature === "object" ? (creature as { actions?: unknown }).actions : undefined;
+    if (!Array.isArray(actions)) return false;
+    return actions.some((action) => {
+      if (!action || typeof action !== "object") return false;
+      const { range, area } = action as { range?: unknown; area?: unknown };
+      return (!!range && typeof range === "object") || area !== undefined;
+    });
+  });
+}
+
+/** `rulesetDocument` is the package's own `ruleset.json`, parsed, when the install already has its
+ *  verified bytes. Catalogs live INSIDE that file, so the manifest alone cannot show them, and the
+ *  gate that keeps a package off an Engine too old to serve them has to read it. `catalogDocuments`
+ *  are the package's own `catalogs/<id>.json` files, by their normalized path, which install also
+ *  holds by then: a scaled row can sit in one of those instead. A document that is absent or
+ *  unparseable simply skips the catalog check: install has never validated a ruleset's contents, and
+ *  an unusable one is the registry's story to tell, with a log line. */
+/** One reason for every 1.37 key, wherever it sits: they arrived together and an older Engine refuses
+ *  each of them the same way. */
+const SHEET_1_37_ISSUE =
+  "A ruleset whose tracks read their maximum off the sheet, hide or always show, or whose sheet summary lists show columns or are named by an enum, requires schemaVersion 2 and capabilityApi 1.37 or newer";
+
+/** The 1.37 keys on the sheet and its summary. Read off the raw document for the same reason every
+ *  gate above is: an Engine that does not know them refuses the whole strict file. An enum column
+ *  naming a summary list is an old key with a new value, so the list's own column is looked up. */
+function rulesetCarriesSheet137Keys(ruleset: { sheet?: unknown; gm?: unknown } | undefined): boolean {
+  const record = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  const sheet = record(ruleset?.sheet);
+  const tracks = record(sheet?.live)?.tracks;
+  const trackKeys =
+    Array.isArray(tracks) &&
+    tracks.some((track) => {
+      const entry = record(track);
+      return (
+        !!entry && (typeof entry.max === "object" || entry.hideWhen !== undefined || entry.alwaysShow !== undefined)
+      );
+    });
+  if (trackKeys) return true;
+  const lists = Array.isArray(sheet?.lists) ? sheet.lists : [];
+  const summaryLists = record(record(record(ruleset?.gm)?.sheetSummary))?.lists;
+  return (
+    Array.isArray(summaryLists) &&
+    summaryLists.some((summary) => {
+      const entry = record(summary);
+      if (!entry) return false;
+      if (entry.columns !== undefined) return true;
+      const list = lists.map(record).find((candidate) => candidate?.id === entry.list);
+      const columns = Array.isArray(list?.columns) ? list.columns : [];
+      return columns.map(record).some((column) => column?.id === entry.nameColumn && column?.type === "enum");
+    })
+  );
+}
+
+const MOVED_POOL_RULES_ISSUE =
+  "A ruleset whose pool checks can move their rules, add two abilities or read a botch off half the dice requires schemaVersion 2 and capabilityApi 1.37 or newer";
+
+const SHEET_READS_ISSUE =
+  "A ruleset whose values read a live track or pool or add up a list, whose skills or saves carry a cap, or that hides on anything but one value requires schemaVersion 2 and capabilityApi 1.39 or newer";
+
+/** The 1.39 keys a value reference or a `hideWhen` may carry, anywhere in a document. Their names
+ *  are camelCase, which no sheet id can be, so walking the whole document finds exactly them rather
+ *  than every place a reference may sit (and a catalog file is walked the same way). */
+function carriesSheetReads139(value: unknown, depth = 0): boolean {
+  if (!value || typeof value !== "object" || depth > 64) return false;
+  if (Array.isArray(value)) return value.some((entry) => carriesSheetReads139(entry, depth + 1));
+  const record = value as Record<string, unknown>;
+  if (record.liveTrack !== undefined || record.livePool !== undefined || record.listSum !== undefined) return true;
+  const hide = record.hideWhen;
+  if (hide && typeof hide === "object") {
+    const comparison = hide as Record<string, unknown>;
+    if (comparison.notEquals !== undefined || comparison.in !== undefined) return true;
+  }
+  return Object.values(record).some((entry) => carriesSheetReads139(entry, depth + 1));
+}
+
+/** And a `cap` on a skill or save, which is an ordinary word, so only those two lists are read. */
+function rulesetCapsChecks(ruleset: { sheet?: unknown } | undefined): boolean {
+  const sheet = ruleset?.sheet && typeof ruleset.sheet === "object" ? (ruleset.sheet as Record<string, unknown>) : {};
+  return (["skills", "saves"] as const).some(
+    (key) =>
+      Array.isArray(sheet[key]) &&
+      (sheet[key] as unknown[]).some(
+        (entry) => !!entry && typeof entry === "object" && (entry as Record<string, unknown>).cap !== undefined,
+      ),
+  );
+}
+
+const WOUND_BOXES_ISSUE =
+  "A ruleset whose wound tracks are boxes, fill by box, refuse a mark when full or take extra levels from a list, or whose rests heal one kind of harm, requires schemaVersion 2 and capabilityApi 1.40 or newer";
+
+/** The 1.40 keys: on a live track, and on a rest's restore step. Ordinary words, so only those two
+ *  places are read. */
+function rulesetCarriesWound140Keys(ruleset: { sheet?: unknown; rests?: unknown } | undefined): boolean {
+  const record = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  const tracks = record(record(ruleset?.sheet)?.live)?.tracks;
+  const trackKeys =
+    Array.isArray(tracks) &&
+    tracks.some((track) => {
+      const entry = record(track);
+      return !!entry && (["boxes", "fill", "onFull", "extra"] as const).some((key) => entry[key] !== undefined);
+    });
+  if (trackKeys) return true;
+  const rests = Array.isArray(ruleset?.rests) ? ruleset.rests : [];
+  return rests.some((rest) => {
+    const restore = record(rest)?.restore;
+    return Array.isArray(restore) && restore.some((step) => record(step)?.kind !== undefined);
+  });
+}
+
+const CONTESTS_ISSUE =
+  "A ruleset whose fights have contests, or whose creatures carry contest checks, requires schemaVersion 2 and capabilityApi 1.43 or newer";
+
+/** The 1.43 keys in the ruleset file itself: `checks` and `contests` in the combat block. */
+function rulesetCarriesContests143Keys(ruleset: { combat?: unknown } | undefined): boolean {
+  const combat =
+    ruleset?.combat && typeof ruleset.combat === "object" ? (ruleset.combat as Record<string, unknown>) : undefined;
+  return !!combat && (combat.checks !== undefined || combat.contests !== undefined);
+}
+
+const CONDITION_NUMBERS_ISSUE =
+  "A ruleset whose conditions change numbers or count levels, or end after one use or as a turn begins, requires schemaVersion 2 and capabilityApi 1.45 or newer";
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/** The 1.45 keys in the ruleset file itself: `levels` in the combat block, and a combat condition's
+ *  `modifiers` or check effects. */
+function rulesetCarriesConditionNumbers145Keys(ruleset: { combat?: unknown } | undefined): boolean {
+  const combat = plainRecord(ruleset?.combat);
+  if (!combat) return false;
+  if (combat.levels !== undefined) return true;
+  const conditions = Array.isArray(combat.conditions) ? combat.conditions : [];
+  return conditions.some((entry) => {
+    const condition = plainRecord(entry);
+    if (!condition) return false;
+    if (condition.modifiers !== undefined) return true;
+    const effects = Array.isArray(condition.effects) ? condition.effects : [];
+    return effects.includes("own-checks-advantage") || effects.includes("own-checks-disadvantage");
+  });
+}
+
+/** A condition an entry or a creature's action applies that ends after one use or counts down as
+ *  turns begin, which is 1.45: new keys in the same strict `applies`. */
+function entriesCarryConditionEndings(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  const endsNewly = (applies: unknown) =>
+    Array.isArray(applies) &&
+    applies.some((one) => {
+      const entry = plainRecord(one);
+      return entry?.endsAfter !== undefined || plainRecord(entry?.duration)?.at !== undefined;
+    });
+  return entries.some((entry) => {
+    const record = plainRecord(entry);
+    if (endsNewly(plainRecord(record?.mechanics)?.applies)) return true;
+    const actions = plainRecord(record?.creature)?.actions;
+    return Array.isArray(actions) && actions.some((action) => endsNewly(plainRecord(action)?.applies));
+  });
+}
+
+const ITEMS_ISSUE = "A ruleset that describes items requires schemaVersion 2 and capabilityApi 1.49 or newer";
+
+const INVENTED_ITEMS_ISSUE =
+  "A ruleset that caps or forbids the items its Game Master invents requires schemaVersion 2 and capabilityApi 1.51 or newer";
+
+/** `rarityCaps` and `propose`, which are 1.51: new keys on the strict items block, read structurally
+ *  for the same reason the others are. */
+function rulesetCarriesInventedItem151Keys(ruleset: { items?: unknown } | undefined): boolean {
+  const items = plainRecord(ruleset?.items);
+  return items?.rarityCaps !== undefined || items?.propose !== undefined;
+}
+
+const ITEM_STAT_ISSUE =
+  "A ruleset whose values read the items someone holds requires schemaVersion 2 and capabilityApi 1.52 or newer";
+
+/** An `itemStat` reference, which is 1.52. Its name is camelCase, which no sheet id can be, so
+ *  walking the whole document finds exactly it (and a catalog file is walked the same way). */
+function carriesItemStat152(value: unknown, depth = 0): boolean {
+  if (!value || typeof value !== "object" || depth > 64) return false;
+  if (Array.isArray(value)) return value.some((entry) => carriesItemStat152(entry, depth + 1));
+  const record = value as Record<string, unknown>;
+  if (record.itemStat !== undefined) return true;
+  return Object.values(record).some((entry) => carriesItemStat152(entry, depth + 1));
+}
+
+/** An item in place of rows or a creature, which is 1.49: a new key on the strict entry, read
+ *  structurally for the same reason the others are. */
+function entriesCarryItems(entries: unknown): boolean {
+  return Array.isArray(entries) && entries.some((entry) => plainRecord(entry)?.item !== undefined);
+}
+
+const CHECK_EFFECTS_ISSUE =
+  "A ruleset whose items change checks while worn or carried, whose conditions or levels name skills, whose modifiers name skills, saves or a mode, or whose rarity caps hold a bonus requires schemaVersion 2 and capabilityApi 1.53 or newer";
+
+const REQUIREMENTS_ISSUE =
+  "A ruleset whose items ask something of their wearer or change an ability, or whose condition levels read a derived value, requires schemaVersion 2 and capabilityApi 1.54 or newer";
+
+/** What an item asks of its wearer, and an ability its worn or carried effect changes, which are
+ *  1.54: new keys on the strict item and its effects. */
+function entriesCarryRequirements(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const item = plainRecord(plainRecord(entry)?.item);
+      return (
+        item?.requires !== undefined ||
+        plainRecord(item?.worn)?.abilities !== undefined ||
+        plainRecord(item?.carried)?.abilities !== undefined
+      );
+    })
+  );
+}
+
+const WEAPONS_ISSUE =
+  "A ruleset whose items are weapons, or whose creatures name what gets through a resistance or an immunity, requires schemaVersion 2 and capabilityApi 1.55 or newer";
+
+/** A weapon's attack, which is 1.55 (a new key on the strict item), and a creature's resistance or
+ *  immunity written as an object with what gets through it, where a word was all there was before. */
+function entriesCarryWeapons(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const record = plainRecord(entry);
+      if (plainRecord(record?.item)?.attack !== undefined) return true;
+      const creature = plainRecord(record?.creature);
+      return (["resist", "immune"] as const).some(
+        (key) => Array.isArray(creature?.[key]) && (creature[key] as unknown[]).some((type) => plainRecord(type)),
+      );
+    })
+  );
+}
+
+const ARMOR_ISSUE =
+  "A ruleset whose items change a fight while worn or carried, or with hardness, requires schemaVersion 2 and capabilityApi 1.56 or newer";
+
+/** What an item's effect does only in a fight, which is 1.56: an effect other than a check's or a
+ *  save's, a modifier to anything but checks and saves, and the kinds of harm or conditions it keeps
+ *  off (new keys on the strict effect). */
+function effectCarriesFightParts(effect: unknown): boolean {
+  const record = plainRecord(effect);
+  if (!record) return false;
+  const checkEffects = [
+    "own-checks-advantage",
+    "own-checks-disadvantage",
+    "own-saves-advantage",
+    "own-saves-disadvantage",
+  ];
+  if (Array.isArray(record.effects) && record.effects.some((one) => !checkEffects.includes(String(one)))) return true;
+  if (
+    Array.isArray(record.modifiers) &&
+    record.modifiers.some((modifier) => !["checks", "saves"].includes(String(plainRecord(modifier)?.to)))
+  ) {
+    return true;
+  }
+  return ["resist", "vulnerable", "immune", "conditionImmunities"].some((key) => record[key] !== undefined);
+}
+
+/** An item that changes a fight, and a creature's hardness, which are 1.56. */
+function entriesCarryArmor(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const record = plainRecord(entry);
+      if (plainRecord(record?.creature)?.hardness !== undefined) return true;
+      const item = plainRecord(record?.item);
+      if (!item) return false;
+      const requires = Array.isArray(item.requires) ? item.requires : [];
+      return [item.worn, item.carried, ...requires.map((requirement) => plainRecord(requirement)?.otherwise)].some(
+        effectCarriesFightParts,
+      );
+    })
+  );
+}
+
+const AMMO_ISSUE =
+  "A ruleset whose weapons shoot ammunition or keep a loaded count requires schemaVersion 2 and capabilityApi 1.57 or newer";
+
+/** A weapon's `ammo` or `clip`, which are 1.57: new keys on the strict attack. */
+function entriesCarryAmmo(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const attack = plainRecord(plainRecord(plainRecord(entry)?.item)?.attack);
+      return attack?.ammo !== undefined || attack?.clip !== undefined;
+    })
+  );
+}
+
+const WEAPON_WAYS_ISSUE =
+  "A ruleset whose weapons have modes, an off-hand attack, a floor or conditions on a hit, or whose combat block names an off-hand budget, requires schemaVersion 2 and capabilityApi 1.58 or newer";
+
+/** A weapon's `modes`, `offHand`, `floor` or `onHit`, which are 1.58: new keys on the strict attack. */
+function entriesCarryWeaponWays(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const attack = plainRecord(plainRecord(plainRecord(entry)?.item)?.attack);
+      return ["modes", "offHand", "floor", "onHit"].some((key) => attack?.[key] !== undefined);
+    })
+  );
+}
+
+const ITEM_USE_ISSUE =
+  "A ruleset whose items are used in a fight or hold charges requires schemaVersion 2 and capabilityApi 1.59 or newer";
+
+/** An item's `use` or `charges`, which are 1.59: new keys on the strict item. */
+function entriesCarryItemUse(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const item = plainRecord(plainRecord(entry)?.item);
+      return item?.use !== undefined || item?.charges !== undefined;
+    })
+  );
+}
+
+const ITEM_RESTORE_ISSUE =
+  "A ruleset whose items restore a pool when used requires schemaVersion 2 and capabilityApi 1.60 or newer";
+
+/** A use's `restore`, which is 1.60: a new key on the strict use. */
+function entriesCarryItemRestore(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => plainRecord(plainRecord(plainRecord(entry)?.item)?.use)?.restore !== undefined)
+  );
+}
+
+const CHARGES_OVER_TIME_ISSUE =
+  "A ruleset whose items regain charges on a rest or break when emptied requires schemaVersion 2 and capabilityApi 1.61 or newer";
+
+/** An item's `charges.recharge` or `charges.breaksOn`, which are 1.61: new keys on the strict charges. */
+function entriesCarryChargesOverTime(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const charges = plainRecord(plainRecord(plainRecord(entry)?.item)?.charges);
+      return charges?.recharge !== undefined || charges?.breaksOn !== undefined;
+    })
+  );
+}
+
+const ITEM_GATE_ISSUE =
+  "A ruleset whose items ask a check before they work requires schemaVersion 2 and capabilityApi 1.62 or newer";
+
+/** A use's `gate`, which is 1.62: a new key on the strict use. */
+function entriesCarryItemGate(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => plainRecord(plainRecord(plainRecord(entry)?.item)?.use)?.gate !== undefined)
+  );
+}
+
+const MONEY_ISSUE =
+  "A ruleset whose layers remove coins, or whose loot tables drop coins, requires schemaVersion 2 and capabilityApi 1.64 or newer";
+
+/** A layer's `currencies`, or a loot line's `coins`, which are 1.64: new keys on the strict layer and line. */
+function rulesetCarriesMoney164(ruleset: { layers?: unknown; items?: unknown } | undefined): boolean {
+  const layers = Array.isArray(ruleset?.layers) ? ruleset.layers : [];
+  const tables = plainRecord(ruleset?.items)?.lootTables;
+  return (
+    layers.some((layer) => plainRecord(layer)?.currencies !== undefined) ||
+    (Array.isArray(tables) &&
+      tables.some((table) => {
+        const entries = plainRecord(table)?.entries;
+        return Array.isArray(entries) && entries.some((entry) => plainRecord(entry)?.coins !== undefined);
+      }))
+  );
+}
+
+const MARKET_ISSUE =
+  "A ruleset with a market, or whose items name where they are sold or are services, requires schemaVersion 2 and capabilityApi 1.65 or newer";
+
+/** An item's `sold` or `service`, which are 1.65: new keys on the strict item. */
+function entriesCarryMarket(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const item = plainRecord(plainRecord(entry)?.item);
+      return item?.sold !== undefined || item?.service !== undefined;
+    })
+  );
+}
+
+const LOOT_ISSUE =
+  "A ruleset with loot tables, or creatures that carry loot, requires schemaVersion 2 and capabilityApi 1.63 or newer";
+
+/** A bestiary creature's `loot`, which is 1.63: a new key on the strict creature. */
+function entriesCarryCreatureLoot(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) && entries.some((entry) => plainRecord(plainRecord(entry)?.creature)?.loot !== undefined)
+  );
+}
+
+/** A level that reads a derived value, which is 1.54: a new key on the strict level. */
+function rulesetCarriesDerivedLevels154(ruleset: { combat?: unknown } | undefined): boolean {
+  const levels = plainRecord(ruleset?.combat)?.levels;
+  return Array.isArray(levels) && levels.some((level) => plainRecord(level)?.derived !== undefined);
+}
+
+/** What an item does while worn or carried, which is 1.53: new keys on the strict item. */
+function entriesCarryItemEffects(entries: unknown): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.some((entry) => {
+      const item = plainRecord(plainRecord(entry)?.item);
+      return item?.worn !== undefined || item?.carried !== undefined;
+    })
+  );
+}
+
+/** The 1.53 keys in the ruleset file itself: `skills` on a condition or a level, `skills`, `saves` and
+ *  `mode` on one of their modifiers, and a rarity cap's `bonus`. Ordinary words, so only those places
+ *  are read. */
+function rulesetCarriesCheckEffects153Keys(ruleset: { combat?: unknown; items?: unknown } | undefined): boolean {
+  const combat = plainRecord(ruleset?.combat);
+  const entries = [combat?.conditions, combat?.levels].flatMap((list) => (Array.isArray(list) ? list : []));
+  const named = entries.some((raw) => {
+    const entry = plainRecord(raw);
+    if (!entry) return false;
+    if (entry.skills !== undefined) return true;
+    const modifiers = Array.isArray(entry.modifiers) ? entry.modifiers : [];
+    return modifiers.some((one) => {
+      const modifier = plainRecord(one);
+      return modifier?.skills !== undefined || modifier?.saves !== undefined || modifier?.mode !== undefined;
+    });
+  });
+  if (named) return true;
+  const caps = plainRecord(ruleset?.items)?.rarityCaps;
+  return Array.isArray(caps) && caps.some((cap) => plainRecord(cap)?.bonus !== undefined);
+}
+
+const MOVING_INITIATIVE_ISSUE =
+  "A ruleset whose fights throw initiative as a pool or let attacks move it requires schemaVersion 2 and capabilityApi 1.48 or newer";
+
+/** The 1.48 keys in the ruleset file itself: initiative thrown as a pool (`initiative.pool` and its
+ *  `plus`) and initiative as a number attacks move (`initiative.resource`). */
+function rulesetCarriesMovingInitiative148Keys(ruleset: { combat?: unknown } | undefined): boolean {
+  const initiative = plainRecord(plainRecord(ruleset?.combat)?.initiative);
+  return (
+    !!initiative &&
+    (initiative.pool !== undefined || initiative.plus !== undefined || initiative.resource !== undefined)
+  );
+}
+
+const POOL_FIGHT_ISSUE =
+  "A ruleset whose fights throw dice pools, soak, throw initiative every round or limit spending per turn requires schemaVersion 2 and capabilityApi 1.47 or newer";
+
+/** The 1.47 keys in the ruleset file itself: the `dice-pool` kind and its `pool` block, an attack
+ *  row's `toHit.skill`, `initiative.each` and `spendLimits`. */
+function rulesetCarriesPoolFight147Keys(ruleset: { combat?: unknown } | undefined): boolean {
+  const combat = plainRecord(ruleset?.combat);
+  if (!combat) return false;
+  if (combat.kind === "dice-pool" || combat.pool !== undefined || combat.spendLimits !== undefined) return true;
+  if (plainRecord(combat.initiative)?.each !== undefined) return true;
+  const attacks = Array.isArray(combat.attacks) ? combat.attacks : [];
+  return attacks.some((source) => plainRecord(plainRecord(source)?.toHit)?.skill !== undefined);
+}
+
+/** A creature that soaks, which is 1.47: a new key on the strict creature. */
+function entriesCarryCreatureSoak(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => plainRecord(plainRecord(entry)?.creature)?.soak !== undefined);
+}
+
+const HIT_MOMENTS_ISSUE =
+  "A ruleset whose reactions answer being hit, or whose creatures react or act on themselves, requires schemaVersion 2 and capabilityApi 1.46 or newer";
+
+/** A reaction on the `hit` moment, and a creature's action that is a reaction or lands on the
+ *  creature itself, which are 1.46: a new value in the strict reaction object and new keys in the
+ *  strict creature action. */
+function entriesCarryHitMoments(entries: unknown): boolean {
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    const record = plainRecord(entry);
+    if (plainRecord(plainRecord(record?.mechanics)?.reaction)?.on === "hit") return true;
+    const actions = plainRecord(record?.creature)?.actions;
+    return (
+      Array.isArray(actions) &&
+      actions.some((action) => plainRecord(action)?.reaction !== undefined || plainRecord(action)?.self !== undefined)
+    );
+  });
+}
+
+const LIVE_STATES_ISSUE =
+  "A ruleset whose sheet has live states, whose derived values read an enum table, or whose rests put a state back, requires schemaVersion 2 and capabilityApi 1.42 or newer";
+
+/** The 1.42 keys: `states` in the live section, an `enumTable` derived value, and a rest step that
+ *  names a `state`. Ordinary words, so only those three places are read. */
+function rulesetCarriesLiveStates142Keys(ruleset: { sheet?: unknown; rests?: unknown } | undefined): boolean {
+  const record = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  const sheet = record(ruleset?.sheet);
+  if (record(sheet?.live)?.states !== undefined) return true;
+  const derived = sheet?.derived;
+  if (Array.isArray(derived) && derived.some((entry) => record(entry)?.op === "enumTable")) return true;
+  const rests = Array.isArray(ruleset?.rests) ? ruleset.rests : [];
+  return rests.some((rest) => {
+    const restore = record(rest)?.restore;
+    return Array.isArray(restore) && restore.some((step) => record(step)?.state !== undefined);
+  });
+}
+
+const SECTIONS_ISSUE =
+  "A ruleset whose abilities, skills or saves sit in sections, or that says what a check does untrained, requires schemaVersion 2 and capabilityApi 1.41 or newer";
+
+/** The 1.41 keys: a `section` on an ability, skill or save, and an `untrained` rule on a skill, a save
+ *  or a section. Ordinary words, so only those four lists are read. */
+function rulesetCarriesSections141Keys(ruleset: { sheet?: unknown } | undefined): boolean {
+  const sheet = ruleset?.sheet && typeof ruleset.sheet === "object" ? (ruleset.sheet as Record<string, unknown>) : {};
+  const carries = (key: string, fields: readonly string[]) =>
+    Array.isArray(sheet[key]) &&
+    (sheet[key] as unknown[]).some(
+      (entry) =>
+        !!entry &&
+        typeof entry === "object" &&
+        fields.some((field) => (entry as Record<string, unknown>)[field] !== undefined),
+    );
+  return (
+    carries("abilities", ["section"]) ||
+    carries("skills", ["section", "untrained"]) ||
+    carries("saves", ["section", "untrained"]) ||
+    carries("sections", ["untrained"])
+  );
+}
+
+export function getCapabilityPackageInstallIssue(
+  manifest: CapabilityCatalogPackage["manifest"],
+  rulesetDocument?: unknown,
+  catalogDocuments?: ReadonlyMap<string, unknown>,
+): string | null {
   if (manifest.kind.includes("turn-game") && !manifest.entrypoints.server) {
     return "Turn-game packages require a server entrypoint";
   }
   if (manifest.permissions.includes("routes") && !manifest.restartRequired) {
     return "Packages with privileged routes must require a restart";
   }
+  // The ruleset IS the package, so one that declares the kind without the asset would install and
+  // then do nothing at all.
+  const declaresRuleset = (manifest.contributions?.assets?.paths ?? []).some((path) => {
+    try {
+      return normalizeArchivePath(path) === RULESET_ASSET_PATH;
+    } catch {
+      return false;
+    }
+  });
+  if (manifest.kind.includes("ruleset") && !declaresRuleset) {
+    return `Ruleset packages must list ${RULESET_ASSET_PATH} in contributions.assets.paths`;
+  }
+  // And the other way round: the kind is what makes the contribution explicit, in the catalog and
+  // to the registry, so a package cannot slip a ruleset in under another kind. Whether the asset is
+  // hash-pinned in files[] is already the manifest schema's rule for every declared asset.
+  if (declaresRuleset && !manifest.kind.includes("ruleset")) {
+    return `Packages that list ${RULESET_ASSET_PATH} must declare the "ruleset" kind`;
+  }
+  const ruleset =
+    rulesetDocument && typeof rulesetDocument === "object"
+      ? (rulesetDocument as {
+          catalogs?: unknown;
+          items?: unknown;
+          battle?: unknown;
+          combat?: unknown;
+          resolution?: unknown;
+          layers?: unknown;
+          gm?: unknown;
+          sheet?: unknown;
+        })
+      : undefined;
+  const api = manifest.schemaVersion === 2 ? manifest.capabilityApi : null;
+  const declaresApi = (minor: number) => !!api && (api.major > 1 || (api.major === 1 && api.minor >= minor));
+  /** Whether a catalog, inline or in its own file, gives a creature its loot: 1.63, asked last. */
+  let carriesLoot = false;
+  let carriesMarket = false;
+  const catalogs = ruleset?.catalogs;
+  if (Array.isArray(catalogs) && catalogs.length > 0) {
+    if (!declaresApi(21)) {
+      return "A ruleset with catalogs requires schemaVersion 2 and capabilityApi 1.21 or newer";
+    }
+    // A catalog file the ruleset names but the package never declared would install fine and then
+    // leave the picker with nothing to open. Said at install, where the author can still fix it.
+    const declaredPaths = new Set(
+      (manifest.contributions?.assets?.paths ?? []).map(tryNormalizeArchivePath).filter((path) => path !== null),
+    );
+    // A row whose number the ruleset keeps up to date is a new key in a strict file, inline or in a
+    // catalog asset, so an Engine that does not know it refuses the file that holds it.
+    const scaledIssue = "A ruleset with scaled catalog rows requires schemaVersion 2 and capabilityApi 1.23 or newer";
+    const mechanicsIssue =
+      "A ruleset whose catalog mechanics reach a fight requires schemaVersion 2 and capabilityApi 1.26 or newer";
+    // A bestiary is the catalog's own `holds` plus the `creature` on every entry of it, and the
+    // entries may sit in the ruleset file or in the catalog file, so both are read.
+    const creatureIssue =
+      "A ruleset with a catalog of creatures requires schemaVersion 2 and capabilityApi 1.27 or newer";
+    // A distance a fight measures in cells is a new key, or a new shape for an old one, in the same
+    // strict file. Same reading, same reason.
+    const positionIssue =
+      "A ruleset whose fights are measured in cells requires schemaVersion 2 and capabilityApi 1.28 or newer";
+    // And what one turn of that fight can do: a second damage clause, several strikes for one
+    // budget, an ability that changes the economy, and a rider. New keys, same file, same reason.
+    const economyIssue =
+      "A ruleset that says what one turn can do requires schemaVersion 2 and capabilityApi 1.29 or newer";
+    // And what a picked entry does to a check, which is new in 1.30 and needs no wound track at all.
+    const checkIssue =
+      "A ruleset whose catalog entries change a check requires schemaVersion 2 and capabilityApi 1.30 or newer";
+    // And the moment a reaction waits for, which is new in 1.33.
+    const momentIssue =
+      "A ruleset whose reactions name the moment they wait for requires schemaVersion 2 and capabilityApi 1.33 or newer";
+    // And a creature written in the ruleset's own terms, which is new in 1.34.
+    const sheetIssue =
+      "A ruleset whose creatures carry a sheet of their own requires schemaVersion 2 and capabilityApi 1.34 or newer";
+    // And an entry that moves a pool rule for the check it is used on, which is new in 1.37.
+    const facesIssue = MOVED_POOL_RULES_ISSUE;
+    for (const catalog of catalogs) {
+      const header =
+        catalog && typeof catalog === "object"
+          ? (catalog as { asset?: unknown; entries?: unknown; holds?: unknown })
+          : {};
+      if (header.holds === "creatures" && !declaresApi(27)) return creatureIssue;
+      if (header.holds === "items" && !declaresApi(49)) return ITEMS_ISSUE;
+      if (entriesCarryItems(header.entries) && !declaresApi(49)) return ITEMS_ISSUE;
+      if (entriesCarryScaledRows(header.entries) && !declaresApi(23)) return scaledIssue;
+      if (entriesCarryCombatMechanics(header.entries) && !declaresApi(26)) return mechanicsIssue;
+      if (entriesCarryCreatures(header.entries) && !declaresApi(27)) return creatureIssue;
+      if (entriesCarryCreatureRanges(header.entries) && !declaresApi(28)) return positionIssue;
+      if (entriesCarryTurnEconomy(header.entries) && !declaresApi(29)) return economyIssue;
+      if (entriesCarryCreatureEconomy(header.entries) && !declaresApi(29)) return economyIssue;
+      if (entriesCarryCheckEffects(header.entries) && !declaresApi(30)) return checkIssue;
+      if (entriesCarryReactionMoments(header.entries) && !declaresApi(33)) return momentIssue;
+      if (entriesCarryCreatureSheets(header.entries) && !declaresApi(34)) return sheetIssue;
+      if (entriesCarryCheckFaces(header.entries) && !declaresApi(37)) return facesIssue;
+      if (entriesCarryCreatureChecks(header.entries) && !declaresApi(43)) return CONTESTS_ISSUE;
+      if (entriesCarryUsedMoments(header.entries) && !declaresApi(44)) return USED_MOMENTS_ISSUE;
+      if (entriesCarryConditionEndings(header.entries) && !declaresApi(45)) return CONDITION_NUMBERS_ISSUE;
+      if (entriesCarryHitMoments(header.entries) && !declaresApi(46)) return HIT_MOMENTS_ISSUE;
+      if (entriesCarryCreatureSoak(header.entries) && !declaresApi(47)) return POOL_FIGHT_ISSUE;
+      if (entriesCarryItemEffects(header.entries) && !declaresApi(53)) return CHECK_EFFECTS_ISSUE;
+      if (entriesCarryRequirements(header.entries) && !declaresApi(54)) return REQUIREMENTS_ISSUE;
+      if (entriesCarryWeapons(header.entries) && !declaresApi(55)) return WEAPONS_ISSUE;
+      if (entriesCarryArmor(header.entries) && !declaresApi(56)) return ARMOR_ISSUE;
+      if (entriesCarryAmmo(header.entries) && !declaresApi(57)) return AMMO_ISSUE;
+      if (entriesCarryWeaponWays(header.entries) && !declaresApi(58)) return WEAPON_WAYS_ISSUE;
+      if (entriesCarryItemUse(header.entries) && !declaresApi(59)) return ITEM_USE_ISSUE;
+      if (entriesCarryItemRestore(header.entries) && !declaresApi(60)) return ITEM_RESTORE_ISSUE;
+      if (entriesCarryChargesOverTime(header.entries) && !declaresApi(61)) return CHARGES_OVER_TIME_ISSUE;
+      if (entriesCarryItemGate(header.entries) && !declaresApi(62)) return ITEM_GATE_ISSUE;
+      if (entriesCarryCreatureLoot(header.entries)) carriesLoot = true;
+      if (entriesCarryMarket(header.entries)) carriesMarket = true;
+      const asset = header.asset;
+      if (typeof asset !== "string") continue;
+      // A path that does not normalize is never a declared one, whatever else failed to normalize.
+      const normalized = tryNormalizeArchivePath(asset);
+      if (!normalized || !declaredPaths.has(normalized)) {
+        return `The ruleset names the catalog file ${asset}, which is not listed in contributions.assets.paths`;
+      }
+      const document = catalogDocuments?.get(normalized);
+      const fileEntries = document && typeof document === "object" ? (document as { entries?: unknown }).entries : null;
+      if (entriesCarryScaledRows(fileEntries) && !declaresApi(23)) return scaledIssue;
+      if (entriesCarryCombatMechanics(fileEntries) && !declaresApi(26)) return mechanicsIssue;
+      if (entriesCarryCreatures(fileEntries) && !declaresApi(27)) return creatureIssue;
+      if (entriesCarryCreatureRanges(fileEntries) && !declaresApi(28)) return positionIssue;
+      if (entriesCarryTurnEconomy(fileEntries) && !declaresApi(29)) return economyIssue;
+      if (entriesCarryCreatureEconomy(fileEntries) && !declaresApi(29)) return economyIssue;
+      if (entriesCarryCheckEffects(fileEntries) && !declaresApi(30)) return checkIssue;
+      if (entriesCarryReactionMoments(fileEntries) && !declaresApi(33)) return momentIssue;
+      if (entriesCarryCreatureSheets(fileEntries) && !declaresApi(34)) return sheetIssue;
+      if (entriesCarryCheckFaces(fileEntries) && !declaresApi(37)) return facesIssue;
+      if (entriesCarryCreatureChecks(fileEntries) && !declaresApi(43)) return CONTESTS_ISSUE;
+      if (entriesCarryUsedMoments(fileEntries) && !declaresApi(44)) return USED_MOMENTS_ISSUE;
+      if (entriesCarryConditionEndings(fileEntries) && !declaresApi(45)) return CONDITION_NUMBERS_ISSUE;
+      if (entriesCarryHitMoments(fileEntries) && !declaresApi(46)) return HIT_MOMENTS_ISSUE;
+      if (entriesCarryCreatureSoak(fileEntries) && !declaresApi(47)) return POOL_FIGHT_ISSUE;
+      if (entriesCarryItems(fileEntries) && !declaresApi(49)) return ITEMS_ISSUE;
+      if (entriesCarryItemEffects(fileEntries) && !declaresApi(53)) return CHECK_EFFECTS_ISSUE;
+      if (entriesCarryRequirements(fileEntries) && !declaresApi(54)) return REQUIREMENTS_ISSUE;
+      if (entriesCarryWeapons(fileEntries) && !declaresApi(55)) return WEAPONS_ISSUE;
+      if (entriesCarryArmor(fileEntries) && !declaresApi(56)) return ARMOR_ISSUE;
+      if (entriesCarryAmmo(fileEntries) && !declaresApi(57)) return AMMO_ISSUE;
+      if (entriesCarryWeaponWays(fileEntries) && !declaresApi(58)) return WEAPON_WAYS_ISSUE;
+      if (entriesCarryItemUse(fileEntries) && !declaresApi(59)) return ITEM_USE_ISSUE;
+      if (entriesCarryItemRestore(fileEntries) && !declaresApi(60)) return ITEM_RESTORE_ISSUE;
+      if (entriesCarryChargesOverTime(fileEntries) && !declaresApi(61)) return CHARGES_OVER_TIME_ISSUE;
+      if (entriesCarryItemGate(fileEntries) && !declaresApi(62)) return ITEM_GATE_ISSUE;
+      if (entriesCarryCreatureLoot(fileEntries)) carriesLoot = true;
+      if (entriesCarryMarket(fileEntries)) carriesMarket = true;
+    }
+  }
+  // The battle block lives inside the ruleset file too, so it is read the same way and for the same
+  // reason: an Engine that does not know the key refuses the whole file, and the package would be
+  // installed with no rules at all.
+  if (ruleset?.battle && typeof ruleset.battle === "object" && !declaresApi(22)) {
+    return "A ruleset with a battle block requires schemaVersion 2 and capabilityApi 1.22 or newer";
+  }
+  // The resolution kind is read the same way and for the same reason. An Engine that knows only
+  // `dice-sum` refuses the whole file, so the package would be installed with no rules at all.
+  const resolution =
+    ruleset?.resolution && typeof ruleset.resolution === "object"
+      ? (ruleset.resolution as { kind?: unknown; penaltyFrom?: unknown; spend?: unknown })
+      : undefined;
+  if (resolution?.kind === "dice-pool" && !declaresApi(24)) {
+    return "A ruleset with a dice-pool resolution requires schemaVersion 2 and capabilityApi 1.24 or newer";
+  }
+  // Layers and the base world-generation slot are new keys in the same strict file, so they are
+  // read the same way and for the same reason as everything above: an Engine that does not know
+  // the key refuses the whole file, and the package would install with no rules at all.
+  if (Array.isArray(ruleset?.layers) && ruleset.layers.length > 0 && !declaresApi(25)) {
+    return "A ruleset with layers requires schemaVersion 2 and capabilityApi 1.25 or newer";
+  }
+  const gm = ruleset?.gm && typeof ruleset.gm === "object" ? (ruleset.gm as { worldGuidance?: unknown }) : undefined;
+  if (gm?.worldGuidance !== undefined && !declaresApi(25)) {
+    return "A ruleset with gm.worldGuidance requires schemaVersion 2 and capabilityApi 1.25 or newer";
+  }
+  // The combat block is one more key in the same strict file, read the same way and for the same
+  // reason. An inline catalog whose mechanics reach a fight is checked with the catalogs above.
+  if (ruleset?.combat && typeof ruleset.combat === "object" && !declaresApi(26)) {
+    return "A ruleset with a combat block requires schemaVersion 2 and capabilityApi 1.26 or newer";
+  }
+  // And the keys inside it that give a fight a board. Same file, same reading, same reason.
+  const combat =
+    ruleset?.combat && typeof ruleset.combat === "object" ? (ruleset.combat as Record<string, unknown>) : undefined;
+  if (combat && !declaresApi(28)) {
+    const positioned = ["distance", "ranged", "cover", "opportunity"].some((key) => combat[key] !== undefined);
+    const attacks = Array.isArray(combat.attacks)
+      ? combat.attacks.some(
+          (source) =>
+            !!source &&
+            typeof source === "object" &&
+            (["reach", "range"] as const).some((key) => (source as Record<string, unknown>)[key] !== undefined),
+        )
+      : false;
+    if (positioned || attacks) {
+      return "A ruleset whose fights are measured in cells requires schemaVersion 2 and capabilityApi 1.28 or newer";
+    }
+  }
+  // And the keys inside the block that say what one turn can do. Same file, same reading, same
+  // reason: an attack list that buys several strikes with one spend, and a condition that narrows
+  // the saves it is about, is in sight of its source or ends when its source goes down.
+  if (combat && !declaresApi(29)) {
+    const strikes = Array.isArray(combat.attacks)
+      ? combat.attacks.some(
+          (source) =>
+            !!source && typeof source === "object" && (source as Record<string, unknown>).strikes !== undefined,
+        )
+      : false;
+    const conditions = Array.isArray(combat.conditions)
+      ? combat.conditions.some((entry) => {
+          if (!entry || typeof entry !== "object") return false;
+          const record = entry as Record<string, unknown>;
+          if ((["saves", "whileSourceInSight", "endsWhenSourceDown"] as const).some((key) => record[key] !== undefined))
+            return true;
+          // A value the old effect list did not hold is refused by an Engine that only knows that
+          // list, so it is read here as well as the keys beside it.
+          return (
+            Array.isArray(record.effects) &&
+            record.effects.some((effect) => typeof effect === "string" && !OLD_CONDITION_EFFECTS.has(effect))
+          );
+        })
+      : false;
+    // The part of a dodge its flag does not carry. Same reason as the two above: an Engine that does
+    // not know the key refuses the whole strict file rather than ignoring it.
+    const dodgeSaves = combat.standardEffects !== undefined;
+    if (strikes || conditions || dodgeSaves) {
+      return "A ruleset that says what one turn can do requires schemaVersion 2 and capabilityApi 1.29 or newer";
+    }
+  }
+  // A weapon held to one strike by a column of its own row. Same file, same reading, same reason as
+  // everything above: an Engine that does not know the key refuses the whole ruleset.
+  if (combat && !declaresApi(32)) {
+    const capped = Array.isArray(combat.attacks)
+      ? combat.attacks.some(
+          (source) =>
+            !!source && typeof source === "object" && (source as Record<string, unknown>).strikesCappedBy !== undefined,
+        )
+      : false;
+    if (capped) {
+      return "A ruleset whose weapons cap their own strikes requires schemaVersion 2 and capabilityApi 1.32 or newer";
+    }
+  }
+  // The items block, which is 1.49's. Same file, same reason.
+  if (!declaresApi(49) && ruleset?.items !== undefined) return ITEMS_ISSUE;
+  // What the Game Master may invent, which is 1.51's. Same file, same reason.
+  if (!declaresApi(51) && rulesetCarriesInventedItem151Keys(ruleset)) return INVENTED_ITEMS_ISSUE;
+  // What items, conditions and levels do to checks outside a fight, which are 1.53's. Same file, same
+  // reason; the items themselves are read with the catalogs above.
+  if (!declaresApi(53) && rulesetCarriesCheckEffects153Keys(ruleset)) return CHECK_EFFECTS_ISSUE;
+  // A level that reads a derived value, which is 1.54's. Same file, same reason.
+  if (!declaresApi(54) && rulesetCarriesDerivedLevels154(ruleset)) return REQUIREMENTS_ISSUE;
+  if (!declaresApi(56) && plainRecord(plainRecord(plainRecord(ruleset?.combat)?.pool))?.hardness !== undefined) {
+    return ARMOR_ISSUE;
+  }
+  if (!declaresApi(58) && plainRecord(ruleset?.combat)?.offHand !== undefined) return WEAPON_WAYS_ISSUE;
+  // Values that read the items someone holds, which are 1.52's. Same file (and the same catalog
+  // files), same reason.
+  if (
+    !declaresApi(52) &&
+    (carriesItemStat152(ruleset) ||
+      [...(catalogDocuments?.values() ?? [])].some((document) => carriesItemStat152(document)))
+  ) {
+    return ITEM_STAT_ISSUE;
+  }
+  // Initiative thrown as a pool, and a number attacks move, which are 1.48's. Same file, same reason.
+  if (!declaresApi(48) && rulesetCarriesMovingInitiative148Keys(ruleset)) return MOVING_INITIATIVE_ISSUE;
+  // A fight thrown in pools, and what either kind may now throw every round or cap per turn, which
+  // are 1.47's. Same file, same reason.
+  if (!declaresApi(47) && rulesetCarriesPoolFight147Keys(ruleset)) return POOL_FIGHT_ISSUE;
+  // Numbers a condition changes, and levels of a track, which are 1.45's. Same file, same reason.
+  if (!declaresApi(45) && rulesetCarriesConditionNumbers145Keys(ruleset)) return CONDITION_NUMBERS_ISSUE;
+  // Contests and the checks they read, which are 1.43's. Same file, same reason.
+  if (!declaresApi(43) && rulesetCarriesContests143Keys(ruleset)) return CONTESTS_ISSUE;
+  // Live states, the enum tables that follow them and the rests that put them back, which are
+  // 1.42's. Same file, same reason.
+  if (!declaresApi(42) && rulesetCarriesLiveStates142Keys(ruleset)) return LIVE_STATES_ISSUE;
+  // Sections on abilities, skills and saves, and untrained rules, which are 1.41's. Same file, same reason.
+  if (!declaresApi(41) && rulesetCarriesSections141Keys(ruleset)) return SECTIONS_ISSUE;
+  // Wound tracks of boxes, filled by box, refusing when full or lengthened by a list, and rests that
+  // heal one kind of harm, which are 1.40's. Same file, same reason.
+  if (!declaresApi(40) && rulesetCarriesWound140Keys(ruleset)) return WOUND_BOXES_ISSUE;
+  // Values that read the live state or add up a list, caps on checks, and wider hide rules, which are
+  // 1.39's. Same file (and the same catalog files), same reason.
+  if (
+    !declaresApi(39) &&
+    (carriesSheetReads139(ruleset) ||
+      rulesetCapsChecks(ruleset) ||
+      [...(catalogDocuments?.values() ?? [])].some((document) => carriesSheetReads139(document)))
+  ) {
+    return SHEET_READS_ISSUE;
+  }
+  // What a check may buy and what rides along on it, which are 1.38's: standing re-throws, a spend
+  // that throws again or reads its limit off the sheet, more than two spends, and sheet modifiers.
+  if (resolution && !declaresApi(38)) {
+    const record = resolution as Record<string, unknown>;
+    const spends = Array.isArray(record.spend) ? record.spend : [];
+    const newSpend =
+      spends.length > 2 ||
+      spends.some((entry) => {
+        const spend = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+        return spend.reroll !== undefined || (spend.perCheck !== undefined && typeof spend.perCheck !== "number");
+      });
+    if (record.reroll !== undefined || record.adjust !== undefined || newSpend) {
+      return "A ruleset whose checks take standing re-throws or sheet modifiers, or whose spends throw again, read their limit off the sheet or number more than two, requires schemaVersion 2 and capabilityApi 1.38 or newer";
+    }
+  }
+  // The sheet's own 1.37 keys: a track's maximum off the sheet, a track hidden or always shown, and
+  // a summary list's columns or enum name. Same file, same reading, same reason.
+  if (!declaresApi(37) && rulesetCarriesSheet137Keys(ruleset)) return SHEET_1_37_ISSUE;
+  // A pool check whose rules a check may move, two abilities rolled together, and a botch read off
+  // half the dice. New keys in the same strict resolution, so the reading and the reason are the same
+  // as everything above.
+  if (resolution?.kind === "dice-pool" && !declaresApi(37)) {
+    const record = resolution as Record<string, unknown>;
+    const moved = (["explode", "double"] as const).some((key) => {
+      const rule = record[key];
+      return !!rule && typeof rule === "object" && (rule as Record<string, unknown>).min !== undefined;
+    });
+    const pool = record.pool;
+    const paired =
+      !!pool && typeof pool === "object" && (pool as Record<string, unknown>).abilityPlusAbility !== undefined;
+    const botch = record.botch;
+    const ruled = !!botch && typeof botch === "object" && (botch as Record<string, unknown>).rule !== undefined;
+    if (moved || paired || ruled) return MOVED_POOL_RULES_ISSUE;
+  }
+  // Wound tracks. `levels` and `kinds` on a live track, and the track `resolution.penaltyFrom`
+  // names, are new keys in the same strict file, so the reading and the reason are the same as
+  // everything above: an Engine that does not know them refuses the whole ruleset.
+  if (!declaresApi(30)) {
+    const woundIssue = "A ruleset with wound tracks requires schemaVersion 2 and capabilityApi 1.30 or newer";
+    const sheet =
+      ruleset?.sheet && typeof ruleset.sheet === "object" ? (ruleset.sheet as { live?: unknown }) : undefined;
+    const live = sheet?.live && typeof sheet.live === "object" ? (sheet.live as { tracks?: unknown }) : undefined;
+    const marked = Array.isArray(live?.tracks)
+      ? live.tracks.some(
+          (track) =>
+            !!track &&
+            typeof track === "object" &&
+            (["levels", "kinds"] as const).some((key) => (track as Record<string, unknown>)[key] !== undefined),
+        )
+      : false;
+    if (marked || resolution?.penaltyFrom !== undefined) return woundIssue;
+    // A player spending a resource on a roll is the other half of 1.30 and depends on no track at
+    // all, so it is its own reason rather than being folded into the wound-track one.
+    if (resolution?.spend !== undefined) {
+      return "A ruleset that lets a check spend a resource requires schemaVersion 2 and capabilityApi 1.30 or newer";
+    }
+  }
+  // Loot tables in the items block and a creature's loot, which are 1.63's. Same files, same reason;
+  // asked last, so a package that declares an older minor hears first about what that minor lacks.
+  if (!declaresApi(63) && (carriesLoot || plainRecord(ruleset?.items)?.lootTables !== undefined)) return LOOT_ISSUE;
+  if (!declaresApi(64) && rulesetCarriesMoney164(ruleset)) return MONEY_ISSUE;
+  if (!declaresApi(65) && (carriesMarket || plainRecord(ruleset?.items)?.market !== undefined)) return MARKET_ISSUE;
   return null;
 }
 
@@ -742,15 +1809,41 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
   if (agentDetailIds.length > 0 && !installedManifest.entrypoints.agents) {
     throw new Error("Agent detail contributions require agent definitions");
   }
+  let usesDecisions = false;
   if (installedManifest.entrypoints.agents) {
     const agentsPath = normalizeArchivePath(installedManifest.entrypoints.agents);
     const agentsFile = verifiedFiles.get(agentsPath);
     if (!agentsFile) throw new Error("Package agent definitions are missing");
     const agentDefinitions = packagedAgentDefinitionsSchema.parse(JSON.parse(agentsFile.toString("utf8")));
+    usesDecisions = containsDecisionStatements(agentDefinitions);
     for (const agentId of agentDetailIds) {
       const detailIssue = getCapabilityAgentDetailDefinitionIssue(agentId, agentDefinitions);
       if (detailIssue) throw new Error(detailIssue);
     }
+  }
+  // Run again now that the ruleset's verified bytes are here: what the manifest could be judged on
+  // was already checked before the download, and this adds the one gate that needs the file itself.
+  const rulesetBytes = verifiedFiles.get(RULESET_ASSET_PATH);
+  if (rulesetBytes) {
+    let rulesetDocument: unknown;
+    try {
+      rulesetDocument = JSON.parse(rulesetBytes.toString("utf8"));
+    } catch {
+      rulesetDocument = undefined;
+    }
+    // The catalog files are here too, and a scaled row can sit in one of them rather than inline.
+    const catalogDocuments = new Map<string, unknown>();
+    for (const [name, data] of verifiedFiles) {
+      if (!isRulesetCatalogAssetPath(name)) continue;
+      try {
+        catalogDocuments.set(name, JSON.parse(data.toString("utf8")));
+      } catch {
+        // An unreadable catalog file is the catalog route's story to tell, with the author's own
+        // issue lines; it has never been a reason to refuse the install.
+      }
+    }
+    const rulesetIssue = getCapabilityPackageInstallIssue(installedManifest, rulesetDocument, catalogDocuments);
+    if (rulesetIssue) throw new Error(rulesetIssue);
   }
 
   const temporary = join(ROOT, `.install-${manifest.id}-${Date.now()}`);
@@ -797,7 +1890,7 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
     } catch (error) {
       logger.warn(error, "Could not clear the deferred update marker for capability package %s", manifest.id);
     }
-    return installed;
+    return { ...installed, usesDecisions };
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -1124,23 +2217,21 @@ export const capabilityPackageManager = {
     // Every normalization below treats an unsafe path — requested OR declared —
     // as simply "not servable" (404). Declared paths are manifest-controlled,
     // and a single throwing declaration must not 500 the whole asset surface.
-    const tryNormalize = (path: string): string | null => {
-      try {
-        return normalizeArchivePath(path);
-      } catch {
-        return null;
-      }
-    };
-    const normalizedPath = tryNormalize(assetPath);
+    const normalizedPath = tryNormalizeArchivePath(assetPath);
     if (!normalizedPath) return null;
     // The in-package manifest is metadata about the artifact, never an asset —
     // it cannot be hash-pinned by itself, so refuse it outright.
     if (normalizedPath === "manifest.json") return null;
     const iconPaths = servable.manifest.contributions?.homeBrowserTab?.iconPaths ?? [];
     const declaredAssetPaths = servable.manifest.contributions?.assets?.paths ?? [];
-    const allowed = [...iconPaths, ...declaredAssetPaths].some((path) => tryNormalize(path) === normalizedPath);
+    const widgetIconPaths = (servable.manifest.contributions?.homeWidgets ?? []).flatMap((widget) =>
+      widget.iconPath ? [widget.iconPath] : [],
+    );
+    const allowed = [...iconPaths, ...widgetIconPaths, ...declaredAssetPaths].some(
+      (path) => tryNormalizeArchivePath(path) === normalizedPath,
+    );
     if (!allowed) return null;
-    const declaration = servable.manifest.files.find((item) => tryNormalize(item.path) === normalizedPath);
+    const declaration = servable.manifest.files.find((item) => tryNormalizeArchivePath(item.path) === normalizedPath);
     if (!declaration) return null;
     const contentType = PACKAGE_ASSET_CONTENT_TYPES.get(extname(normalizedPath).toLowerCase());
     if (!contentType) return null;
@@ -1200,15 +2291,8 @@ export const capabilityPackageManager = {
       );
       return null;
     }
-    const tryNormalize = (path: string): string | null => {
-      try {
-        return normalizeArchivePath(path);
-      } catch {
-        return null;
-      }
-    };
     const declaredAssetPaths = installed.manifest.contributions?.assets?.paths ?? [];
-    if (!declaredAssetPaths.some((path) => tryNormalize(path) === GM_VERB_TABLE_ASSET_PATH)) return null;
+    if (!declaredAssetPaths.some((path) => tryNormalizeArchivePath(path) === GM_VERB_TABLE_ASSET_PATH)) return null;
     if (!installed.manifest.permissions.includes("chat-write")) {
       logger.warn(
         "[capability/gm-verbs] Package %s declares %s without the chat-write permission; its verbs are refused",
@@ -1217,7 +2301,9 @@ export const capabilityPackageManager = {
       );
       return null;
     }
-    const declaration = installed.manifest.files.find((item) => tryNormalize(item.path) === GM_VERB_TABLE_ASSET_PATH);
+    const declaration = installed.manifest.files.find(
+      (item) => tryNormalizeArchivePath(item.path) === GM_VERB_TABLE_ASSET_PATH,
+    );
     if (!declaration) {
       // Declared as an asset but never hash-pinned. The manifest schema only checks the other
       // direction, so this is silent everywhere else in the pipeline.
@@ -1249,6 +2335,128 @@ export const capabilityPackageManager = {
       );
       return null;
     }
+  },
+
+  /** Every ready package's `ruleset.json`, verified, for the ruleset registry. Same discipline as
+   *  `gmVerbTableSource`: declared as an asset, hash-pinned in `files[]`, refused on its DECLARED
+   *  size before the read, and re-verified against the install-time hash. A ruleset is inert data
+   *  that needs no permission, so there is no permission gate here. Never throws. */
+  async rulesetSources(): Promise<Array<{ packageId: string; data: Buffer }>> {
+    const sources: Array<{ packageId: string; data: Buffer }> = [];
+    for (const installed of (await readRegistry()).packages) {
+      const declared = installed.manifest.contributions?.assets?.paths ?? [];
+      if (!declared.some((path) => tryNormalizeArchivePath(path) === RULESET_ASSET_PATH)) continue;
+      if (!installed.manifest.kind.includes("ruleset")) {
+        logger.warn(
+          "[capability/rulesets] Package %s lists %s without the ruleset kind; its ruleset is refused",
+          installed.id,
+          RULESET_ASSET_PATH,
+        );
+        continue;
+      }
+      if (!isInstalledCapabilityReady(installed)) {
+        logger.info(
+          "[capability/rulesets] Package %s is not ready (status=%s); its ruleset stays unavailable until restart",
+          installed.id,
+          installed.status,
+        );
+        continue;
+      }
+      const declaration = installed.manifest.files.find(
+        (item) => tryNormalizeArchivePath(item.path) === RULESET_ASSET_PATH,
+      );
+      if (!declaration) {
+        logger.warn(
+          "[capability/rulesets] Package %s declares %s as an asset but does not list it in files[]",
+          installed.id,
+          RULESET_ASSET_PATH,
+        );
+        continue;
+      }
+      if (declaration.bytes > RULESET_MAX_BYTES) {
+        logger.warn(
+          "[capability/rulesets] Package %s declares a %d-byte ruleset over the %d-byte ceiling; refused unread",
+          installed.id,
+          declaration.bytes,
+          RULESET_MAX_BYTES,
+        );
+        continue;
+      }
+      try {
+        sources.push({
+          packageId: installed.id,
+          data: (await readVerifiedInstalledPackageFile(installed, RULESET_ASSET_PATH)).data,
+        });
+      } catch (error) {
+        logger.error(error, "[capability/rulesets] Ruleset for %s failed integrity verification", installed.id);
+      }
+    }
+    return sources;
+  },
+
+  /** One package's `catalogs/<id>.json`, verified, for the catalog route. Same discipline as
+   *  `rulesetSources`, and the same reasons: declared as an asset, hash-pinned in `files[]`, refused
+   *  on its DECLARED size before the read, and re-verified against the install-time hash.
+   *
+   *  Three answers, because the route owes the user different words for each: `null` when this
+   *  package serves no such catalog file at all (not installed, not ready, not declared), `{ issue }`
+   *  when it declares one the Engine will not read, and `{ data }` for the verified bytes. Never
+   *  throws. */
+  async rulesetCatalogAsset(
+    packageId: string,
+    catalogId: string,
+  ): Promise<{ sha256: string; read: () => Promise<{ data: Buffer } | { issue: string }> } | { issue: string } | null> {
+    const assetPath = rulesetCatalogAssetPath(catalogId);
+    const installed = (await readRegistry()).packages.find((item) => item.id === packageId);
+    if (!installed) return null;
+    if (!isInstalledCapabilityReady(installed)) {
+      logger.info(
+        "[capability/rulesets] Package %s is not ready (status=%s); its catalogs stay unavailable until restart",
+        packageId,
+        installed.status,
+      );
+      return null;
+    }
+    const declared = installed.manifest.contributions?.assets?.paths ?? [];
+    if (!declared.some((path) => tryNormalizeArchivePath(path) === assetPath)) return null;
+    const declaration = installed.manifest.files.find((item) => tryNormalizeArchivePath(item.path) === assetPath);
+    if (!declaration) {
+      logger.warn(
+        "[capability/rulesets] Package %s declares %s as an asset but does not list it in files[]",
+        packageId,
+        assetPath,
+      );
+      return { issue: `${assetPath} is not listed in the package file manifest` };
+    }
+    if (declaration.bytes > RULESET_CATALOG_MAX_BYTES) {
+      logger.warn(
+        "[capability/rulesets] Package %s declares a %d-byte catalog over the %d-byte ceiling; refused unread",
+        packageId,
+        declaration.bytes,
+        RULESET_CATALOG_MAX_BYTES,
+      );
+      return {
+        issue: `${assetPath} is ${declaration.bytes} bytes, over the ${RULESET_CATALOG_MAX_BYTES}-byte limit`,
+      };
+    }
+    // The pinned hash comes back before the bytes are read, so a caller that already holds this
+    // exact file (a conditional request) never makes the Engine read and validate it again.
+    return {
+      sha256: declaration.sha256,
+      read: async () => {
+        try {
+          return { data: (await readVerifiedInstalledPackageFile(installed, assetPath)).data };
+        } catch (error) {
+          logger.error(
+            error,
+            "[capability/rulesets] Catalog %s for %s failed integrity verification",
+            assetPath,
+            packageId,
+          );
+          return { issue: `${assetPath} is not the file that was installed` };
+        }
+      },
+    };
   },
 
   async markRuntimeStatus(

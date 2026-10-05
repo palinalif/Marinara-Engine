@@ -7,14 +7,25 @@
 // Apple Silicon MLX-native path.
 // ──────────────────────────────────────────────
 
-import { basename, join, relative, resolve, sep } from "path";
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { basename, isAbsolute, join, relative, resolve, sep } from "path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import {
   SIDECAR_DEFAULT_CONFIG,
   SIDECAR_EMBEDDING_POOLING_TYPES,
   SIDECAR_RUNTIME_PREFERENCES,
   SIDECAR_MLX_MODELS,
   SIDECAR_MODELS,
+  type DecisionThinkingMode,
   type SidecarBackend,
   type SidecarConfig,
   type SidecarCustomModelEntry,
@@ -28,7 +39,11 @@ import { getDataDir } from "../../utils/data-dir.js";
 import { downloadFileWithProgress, fetchJson, isAbortError } from "./sidecar-download.js";
 import { mlxRuntimeService } from "./mlx-runtime.service.js";
 import { sidecarRuntimeService } from "./sidecar-runtime.service.js";
-import { assertSupportedLlamaCppModelPath, isSupportedLlamaCppModelFilename } from "./sidecar-model-files.js";
+import {
+  assertSupportedLlamaCppModelPath,
+  isSupportedLlamaCppModelFilename,
+  validateLocalGgufPath,
+} from "./sidecar-model-files.js";
 import { logger } from "../../lib/logger.js";
 
 export const MODELS_DIR = join(getDataDir(), "models");
@@ -176,6 +191,17 @@ class SidecarModelService {
           -1,
           1024,
         );
+        if (!["f16", "q8_0", "q4_0"].includes(nextConfig.kvCacheType ?? "")) {
+          nextConfig.kvCacheType = "f16";
+          shouldRewrite = true;
+        }
+        if (
+          nextConfig.externalModelPath &&
+          (typeof nextConfig.externalModelPath !== "string" || !isAbsolute(nextConfig.externalModelPath))
+        ) {
+          nextConfig.externalModelPath = null;
+          shouldRewrite = true;
+        }
         nextConfig.enableNativeToolCalls = normalizeBooleanSetting(
           nextConfig.enableNativeToolCalls,
           SIDECAR_DEFAULT_CONFIG.enableNativeToolCalls,
@@ -241,7 +267,13 @@ class SidecarModelService {
   }
 
   private writeConfig(config: SidecarConfig): void {
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    const temporary = `${CONFIG_PATH}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify(config, null, 2), "utf-8");
+      renameSync(temporary, CONFIG_PATH);
+    } finally {
+      rmSync(temporary, { force: true });
+    }
   }
 
   private saveConfig(): void {
@@ -267,7 +299,7 @@ class SidecarModelService {
   }
 
   private resolveBackend(config: SidecarConfig = this.config): SidecarBackend {
-    if (config.modelPath) {
+    if (config.modelPath || config.externalModelPath) {
       return "llama_cpp";
     }
     if (config.backend === "mlx" && isMacAppleSilicon()) {
@@ -284,12 +316,16 @@ class SidecarModelService {
   }
 
   private getModelFilePathForConfig(config: SidecarConfig = this.config): string | null {
+    if (config.externalModelPath) {
+      return existsSync(config.externalModelPath) ? config.externalModelPath : null;
+    }
     if (!config.modelPath) return null;
     const resolved = this.resolveModelPath(config.modelPath);
     return existsSync(resolved) ? resolved : null;
   }
 
   private getConfiguredModelFileTarget(config: SidecarConfig): string | null {
+    if (config.externalModelPath) return config.externalModelPath;
     if (!config.modelPath) return null;
     try {
       return this.resolveModelPath(config.modelPath);
@@ -361,10 +397,11 @@ class SidecarModelService {
     }
 
     const modelPath = this.getModelFilePathForConfig(config);
-    return modelPath && config.modelPath ? basename(config.modelPath) : null;
+    return modelPath ? basename(modelPath) : null;
   }
 
   private cleanupPreviousModel(previousConfig: SidecarConfig, nextConfig: SidecarConfig): void {
+    if (previousConfig.externalModelPath) return;
     const previousBackend = this.resolveBackend(previousConfig);
     const nextBackend = this.resolveBackend(nextConfig);
 
@@ -535,6 +572,19 @@ class SidecarModelService {
     return this.resolveBackend();
   }
 
+  /**
+   * Record how this slot's model may answer an activation question.
+   *
+   * The operator's own choice, and only theirs: when Auto finds that the loaded model
+   * cannot answer in one token, that verdict goes in the decision backend's per-model
+   * cache rather than being written back over this setting.
+   */
+  setDecisionThinking(decisionThinking: DecisionThinkingMode): void {
+    if (this.config.decisionThinking === decisionThinking) return;
+    this.config = { ...this.config, decisionThinking };
+    this.saveConfig();
+  }
+
   getConfiguredModelRef(): string | null {
     return this.resolveBackend() === "mlx"
       ? mlxRuntimeService.hasModelCache(this.config.modelRepo)
@@ -569,10 +619,12 @@ class SidecarModelService {
         | "topK"
         | "maxParallelJobs"
         | "gpuLayers"
+        | "kvCacheType"
         | "enableNativeToolCalls"
         | "embeddingPooling"
         | "embeddingBatchSize"
         | "runtimePreference"
+        | "decisionThinking"
       >
     >,
   ): SidecarConfig {
@@ -582,6 +634,26 @@ class SidecarModelService {
       this.status = "downloaded";
     }
     return { ...this.config, backend: this.resolveBackend() };
+  }
+
+  selectLocalModel(filePath: string): void {
+    if (this.status.startsWith("downloading"))
+      throw new Error("Wait for the current download before switching models.");
+    const selected = validateLocalGgufPath(filePath);
+    // An existing file is borrowed, including files selected from data/models.
+    // Do not clean up either it or the previously selected download when switching here.
+    const nextConfig: SidecarConfig = {
+      ...this.config,
+      backend: "llama_cpp",
+      modelPath: null,
+      externalModelPath: selected,
+      modelRepo: null,
+      customModelRepo: null,
+      quantization: null,
+    };
+    this.writeConfig(nextConfig);
+    this.config = nextConfig;
+    this.status = "downloaded";
   }
 
   async download(quantization: SidecarQuantization, onProgress?: ProgressCallback): Promise<void> {
@@ -598,6 +670,7 @@ class SidecarModelService {
         ...previousConfig,
         backend: "mlx",
         modelPath: null,
+        externalModelPath: null,
         modelRepo: repoId,
         quantization,
         customModelRepo: null,
@@ -621,11 +694,20 @@ class SidecarModelService {
 
     const relativePath = modelInfo.filename;
     const destination = this.resolveModelPath(relativePath);
+    if (
+      previousConfig.externalModelPath &&
+      existsSync(destination) &&
+      existsSync(previousConfig.externalModelPath) &&
+      realpathSync(destination) === realpathSync(previousConfig.externalModelPath)
+    ) {
+      throw new Error("This file is already selected from disk. Keep that selection or choose a different download.");
+    }
     const expectedBytes = this.getExactDownloadSize(modelInfo);
     const nextConfig: SidecarConfig = {
       ...previousConfig,
       backend: "llama_cpp",
       modelPath: relativePath,
+      externalModelPath: null,
       modelRepo: null,
       quantization,
       customModelRepo: null,
@@ -723,6 +805,7 @@ class SidecarModelService {
         ...previousConfig,
         backend: "mlx",
         modelPath: null,
+        externalModelPath: null,
         modelRepo: repo,
         quantization: null,
         customModelRepo: repo,
@@ -753,10 +836,19 @@ class SidecarModelService {
 
     const relativePath = join("custom", `${slugifyRepo(repo)}__${selected.filename}`).replace(/\\/g, "/");
     const destination = this.resolveModelPath(relativePath);
+    if (
+      previousConfig.externalModelPath &&
+      existsSync(destination) &&
+      existsSync(previousConfig.externalModelPath) &&
+      realpathSync(destination) === realpathSync(previousConfig.externalModelPath)
+    ) {
+      throw new Error("This file is already selected from disk. Keep that selection or choose a different download.");
+    }
     const nextConfig: SidecarConfig = {
       ...previousConfig,
       backend: "llama_cpp",
       modelPath: relativePath,
+      externalModelPath: null,
       modelRepo: null,
       quantization: null,
       customModelRepo: repo,
@@ -879,7 +971,7 @@ class SidecarModelService {
       mlxRuntimeService.clearModelCache();
     } else {
       const modelPath = this.getModelFilePath();
-      if (modelPath && existsSync(modelPath)) {
+      if (modelPath && !this.config.externalModelPath && existsSync(modelPath)) {
         await this.removeModelFileWithRetry(modelPath);
       }
     }
@@ -888,6 +980,7 @@ class SidecarModelService {
       ...this.config,
       backend: isMacAppleSilicon() ? "mlx" : "llama_cpp",
       modelPath: null,
+      externalModelPath: null,
       modelRepo: null,
       quantization: null,
       customModelRepo: null,

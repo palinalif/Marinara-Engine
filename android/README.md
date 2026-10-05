@@ -14,14 +14,19 @@ The Android app is a Termux bootstrap + WebView shell for Marinara Engine. It is
 - If Termux blocks external commands, the APK copies the required `allow-external-apps` command to the clipboard and opens Termux so the user can paste it once.
 - The first APK bootstrap starts the exact embedded source commit with update checks skipped and leaves browser auto-open disabled so the authenticated Android app can connect. Later manual launches and updates are still owned by the Termux launcher.
 - APK-managed installs generate and provision a private per-install secret automatically to authenticate the WebView to the Termux server. Users do not create, copy, or enter it during the normal APK flow. This prevents another Android app from impersonating Marinara on the localhost port or inheriting loopback API access. Manual Termux-only installs retain their existing behavior.
-- The Termux launcher sizes the Node.js heap from the structured profile size (roughly twice the on-disk profile plus headroom) bounded by one quarter of known device RAM (or 1536 MiB when device memory cannot be read), starting at a 1 GiB baseline. Advanced users can keep an explicit override, for example `NODE_OPTIONS="--max-old-space-size=1536" ./start-termux.sh`.
+- The Termux launcher sizes the server's Node.js heap from the structured profile size (roughly twice the on-disk profile plus headroom) bounded by one quarter of known device RAM (or 1536 MiB when device memory cannot be read), starting at a 1 GiB baseline. The client build temporarily raises a smaller automatic heap toward 1536 MiB, capped at half of known device RAM with a 1024 MiB floor; the server retains its original limit. The RAM cap is rounded down in 128 MiB steps. If half of device RAM is below 1024 MiB, the 1024 MiB floor takes precedence. Advanced users can keep an explicit override, for example `NODE_OPTIONS="--max-old-space-size=1536" ./start-termux.sh`, which applies to both build and server.
 - The bootstrap fetches and checks out the exact source commit embedded in the APK. It does not fall back to a mutable branch when that commit cannot be fetched.
+- Client rebuilds use the complete low-memory build, including the isolated multiplayer guest assets. Image processing includes Sharp's matching WebAssembly fallback for Android, retained through dependency updates.
 - Release and versioning policy follows the main repo docs in [../CONTRIBUTING.md](../CONTRIBUTING.md): root `package.json` is canonical, Android `versionName` should match the app version, and `versionCode` must increase for every shipped APK.
 - If you build the APK with a non-default port, Termux must use the same `PORT` value in `.env`.
 
 **Fast path:** [download the latest APK](https://github.com/Pasta-Devs/Marinara-Engine/releases/latest/download/marinara-engine-android.apk), open it, tap **Install / Start Marinara**, approve Android/Termux prompts, wait for the Termux launcher to finish, then return to the Marinara Engine app. No signing key, password, local-access secret, or `CSRF_TRUSTED_ORIGINS` change is required from the user. In particular, never add `null`; the APK's self-authenticating handshake handles Android's opaque WebView origin without trusting it for the rest of the API.
 
 **Manual fallback:** install Termux from F-Droid, paste the fresh-Termux command below so it creates/updates the Marinara folder, then open the Marinara Engine Android app. When prompted, confirm **Open manual server**. Clipboard fallback commands never contain the APK's private local-access secret.
+
+## Multiplayer guest support
+
+The current native wrapper cannot join multiplayer rooms. Its JavaScript bridge is injected into every WebView frame, so an iframe sandbox alone cannot provide the required bridge-free guest boundary. Join and the guest document are disabled in the wrapper. Never install a host-provided APK, extension, or required file to work around this. Browser mobile support and physical-device verification are tracked separately in [the multiplayer implementation record](../docs/development/multiplayer.md).
 
 ## Features
 
@@ -43,7 +48,7 @@ The Android app is a Termux bootstrap + WebView shell for Marinara Engine. It is
 
 - **Java 17+** — `brew install openjdk@17` (macOS) or `pkg install openjdk-17` (Termux)
 - **Android SDK** — Set the `ANDROID_HOME` environment variable
-- **Gradle 9.6+** — required by Android Gradle Plugin 9.4; CI uses the pinned Gradle 9.7.1 distribution. Install with `brew install gradle` (macOS) or `pkg install gradle` (Termux).
+- **Gradle 9.6+** — required by Android Gradle Plugin 9.4; CI uses the pinned Gradle 9.8.0 distribution. Install with `brew install gradle` (macOS) or `pkg install gradle` (Termux).
 
 ### Build
 

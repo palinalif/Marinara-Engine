@@ -8,6 +8,7 @@ import {
   normalizeChatSummaryPromptSettings,
 } from "@marinara-engine/shared";
 import { tryParseJsonRecord } from "../../lib/json-repair.js";
+import { parseRoleplayUserCommands } from "./roleplay-commands.js";
 
 const RETIRED_CHAT_SUMMARY_AGENT_ID = "chat-summary";
 const DEFAULT_AUTOMATIC_SUMMARY_INTERVAL = 5;
@@ -20,8 +21,19 @@ export const CONTINUE_ASSISTANT_MESSAGE_PROMPT = "Your last message got cut off!
 export const CONTINUE_ASSISTANT_MESSAGE_DIRECT_PROMPT =
   "Your last message got cut off. Continue it exactly from where it stopped. Your output will be appended directly to the final character of that message with no newline or separator. Do not restart, repeat, or add leading whitespace.";
 
-export function formatRoleplaySummaryChatLog(messages: readonly { role: string; content: string }[]): string {
-  return messages.map((message) => `[${message.role}]: ${message.content}`).join("\n\n");
+export function formatRoleplaySummaryChatLog(
+  messages: readonly { role: string; content: string }[],
+  mode = "roleplay",
+): string {
+  return messages
+    .map((message) => {
+      const content =
+        mode === "roleplay" && message.role === "user"
+          ? parseRoleplayUserCommands(message.content).content
+          : message.content;
+      return `[${message.role}]: ${content}`;
+    })
+    .join("\n\n");
 }
 
 export function clampRoleplaySummaryInterval(value: unknown): number {
@@ -42,21 +54,7 @@ export function clampRoleplaySummaryMaxTokens(value: unknown): number {
   return Math.max(CHAT_SUMMARY_OUTPUT_TOKENS.MIN, Math.min(CHAT_SUMMARY_OUTPUT_TOKENS.MAX, Math.trunc(parsed)));
 }
 
-export function appendContinuationMessageContent(
-  existingContent: unknown,
-  continuation: string,
-  addNewline = true,
-): string {
-  const existing = typeof existingContent === "string" ? existingContent : "";
-  if (!existing) return continuation;
-  if (!continuation) return existing;
-  if (!addNewline) {
-    return `${existing}${continuation.replace(/^(?:\r?\n)+/, "")}`;
-  }
-  const normalizedExisting = existing.replace(/\s+$/, "");
-  const normalizedContinuation = continuation.replace(/^\s+/, "");
-  return `${normalizedExisting}\n\n${normalizedContinuation}`;
-}
+export { appendContinuationMessageContent } from "@marinara-engine/shared";
 
 export function isAutomaticRoleplaySummaryEnabled(chatMetadata: Record<string, unknown>): boolean {
   if (chatMetadata.automaticSummaryEnabled === false) return false;

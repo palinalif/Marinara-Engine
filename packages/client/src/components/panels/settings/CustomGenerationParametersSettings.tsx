@@ -288,7 +288,7 @@ export function CustomGenerationParametersSettings() {
             setDraft(EMPTY_DRAFT);
             setFormOpen(true);
           }}
-          className="mari-chrome-control mari-chrome-control--compact mari-chrome-control--selected w-full justify-center px-3"
+          className="mari-chrome-control mari-chrome-control--primary w-full text-xs"
         >
           <Plus size="0.75rem" />
           {t("settings.customGenerationParameters.add")}

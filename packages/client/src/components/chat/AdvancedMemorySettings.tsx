@@ -12,10 +12,12 @@ import {
 import { SettingsSwitch } from "../panels/settings/SettingControls";
 import { DraftNumberInput } from "../ui/DraftNumberInput";
 import { AdvancedMemoryProgress } from "./AdvancedMemoryProgress";
+import { useConnections } from "../../hooks/use-connections";
 
 const fieldClass = "mari-chrome-field w-full rounded-lg px-3 py-2 text-xs disabled:opacity-50";
 const actionClass = "mari-chrome-control min-h-9 rounded-lg px-3 py-2 text-xs font-medium disabled:opacity-50";
 const warningKeys: Record<string, string> = {
+  "decision-connection-unavailable": "chat.advancedMemory.warning.decisionConnectionUnavailable",
   "unscoped-agent-memory": "chat.advancedMemory.warning.unscopedAgentMemory",
   "unscoped-summaries": "chat.advancedMemory.warning.unscopedSummaries",
 };
@@ -45,6 +47,10 @@ export function AdvancedMemorySettings({
   const { t } = useTranslation();
   const status = useAdvancedMemoryStatus(chatId);
   const action = useAdvancedMemoryAction(chatId);
+  const savedConnections = useConnections();
+  const decisionConnections = (
+    (savedConnections.data ?? []) as Array<{ id: string; name: string; provider: string; model?: string }>
+  ).filter((connection) => connection.provider === "decision");
   const settings = status.data?.settings ?? normalizeAdvancedMemorySettings(metadataSettings);
   const [confirmKnowledge, setConfirmKnowledge] = useState(false);
   const [knowledgeCharacterIds, setKnowledgeCharacterIds] = useState<string[]>([]);
@@ -156,7 +162,12 @@ export function AdvancedMemorySettings({
               ))}
             </ul>
           ) : null}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {/* Chat Settings follows its window's width; the setup wizard follows the screen. */}
+          <div
+            className={
+              variant === "drawer" ? "grid grid-cols-1 gap-3 @lg:grid-cols-2" : "grid grid-cols-1 gap-3 sm:grid-cols-2"
+            }
+          >
             <label className="space-y-1 text-xs">
               <span>{t("chat.advancedMemory.contextCap")}</span>
               <DraftNumberInput
@@ -175,7 +186,7 @@ export function AdvancedMemorySettings({
               />
             </label>
             <label className="space-y-1 text-xs">
-              <span>{t("chat.advancedMemory.summaryBudget")}</span>
+              <span>{t("chat.advancedMemory.memoryBudget")}</span>
               <DraftNumberInput
                 value={settings.summaryBudgetTokens}
                 min={64}
@@ -186,12 +197,63 @@ export function AdvancedMemorySettings({
                     summaryBudgetTokens: Math.min(summaryBudgetTokens, current.maxContextTokens - 1),
                   }))
                 }
-                ariaLabel={t("chat.advancedMemory.summaryBudget")}
+                ariaLabel={t("chat.advancedMemory.memoryBudget")}
                 className={fieldClass}
               />
             </label>
           </div>
           <p className="text-[0.6875rem] text-[var(--muted-foreground)]">{t("chat.advancedMemory.budgetHelp")}</p>
+          <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
+            {t("chat.advancedMemory.memoryAllocationHelp")}
+          </p>
+          <SettingsSwitch
+            label={t("chat.advancedMemory.decisionEnabled")}
+            description={t("chat.advancedMemory.decisionDescription")}
+            checked={settings.decisionEnabled}
+            disabled={disabled}
+            onChange={(decisionEnabled) => save({ decisionEnabled })}
+            labelPosition="start"
+            className="justify-between rounded-md bg-[var(--secondary)] px-3 py-2.5 text-left"
+            labelClassName="text-xs font-medium"
+          />
+          {settings.decisionEnabled && (
+            <div className="space-y-2">
+              <label className="block space-y-1 text-xs">
+                <span>{t("chat.advancedMemory.decisionConnection")}</span>
+                <select
+                  value={settings.decisionConnectionId ?? ""}
+                  disabled={disabled || savedConnections.isLoading || savedConnections.isError}
+                  className={fieldClass}
+                  onChange={(event) => save({ decisionConnectionId: event.target.value || null })}
+                >
+                  <option value="">{t("chat.advancedMemory.chooseDecisionConnection")}</option>
+                  {settings.decisionConnectionId &&
+                    !decisionConnections.some((connection) => connection.id === settings.decisionConnectionId) && (
+                      <option value={settings.decisionConnectionId}>
+                        {t("chat.advancedMemory.missingConnection")}
+                      </option>
+                    )}
+                  {decisionConnections.map((connection) => (
+                    <option key={connection.id} value={connection.id}>
+                      {connection.name}
+                      {connection.model ? <> · {connection.model}</> : null}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {savedConnections.isError && (
+                <p role="alert" className="text-xs text-[var(--destructive)]">
+                  {t("chat.advancedMemory.failed", { message: savedConnections.error.message })}{" "}
+                  <button type="button" className="underline" onClick={() => void savedConnections.refetch()}>
+                    {t("chat.advancedMemory.retry")}
+                  </button>
+                </p>
+              )}
+              <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
+                {t("chat.advancedMemory.decisionHelp")}
+              </p>
+            </div>
+          )}
           <label className="block space-y-1 text-xs">
             <span>{t("chat.advancedMemory.helperModel")}</span>
             <select
@@ -213,7 +275,7 @@ export function AdvancedMemorySettings({
             </select>
           </label>
           <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
-            {t("chat.advancedMemory.summaryHelp")}
+            {t("chat.advancedMemory.summaryGenerationHelp")}
           </p>
           <p className="text-[0.6875rem] text-[var(--muted-foreground)]">
             {t("chat.advancedMemory.resolvedModels", {
@@ -238,6 +300,21 @@ export function AdvancedMemorySettings({
           </label>
           <h4 className="text-xs font-medium">{t("chat.advancedMemory.movingContext")}</h4>
           <p className="text-[0.6875rem] text-[var(--muted-foreground)]">{t("chat.advancedMemory.windowHelp")}</p>
+          <label className="block space-y-1 text-xs">
+            <span>{t("chat.advancedMemory.maximumScenes")}</span>
+            <DraftNumberInput
+              value={settings.retrieveMaxScenes}
+              min={0}
+              max={50}
+              disabled={numberInputsDisabled}
+              onCommit={(retrieveMaxScenes) => save({ retrieveMaxScenes })}
+              ariaLabel={t("chat.advancedMemory.maximumScenes")}
+              className={fieldClass}
+            />
+            <span className="block text-[0.6875rem] leading-relaxed text-[var(--muted-foreground)]">
+              {t("chat.advancedMemory.maximumScenesHelp")}
+            </span>
+          </label>
           <div className="grid grid-cols-2 gap-3">
             <label className="space-y-1 text-xs">
               <span>{t("chat.advancedMemory.minimumMessages")}</span>

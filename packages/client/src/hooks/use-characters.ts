@@ -1405,3 +1405,36 @@ export function useDeletePersonaGroup() {
     onSuccess: () => qc.invalidateQueries({ queryKey: characterKeys.personaGroups }),
   });
 }
+
+// ── Library maintenance: bulk tags ──
+
+export function useBulkEditCharacterTags() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      ids: string[];
+      add?: string[];
+      remove?: string[];
+      rename?: Array<{ from: string; to: string }>;
+    }) => {
+      const merged = { updatedIds: [] as string[], unchangedIds: [] as string[], failedIds: [] as string[] };
+      for (let start = 0; start < input.ids.length; start += 5000) {
+        const ids = input.ids.slice(start, start + 5000);
+        try {
+          const result = await api.post<typeof merged>("/characters/bulk-tags", { ...input, ids });
+          merged.updatedIds.push(...result.updatedIds);
+          merged.unchangedIds.push(...result.unchangedIds);
+          merged.failedIds.push(...result.failedIds);
+        } catch {
+          merged.failedIds.push(...ids);
+        }
+      }
+      return merged;
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: characterKeys.list() });
+      qc.invalidateQueries({ queryKey: characterKeys.summariesRoot() });
+      qc.invalidateQueries({ queryKey: [...characterKeys.all, "detail"] });
+    },
+  });
+}

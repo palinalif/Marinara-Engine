@@ -1,8 +1,11 @@
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import type { AdvancedMemorySettings, AdvancedMemoryStatus, Message } from "@marinara-engine/shared";
+import type { AdvancedMemoryJob, AdvancedMemorySettings, AdvancedMemoryStatus, Message } from "@marinara-engine/shared";
 import { api } from "../lib/api-client";
+import { translate } from "../localization/i18n";
+import { useChatStore } from "../stores/chat.store";
 import { chatKeys } from "./use-chats";
 
 export const advancedMemoryKeys = {
@@ -11,34 +14,68 @@ export const advancedMemoryKeys = {
 };
 
 export const ADVANCED_MEMORY_SETTINGS_EVENT = "marinara:advanced-memory-settings";
+const notifiedFailures = new Map<string, string>();
+
+export function notifyAdvancedMemoryFailure(chatId: string, job: Pick<AdvancedMemoryJob, "id" | "status" | "error">) {
+  if (job.status !== "error") {
+    notifiedFailures.delete(chatId);
+    toast.dismiss(`advanced-memory-error-${chatId}`);
+    return;
+  }
+  if (!job.error) return;
+  const failure = JSON.stringify([job.id, job.error]);
+  if (notifiedFailures.get(chatId) === failure) return;
+  notifiedFailures.set(chatId, failure);
+  if (notifiedFailures.size > 100) notifiedFailures.delete(notifiedFailures.keys().next().value!);
+  toast.error(translate("chat.advancedMemory.failureNotice"), {
+    id: `advanced-memory-error-${chatId}`,
+    duration: 15_000,
+    action: {
+      label: translate("chat.advancedMemory.reviewFailure"),
+      onClick: () => {
+        useChatStore.getState().setActiveChatId(chatId);
+        window.dispatchEvent(new CustomEvent(ADVANCED_MEMORY_SETTINGS_EVENT, { detail: { chatId } }));
+      },
+    },
+  });
+}
 
 export function useAdvancedMemoryStatus(chatId: string, enabled = true) {
-  return useQuery({
+  const qc = useQueryClient();
+  const query = useQuery({
     queryKey: advancedMemoryKeys.status(chatId),
     queryFn: ({ signal }) => api.get<AdvancedMemoryStatus>(`/chats/${chatId}/advanced-memory`, { signal }),
     enabled: !!chatId && enabled,
     staleTime: 1_000,
-    refetchInterval: (query) =>
-      !enabled
-        ? false
-        : query.state.data?.job.status === "running"
-          ? 1_000
-          : query.state.data?.settings.enabled
-            ? 5_000
-            : false,
+    refetchInterval: (query) => (enabled && query.state.data?.job.status === "running" ? 1_000 : false),
   });
+  const jobId = query.data?.job.id;
+  const jobStatus = query.data?.job.status;
+  const jobError = query.data?.job.error;
+  useEffect(() => {
+    if (enabled && jobStatus)
+      notifyAdvancedMemoryFailure(chatId, { id: jobId, status: jobStatus, error: jobError ?? null });
+  }, [chatId, enabled, jobId, jobStatus, jobError]);
+  useEffect(() => {
+    if (jobId && jobStatus === "ready") void qc.invalidateQueries({ queryKey: chatKeys.detail(chatId) });
+  }, [chatId, jobId, jobStatus, qc]);
+  return query;
 }
 
 type AdvancedMemoryAction =
   | {
       action: "settings";
       settings:
-        | Partial<AdvancedMemorySettings>
-        | ((current: AdvancedMemorySettings) => Partial<AdvancedMemorySettings>);
+        Partial<AdvancedMemorySettings> | ((current: AdvancedMemorySettings) => Partial<AdvancedMemorySettings>);
     }
-  | { action: "initialize"; settings?: Partial<AdvancedMemorySettings>; debugMode?: boolean }
+  | { action: "initialize"; settings?: Partial<AdvancedMemorySettings>; debugMode?: boolean; sceneId?: string }
   | { action: "cancel" | "reindex" | "reset" }
-  | { action: "record"; recordId: string; patch: { content?: string; enabled?: boolean } }
+  | {
+      action: "record";
+      recordId: string;
+      patch: { content?: string; timeline?: string; enabled?: boolean; audienceCharacterIds?: string[] };
+    }
+  | { action: "delete-record"; recordId: string }
   | { action: "import"; envelope: unknown };
 
 export function useAdvancedMemoryAction(chatId: string) {
@@ -64,10 +101,13 @@ export function useAdvancedMemoryAction(chatId: string) {
         }
         case "record":
           return api.patch<AdvancedMemoryStatus>(`${base}/records/${request.recordId}`, request.patch);
+        case "delete-record":
+          return api.delete<AdvancedMemoryStatus>(`${base}/records/${request.recordId}`);
         case "initialize":
           return api.post<AdvancedMemoryStatus>(`${base}/initialize`, {
             settings: request.settings,
             debugMode: request.debugMode,
+            sceneId: request.sceneId,
           });
         case "import":
           return api.post<AdvancedMemoryStatus>(`${base}/import`, request.envelope);
@@ -77,10 +117,12 @@ export function useAdvancedMemoryAction(chatId: string) {
           return api.post<AdvancedMemoryStatus>(`${base}/${request.action}`, {});
       }
     },
-    onSuccess: async (status) => {
+    onSuccess: async (status, request) => {
       // An older status fetch must not replace this save before the next queued edit reads it.
       await qc.cancelQueries({ queryKey: advancedMemoryKeys.status(chatId), exact: true });
       qc.setQueryData(advancedMemoryKeys.status(chatId), status);
+      // Record edits change neither chat metadata nor their source messages.
+      if (request.action === "record" || request.action === "delete-record") return;
       void qc.invalidateQueries({ queryKey: chatKeys.detail(chatId) });
       void qc.invalidateQueries({ queryKey: ["advanced-memory-sources", chatId] });
     },

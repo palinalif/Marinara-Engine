@@ -32,6 +32,7 @@ import {
   Camera,
 } from "lucide-react";
 import { useUIStore, type LorebookPanelCategory, type LorebookPanelSort } from "../../stores/ui.store";
+import { sortPanelFolders } from "../../lib/panel-sort";
 import { useChatStore } from "../../stores/chat.store";
 import {
   fetchAllLorebookPages,
@@ -62,6 +63,7 @@ import { useTouchFolderDrag } from "../../hooks/use-touch-folder-drag";
 import { SelectionActionBar } from "../ui/SelectionActionBar";
 import { SmoothFolderContent } from "../ui/SmoothFolderContent";
 import { TouchDragHandle } from "../ui/TouchDragHandle";
+import { LorebookSelectionEnableActions } from "./library/LorebookSelectionEnableActions";
 import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
 import { useTranslation as useUiTranslation } from "react-i18next";
 import { PanelLoadMoreBar } from "./PanelLoadMoreBar";
@@ -321,7 +323,16 @@ export function LorebooksPanel() {
     }
   }, [filtered, sort]);
 
-  const lorebookById = useMemo(() => new Map(sorted.map((lorebook) => [lorebook.id, lorebook])), [sorted]);
+  const sortedFolders = useMemo(() => {
+    const folders = sortPanelFolders(lorebookFolders, sort === "tokens" ? "name-asc" : sort);
+    if (sort !== "tokens") return folders;
+    const tokens = new Map(sorted.map((lorebook) => [lorebook.id, lorebook.tokenBudget ?? 0]));
+    const totals = new Map(
+      folders.map((folder) => [folder.id, folder.itemIds.reduce((total, id) => total + (tokens.get(id) ?? 0), 0)]),
+    );
+    return folders.sort((a, b) => totals.get(b.id)! - totals.get(a.id)!);
+  }, [lorebookFolders, sort, sorted]);
+
   const folderFilterActive = searchQuery.trim().length > 0 || activeCategory !== "all" || activeTag !== null;
 
   const folderedLorebookIds = useMemo(() => {
@@ -970,11 +981,10 @@ export function LorebooksPanel() {
       )}
 
       <div className="flex flex-col gap-0.5">
-        {lorebookFolders.map((folder) => {
+        {sortedFolders.map((folder) => {
           const isEditing = editingFolderId === folder.id;
-          const folderItems = folder.itemIds
-            .map((id) => lorebookById.get(id))
-            .filter((item): item is LorebookListItem => Boolean(item));
+          const memberIds = new Set(folder.itemIds);
+          const folderItems = sorted.filter((item) => memberIds.has(item.id));
           if (folderFilterActive && folderItems.length === 0) return null;
           const isExpanded = (folderFilterActive && folderItems.length > 0) || expandedFolderId === folder.id;
           return (
@@ -1043,6 +1053,7 @@ export function LorebooksPanel() {
                       onKeyDown={(event) => {
                         if (event.key === "Enter") event.currentTarget.blur();
                         if (event.key === "Escape") {
+                          event.preventDefault();
                           setEditingFolderId(null);
                           setEditFolderName("");
                         }
@@ -1196,6 +1207,7 @@ export function LorebooksPanel() {
         <SelectionActionBar
           placement="panel"
           selectedCount={selectedLorebookIds.size}
+          extraAction={<LorebookSelectionEnableActions selectedIds={selectedLorebookIds} />}
           onExport={() => void handleExportSelected()}
           onDelete={handleDeleteSelected}
           exporting={exportingSelected}
@@ -1324,8 +1336,8 @@ function LorebookRow({
         </button>
       )}
       <div className={cn("min-w-0 flex-1", !selectionMode && "pr-0 max-md:pr-24 [@media(pointer:coarse)]:pr-24")}>
-        <div className="flex items-center gap-1.5">
-          <span className="truncate text-sm font-medium">{lorebook.name}</span>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="min-w-0 truncate text-sm font-medium">{lorebook.name}</span>
           {!lorebook.enabled && (
             <span className="rounded bg-[var(--muted)]/50 px-1 py-0.5 text-[0.5625rem] text-[var(--muted-foreground)]">
               {localizeUi("ui.panels.lorebookrow.off")}

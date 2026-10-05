@@ -1,11 +1,13 @@
 // ──────────────────────────────────────────────
 // Fastify App Factory
 // ──────────────────────────────────────────────
-import Fastify, { LogController } from "fastify";
+import Fastify, { type FastifyBaseLogger } from "fastify";
+import { holdInjectUntilRegistered } from "./lib/fastify-inject-gate.js";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import { getDB, closeDB, type DB } from "./db/connection.js";
+import { getRuntimeStopBudgetMs, runShutdownStepsWithin } from "./lib/shutdown-steps.js";
 import { registerRoutes } from "./routes/index.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { ipAllowlistHook } from "./middleware/ip-allowlist.js";
@@ -26,20 +28,21 @@ import { migrateTtsSettingsToAudioConnection } from "./services/connections/tts-
 import { migrateLegacyDefaultAgentPrompts } from "./services/agents/default-prompt-migration.js";
 import { APP_VERSION, resetTurnGameRegistry } from "@marinara-engine/shared";
 import { existsSync } from "fs";
-import { readFile } from "fs/promises";
 import { join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { getBuildCommit, getBuildLabel } from "./config/build-info.js";
 import {
-  getLogLevel,
   getNodeEnv,
   isRequestLoggingDisabled,
   isAutoCreateDefaultConnectionDisabled,
   getFileStorageDir,
 } from "./config/runtime-config.js";
 import { corsDelegate } from "./config/cors-config.js";
+import { decisionProcessService } from "./services/sidecar/decision-process.service.js";
 import { sidecarProcessService } from "./services/sidecar/sidecar-process.service.js";
+import { utilitySidecarService } from "./services/utility-sidecar/utility-sidecar.service.js";
 import { startServerAutonomousScheduler } from "./services/conversation/server-autonomous-scheduler.service.js";
+import { createMultiplayerAutonomyAdapter, type MultiplayerAutonomyService } from "./services/multiplayer/autonomy.js";
 import { preparePersonalExtensionTrust } from "./services/setup/personal-extension-trust.js";
 import { personalServerExtensionRuntime } from "./services/extensions/personal-server-extension-runtime.js";
 import { runWithGenerationFallbackNotifier } from "./services/generation/fallback-notification.js";
@@ -48,15 +51,22 @@ import { initializeCapabilityAgentRegistry } from "./services/capability-package
 import { capabilityPackageManager } from "./services/capability-packages/package-manager.service.js";
 import { capabilityModuleRuntime } from "./services/capability-packages/capability-module-runtime.service.js";
 import { migrateLegacyCapabilities } from "./services/capability-packages/legacy-capability-migration.js";
-import { createClientStaticOptions } from "./config/client-static-config.js";
+import { createClientNotFoundHandler, createClientStaticOptions } from "./config/client-static-config.js";
 import { hostValidationHook } from "./middleware/host-validation.js";
 import { androidLocalAuthHook, androidLocalLoginRoute } from "./middleware/android-local-auth.js";
 import { arch, platform, release } from "node:os";
 import { execFileSync } from "node:child_process";
 import { getRuntimeMemorySnapshot } from "./utils/runtime-memory.js";
 import { getLastFreeze } from "./lib/freeze-detector.js";
+import { buildSidecarHealthSection } from "./services/sidecar/sidecar-slot-report.js";
 import { getPreviousSessionStatus, getUncleanExitHistory } from "./lib/session-postmortem.js";
-import { protectTerminalLogger } from "./lib/logger.js";
+import { followLogLevel, logger, protectTerminalLogger } from "./lib/logger.js";
+import { flushLorebookActivationStats } from "./services/lorebook/activation-stats.js";
+import { logRateLimited } from "./lib/log-rate-limit.js";
+import { genRequestId, registerRequestLogging, RequestLogController } from "./lib/request-logging.js";
+import { startup } from "./lib/startup-timeline.js";
+import { openCodeSessionHook } from "./utils/opencode-session.js";
+import { startMessageTrashMaintenance, sweepExpiredMessageTrash } from "./services/storage/message-trash.storage.js";
 
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
@@ -89,18 +99,27 @@ const SERVER_OS = resolveServerOs();
 
 export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   const hadUserStateBeforeStartup = existsSync(join(getFileStorageDir(), "manifest.json"));
+  const logController = new RequestLogController({ disableRequestLogging: isRequestLoggingDisabled() });
   const app = Fastify({
     // Restart has its own bounded fallback; normal shutdown must not interrupt active generations.
     forceCloseConnections: false,
-    logger: {
-      level: getLogLevel(),
-      transport: getNodeEnv() !== "production" ? { target: "pino-pretty", options: { colorize: true } } : undefined,
-    },
-    logController: new LogController({ disableRequestLogging: isRequestLoggingDisabled() }),
+    // Request lines go through the shared logger (lib/logger.ts), so they carry the
+    // same bootId, serializers and context fields as every other server line.
+    loggerInstance: logger as FastifyBaseLogger,
+    logController,
+    genReqId: genRequestId,
     bodyLimit: MAX_UPLOAD_BYTES, // General-route default; transfer routes opt into streamed or unbounded imports.
     ...(https && { https }),
   });
+  // app.log shares the shared logger's stream, which logger.ts already protects; this
+  // is a no-op then and only matters if Fastify is ever given its own stream again.
   protectTerminalLogger(app.log, getNodeEnv() !== "production");
+  // Hold internal inject() calls until every route, hook and package is registered (see fastify-inject-gate.ts).
+  const releaseInjectGate = holdInjectUntilRegistered(app);
+  const stopFollowingLogLevel = followLogLevel(app.log);
+  app.addHook("onClose", async () => stopFollowingLogLevel());
+  // requestId on every line of a request, echoed as x-request-id.
+  registerRequestLogging(app, logController);
 
   // Reject attacker-controlled DNS names before CORS or loopback trust can
   // treat a rebound browser request as same-origin local traffic.
@@ -122,19 +141,48 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   });
 
   // ── Storage ──
-  const db = await getDB();
+  const db = await startup.phase("storage.open", () => getDB());
   app.decorate("db", db);
+  let stopMessageTrashMaintenance: (() => Promise<void>) | undefined;
   app.addHook("onClose", async () => {
+    await stopMessageTrashMaintenance?.();
     try {
-      const stopResults = await Promise.allSettled([
-        capabilityModuleRuntime.stop(),
-        personalServerExtensionRuntime.stop(),
-        sidecarProcessService.stop(),
+      // Same concurrent stops as before, now named and bounded: a runtime
+      // whose stop() hangs must not keep closeDB() from flushing before the
+      // shutdown force-exit deadline.
+      const { failed, timedOut, records } = await runShutdownStepsWithin([
+        { name: "capabilityModuleRuntime", run: () => capabilityModuleRuntime.stop() },
+        { name: "personalExtensions", run: () => personalServerExtensionRuntime.stop() },
+        { name: "sidecar", run: () => sidecarProcessService.stop() },
+        // Separate processes with their own stops: shutting down the main sidecar does
+        // not end them, and a Python model loader left behind keeps its GPU memory.
+        { name: "decisionSidecar", run: () => decisionProcessService.stop() },
+        { name: "utilitySidecar", run: () => utilitySidecarService.stop() },
+        { name: "lorebookActivationStats", run: () => flushLorebookActivationStats() },
       ]);
-      for (const result of stopResults) {
-        if (result.status === "rejected") {
-          app.log.error(result.reason, "Failed to stop a server runtime service during shutdown");
+      for (const { name, reason, elapsedMs } of failed) {
+        app.log.error(
+          { err: reason, stage: name, elapsedMs },
+          "Failed to stop server runtime service %s during shutdown",
+          name,
+        );
+      }
+      for (const record of records) {
+        if (record.outcome === "ok" && record.elapsedMs > 1_000) {
+          app.log.warn(
+            { stage: record.stage, elapsedMs: record.elapsedMs },
+            "[shutdown] %s took %d ms to stop",
+            record.stage,
+            record.elapsedMs,
+          );
         }
+      }
+      if (timedOut.length > 0) {
+        app.log.warn(
+          { stages: timedOut, timeoutMs: getRuntimeStopBudgetMs() },
+          "[shutdown] %s did not stop within the shutdown budget; closing storage anyway",
+          timedOut.join(", "),
+        );
       }
     } finally {
       await closeDB();
@@ -164,34 +212,36 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   resetTurnGameRegistry();
 
   // ── Seed defaults ──
-  await seedDefaultPreset(db);
-  await seedProfessorMari(db);
+  await startup.phase("seed.preset", () => seedDefaultPreset(db));
+  await startup.phase("seed.mari", () => seedProfessorMari(db));
   if (isAutoCreateDefaultConnectionDisabled()) {
     app.log.info("Skipping default OpenRouter Free connection seed because AUTO_CREATE_DEFAULT_CONNECTION is disabled");
   } else {
-    await seedDefaultConnection(db);
+    await startup.phase("seed.connection", () => seedDefaultConnection(db));
   }
-  await seedDefaultRegexScripts(db);
-  await migrateLegacyDefaultAgentPrompts(db);
-  await migrateCharacterExtendedDescriptionsToLorebooks(db);
+  await startup.phase("seed.regex", () => seedDefaultRegexScripts(db));
+  await startup.phase("migrate.agent-prompts", () => migrateLegacyDefaultAgentPrompts(db));
+  await startup.phase("migrate.extended-descriptions", () => migrateCharacterExtendedDescriptionsToLorebooks(db));
   try {
-    await migrateTtsSettingsToAudioConnection(db);
+    await startup.phase("migrate.tts-audio", () => migrateTtsSettingsToAudioConnection(db));
   } catch (error) {
     app.log.warn(error, "TTS audio-connection migration did not complete; it will retry next startup");
   }
-  await seedDefaultBackgrounds();
-  await seedDefaultGameAssets();
+  await startup.phase("seed.backgrounds", () => seedDefaultBackgrounds());
+  await startup.phase("seed.game-assets", () => seedDefaultGameAssets());
 
   // ── Ensure default asset directories exist, then build manifest ──
-  ensureAssetDirs();
-  buildAssetManifest();
+  await startup.phase("assets.manifest", () => {
+    ensureAssetDirs();
+    buildAssetManifest();
+  });
 
   // ── Recover orphaned gallery images (files on disk without DB records) ──
-  await recoverGalleryImages(db);
+  await startup.phase("gallery.recover", () => recoverGalleryImages(db));
 
   // Legacy extension payloads and any out-of-band code changes are retained as
   // disabled drafts. Execution always requires approval of the exact hash.
-  const personalExtensionTrust = await preparePersonalExtensionTrust(db);
+  const personalExtensionTrust = await startup.phase("extensions.trust", () => preparePersonalExtensionTrust(db));
   if (personalExtensionTrust.legacyRecordsQuarantined > 0) {
     app.log.info(
       "Quarantined %d legacy extension record(s) as Personal Extension drafts",
@@ -204,6 +254,9 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
       personalExtensionTrust.changedRecordsDisabled,
     );
   }
+
+  // Share the originating chat session with nested provider calls and retries.
+  app.addHook("preHandler", openCodeSessionHook);
 
   // Keep fallback reporting attached to the originating request even when
   // generation passes through nested services. Streamed routes emit an SSE
@@ -251,11 +304,13 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   await app.register(fastifyStatic, { serve: false });
 
   // ── Routes ──
-  await registerRoutes(app);
-  await androidLocalLoginRoute(app);
+  await startup.phase("routes.register", async () => {
+    await registerRoutes(app);
+    await androidLocalLoginRoute(app);
+  });
 
   // Trusted downloaded server capabilities register while Fastify is still mutable.
-  await capabilityModuleRuntime.start(app);
+  await startup.phase("capabilities.start", () => capabilityModuleRuntime.start(app));
   // A package can install its own art during activate(), which runs AFTER the boot-time scan above, so
   // without this its assets stay invisible to everything reading the manifest until the NEXT restart.
   // Idempotent — the same scan the upload routes already re-run. Guarded because it walks files a package
@@ -265,14 +320,28 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   } catch (error) {
     app.log.warn({ err: error }, "[capability] post-activation asset rescan failed; manifest may be stale");
   }
-  await personalServerExtensionRuntime.start(db);
+  await startup.phase("extensions.start", () => personalServerExtensionRuntime.start(db));
   // Server-backed agent definitions are visible only after their runtime reaches
   // functional readiness. Packages without a server entrypoint remain available
   // as soon as their verified files are installed.
-  await initializeCapabilityAgentRegistry();
+  await startup.phase("capabilities.agents", () => initializeCapabilityAgentRegistry());
 
   // ── Server-side autonomous conversation scheduler ──
-  startServerAutonomousScheduler(app);
+  startServerAutonomousScheduler(
+    app,
+    createMultiplayerAutonomyAdapter(
+      () => (app as unknown as { multiplayer?: MultiplayerAutonomyService }).multiplayer,
+    ),
+  );
+
+  // Expired trash in chats that are never reopened still needs to be removed.
+  // Cold trash shards load only when expired; wait for active cleanup before closing the DB.
+  const messageTrashMaintenance = startMessageTrashMaintenance(() => sweepExpiredMessageTrash(db), {
+    info: (purged) => app.log.info("Purged %d expired message trash entries", purged),
+    warn: (error) =>
+      app.log.warn({ err: error }, "Expired message trash cleanup failed; it will retry on the next sweep"),
+  });
+  stopMessageTrashMaintenance = messageTrashMaintenance.stop;
 
   // ── Sidecar bootstrap (background, skipped in lite mode) ──
   if (!isLite) {
@@ -290,17 +359,8 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   if (existsSync(clientIndex)) {
     await app.register(fastifyStatic, createClientStaticOptions(clientDist));
 
-    // SPA fallback — serve index.html for non-API routes
-    app.setNotFoundHandler(async (req, reply) => {
-      if (req.raw.url?.startsWith("/api/")) {
-        return reply.status(404).send({ error: "Not Found" });
-      }
-
-      reply.header("Cache-Control", "no-cache, must-revalidate");
-      reply.header("Pragma", "no-cache");
-      reply.header("Expires", "0");
-      return reply.type("text/html; charset=utf-8").send(await readFile(clientIndex));
-    });
+    // Only navigation falls back to HTML; missing modules must remain a 404.
+    app.setNotFoundHandler(createClientNotFoundHandler(clientIndex));
   } else {
     app.log.warn(
       "Client build entry not found at %s; serving API only. Run `pnpm build` to build the frontend.",
@@ -315,7 +375,16 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
     try {
       capabilityPackages = await capabilityPackageManager.diagnostics();
     } catch (error) {
-      app.log.warn(error, "Capability package diagnostics are unavailable");
+      // The client polls health; one line a minute is enough for a lasting failure.
+      logRateLimited("warn", "health.capability-packages", error, "Capability package diagnostics are unavailable");
+    }
+    // A slot service that throws must not take the health endpoint down with it: this
+    // response is also the freeze detector's signal and an uptime check's target.
+    let sidecars: ReturnType<typeof buildSidecarHealthSection> | null = null;
+    try {
+      sidecars = buildSidecarHealthSection();
+    } catch (error) {
+      logRateLimited("warn", "health.sidecars", error, "Sidecar health diagnostics are unavailable");
     }
     return {
       status: "ok",
@@ -345,9 +414,16 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
           : "error",
         packages: capabilityPackages ?? [],
       },
+      // What the local model slots cost on the server's own GPU. The report's existing
+      // GPU line is the *browser's* card, which says nothing about the machine running
+      // the sidecars when the client is a phone or another PC. Served from a cached
+      // probe: this endpoint is also the freeze detector's signal and must never wait
+      // on nvidia-smi, so a probe that has not finished yet reports itself as pending.
+      sidecars,
     };
   });
 
+  releaseInjectGate();
   return app;
 }
 

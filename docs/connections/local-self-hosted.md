@@ -85,10 +85,13 @@ The connection editor has a **Connection Tests** card at the bottom. Use it befo
 
 If both tests succeed, your local model is ready to use in a chat. Open a chat, open its settings, and pick this connection.
 
+The same model can also answer decisions, such as agent activation questions, without Marinara loading a second copy. Click **Use this model for decisions** in the connection's settings; see [Decision Models](decision-models.md#on-a-server-you-already-run).
+
 If a test fails, first check that your local server is still running and that the model is loaded. Then check that the **Base URL** matches the server's address and port exactly. For a server on another computer, confirm that `PROVIDER_LOCAL_URLS_ENABLED` is set and that you restarted the Marinara server.
 
 ## Related guides
 
 - [Connecting to an AI Provider](connecting-to-a-provider.md)
 - [Local Model Setup](local-model.md)
+- [Decision Models](decision-models.md)
 - [Server Configuration Reference](../CONFIGURATION.md)

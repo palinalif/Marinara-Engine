@@ -1,3 +1,8 @@
+import {
+  embedCharacterBookImages,
+  embedLorebookImages,
+  LOREBOOK_EXPORT_IMAGE_MAX_BYTES,
+} from "../services/lorebook/lorebook-images.js";
 // ──────────────────────────────────────────────
 // Routes: Backup
 // ──────────────────────────────────────────────
@@ -45,6 +50,7 @@ import {
   MARINARA_UNIVERSAL_PRESET_SYSTEM_KEY,
   normalizePersonalExtensionCapabilities,
   type ExportEnvelope,
+  parseLorebookDecisionActivation,
 } from "@marinara-engine/shared";
 import { getDataDir } from "../utils/data-dir.js";
 import { getFileStorageDir } from "../config/runtime-config.js";
@@ -182,6 +188,11 @@ type AutomaticBackupSettings = {
   lastBackupAt: string | null;
   lastError: string | null;
   lastOmittedEntries: string[];
+};
+
+/** Optional private boundary of the active Long-Term Memory package's runtime service. */
+type LongTermMemoryVaultRuntime = {
+  withVaultMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
 };
 
 export function buildPreparedBackupDownloadUrl(jobId: string, token: string): string {
@@ -492,6 +503,8 @@ function buildCompatibleLorebookExport(lb: Record<string, any>) {
       preventRecursion: entry.preventRecursion === true,
       excludeRecursion: entry.excludeRecursion === true,
       delayUntilRecursion: entry.delayUntilRecursion === true,
+      extensions: { marinaraImages: entry.images ?? [] },
+      ...parseLorebookDecisionActivation(entry),
     };
   });
 
@@ -517,9 +530,13 @@ async function buildCompatibleProfileZip(app: FastifyInstance) {
   });
   const data = envelope.data as Record<string, any>;
   const zip = new AdmZip();
+  const exportBudget = { remainingBytes: LOREBOOK_EXPORT_IMAGE_MAX_BYTES };
 
   for (const [index, character] of (Array.isArray(data.characters) ? data.characters : []).entries()) {
-    const charData = typeof character.data === "string" ? JSON.parse(character.data) : character.data;
+    const charData = await embedCharacterBookImages(
+      typeof character.data === "string" ? JSON.parse(character.data) : character.data,
+      exportBudget,
+    );
     zip.addFile(
       `characters/${toSafeExportName(String(charData?.name ?? "character"), `character-${index + 1}`)}.json`,
       Buffer.from(JSON.stringify({ spec: "chara_card_v2", spec_version: "2.0", data: charData }, null, 2), "utf8"),
@@ -545,7 +562,17 @@ async function buildCompatibleProfileZip(app: FastifyInstance) {
   for (const [index, lorebook] of (Array.isArray(data.lorebooks) ? data.lorebooks : []).entries()) {
     zip.addFile(
       `lorebooks/${toSafeExportName(String(lorebook.name ?? "lorebook"), `lorebook-${index + 1}`)}.json`,
-      Buffer.from(JSON.stringify(buildCompatibleLorebookExport(lorebook), null, 2), "utf8"),
+      Buffer.from(
+        JSON.stringify(
+          buildCompatibleLorebookExport({
+            ...lorebook,
+            entries: await embedLorebookImages(lorebook.entries ?? [], exportBudget),
+          }),
+          null,
+          2,
+        ),
+        "utf8",
+      ),
     );
   }
 
@@ -649,7 +676,7 @@ export function sanitizeProfileTableRows(tableName: string, rows: Array<Record<s
     });
   }
   if (tableName === "api_connections") {
-    return rows.map((row) => ({ ...row, apiKeyEncrypted: "" }));
+    return rows.map((row) => ({ ...row, apiKeyEncrypted: "", managementTokenEncrypted: "" }));
   }
   if (tableName === "agent_configs") {
     return rows.map((row) => redactAgentSecrets(row));
@@ -724,6 +751,8 @@ const PROFILE_CONNECTION_CREDENTIAL_IDENTITY_FIELDS = [
   "videoGenerationSource",
   "videoService",
   "audioSource",
+  "decisionSource",
+  "credentialsFromConnectionId",
 ] as const;
 
 const PROFILE_CONNECTION_AUTOMATIC_SELECTION_FIELDS = [
@@ -757,10 +786,13 @@ export function quarantineProfileApiConnectionRow(
   existing?: Record<string, unknown>,
 ): ProfileApiConnectionImportPlan {
   const existingCredential = typeof existing?.apiKeyEncrypted === "string" ? existing.apiKeyEncrypted : "";
+  const existingManagementToken =
+    typeof existing?.managementTokenEncrypted === "string" ? existing.managementTokenEncrypted : "";
   const trustedIdentity = !!existing && profileConnectionCredentialIdentityMatches(existing, row);
   const secured: Record<string, unknown> = {
     ...row,
     apiKeyEncrypted: trustedIdentity ? existingCredential : "",
+    managementTokenEncrypted: trustedIdentity ? existingManagementToken : "",
     profileImportReviewRequired: trustedIdentity ? "false" : "true",
   };
   if (trustedIdentity) return { row: secured, trustedIdentity };
@@ -1224,6 +1256,11 @@ function buildProfileImportAssetInputs(
   });
 }
 
+/** True when the profile's declared asset inputs touch the active Long-Term Memory vault. */
+function profileImportTouchesLongTermMemory(assets: ReadonlyArray<{ path: string }>): boolean {
+  return assets.some((asset) => asset.path.startsWith("long-term-memory/"));
+}
+
 async function importProfileStorageSnapshot(
   app: FastifyInstance,
   snapshot: ProfileStorageSnapshot,
@@ -1232,12 +1269,25 @@ async function importProfileStorageSnapshot(
   readAsset?: ProfileAssetReader,
 ) {
   validateProfileStorageTableInputs(snapshot);
+  const assetInputs = buildProfileImportAssetInputs(snapshot, readAsset, warnings);
+
+  // An active package must coordinate vault publication through its own lock and cache reset.
+  // An inactive package has nothing to invalidate, so a disk-only restore is safe. Decide this
+  // from the declared inputs before staging, so a refused restore never stages vault bytes and
+  // cannot strand them if staging cleanup later fails.
+  const longTermMemoryRuntime = profileImportTouchesLongTermMemory(assetInputs)
+    ? getCapabilityService<LongTermMemoryVaultRuntime>("long-term-memory:runtime")
+    : null;
+  const longTermMemoryVaultMutation = longTermMemoryRuntime?.withVaultMutation;
+  if (longTermMemoryRuntime && !longTermMemoryVaultMutation) {
+    throw new ProfileImportRequestError(
+      "This profile includes long-term memory, but the active Long-Term Memory package is too old to coordinate a safe restore. Update the package or disable it before importing.",
+    );
+  }
+
   let stagedAssets: StagedProfileImportAssets;
   try {
-    stagedAssets = await stageProfileImportAssets(
-      getDataDir(),
-      buildProfileImportAssetInputs(snapshot, readAsset, warnings),
-    );
+    stagedAssets = await stageProfileImportAssets(getDataDir(), assetInputs);
   } catch (error) {
     if (error instanceof ProfileImportAssetValidationError) {
       throw new ProfileImportRequestError(error.message);
@@ -1262,7 +1312,7 @@ async function importProfileStorageSnapshot(
     });
   };
 
-  return withProfileImportLifecycleLock(async () => {
+  const runProfileImport = async () => {
     let files = 0;
     let committed = false;
     let rollbackFailed = false;
@@ -1361,7 +1411,10 @@ async function importProfileStorageSnapshot(
         }
       }
     }
-  });
+  };
+  return withProfileImportLifecycleLock(() =>
+    longTermMemoryVaultMutation ? longTermMemoryVaultMutation(runProfileImport) : runProfileImport(),
+  );
 }
 
 async function buildProfileExportEnvelope(
@@ -3269,7 +3322,9 @@ function sendBackupRouteError(reply: FastifyReply, err: unknown, operation: stri
   const message = getBackupErrorMessage(err, `${operation} failed. Check the server logs for details.`);
   const logError = err instanceof Error ? err : new Error(message);
   logger.error(logError, "[backup] %s failed", operation);
-  return reply.status(500).send({
+  const statusCode =
+    err && typeof err === "object" && "statusCode" in err && typeof err.statusCode === "number" ? err.statusCode : 500;
+  return reply.status(statusCode).send({
     error: `${operation} failed`,
     message,
   });
@@ -3974,6 +4029,7 @@ export async function backupRoutes(app: FastifyInstance) {
                   maxRecursionDepth: lb.maxRecursionDepth,
                   excludeFromVectorization: lb.excludeFromVectorization ?? false,
                   vectorQueryDepth: lb.vectorQueryDepth ?? 10,
+                  vectorIncludeAssistant: lb.vectorIncludeAssistant === true,
                   vectorScoreThreshold: lb.vectorScoreThreshold ?? 0.3,
                   vectorMaxResults: lb.vectorMaxResults ?? 10,
                   enabled: lb.enabled ?? true,
@@ -4054,7 +4110,13 @@ export async function backupRoutes(app: FastifyInstance) {
                     typeof entry.folderId === "string" && folderIdMap.has(entry.folderId)
                       ? folderIdMap.get(entry.folderId)
                       : null;
-                  await lbs.createEntry({ ...entry, lorebookId: (created as any).id, folderId });
+                  await lbs.createEntry({
+                    ...entry,
+                    lorebookId: (created as any).id,
+                    folderId,
+                    sourceAgentId: null,
+                    sourceMessageRefs: [],
+                  });
                 }
               }
               stats.lorebooks++;
@@ -4143,6 +4205,7 @@ export async function backupRoutes(app: FastifyInstance) {
                           injectionDepth: s.injectionDepth ?? 0,
                           injectionOrder: s.injectionOrder ?? 100,
                           forbidOverrides: s.forbidOverrides === "true" || s.forbidOverrides === true,
+                          skipWrap: s.skipWrap === "true" || s.skipWrap === true,
                         });
                       } catch {
                         /* skip individual section */

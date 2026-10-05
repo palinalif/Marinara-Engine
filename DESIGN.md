@@ -17,7 +17,7 @@ colors:
   frost-text: "#f0e8ff"
   destructive: "var(--destructive)"
   accent-border: "var(--border)"
-  sidebar-night: "#08061a"
+  sidebar-night: "var(--sidebar)"
   light-blush-bg: "#faf8ff"
   light-ink: "#1a1025"
   light-panel: "#ffffffee"
@@ -125,7 +125,7 @@ The palette is a nocturne of near-black violet, soft silver, logo-gradient accen
 - **Void Night** (`#050312`): Default app background.
 - **Soft Silver** (`#d4d4d4`): Default body text on dark surfaces.
 - **Ink Glass** (`#141414d9`): Card, popover, and elevated shell surfaces.
-- **Sidebar Night** (`#08061a`): Persistent navigation and app frame.
+- **Sidebar Surface** (`var(--sidebar)`): Persistent navigation, sidebar headers, row action trays, and settings surfaces share one opaque surface. In the default dark theme, it matches the card painted over the app background.
 - **Light Blush Background** (`#faf8ff`): Light theme app background.
 - **Light Panel** (`#ffffffee`): Light theme panels and popovers.
 - **Accent Border** (`var(--border)`): Default border and input stroke, tinted from the selected accent in dark and light mode.
@@ -203,7 +203,7 @@ Marinara uses a hybrid of tonal layering, soft glow, and selective frosted surfa
 
 ### Navigation
 
-- **Style:** Persistent sidebars use Sidebar Night, compact labels, active theme accents, and enough contrast for long sessions.
+- **Style:** Persistent sidebars use Sidebar Surface, compact labels, active theme accents, and enough contrast for long sessions.
 - **Mobile Treatment:** Navigation and settings controls must be touch-friendly, avoid hover-only disclosure, and keep primary chat/game actions reachable.
 
 ### Chat, Roleplay, and Game Surfaces

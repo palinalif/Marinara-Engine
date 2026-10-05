@@ -178,11 +178,11 @@ test("Roleplay wizard reuses automatic memory settings without downloaded agents
     const agentsToggle = wizard.getByRole("switch", { name: /^Enable Agents/ });
     await expect(agentsToggle).toHaveAttribute("aria-checked", "false");
     const memory = wizard.locator('[data-component="AdvancedMemorySettings"]');
-    const toggle = memory.getByRole("checkbox", { name: /Automatic context and memory handling \(alpha\)/ });
+    const toggle = memory.getByRole("checkbox", { name: /Automatic context and memory handling/ });
     await expect(toggle).not.toBeChecked();
     await expect(memory.getByLabel("Maximum allowed context before compression (tokens)")).toHaveCount(0);
     await page.screenshot({ path: info.outputPath("memory-wizard-disabled.png"), animations: "disabled" });
-    await memory.getByText("Automatic context and memory handling (alpha)", { exact: true }).click();
+    await memory.getByText("Automatic context and memory handling", { exact: true }).click();
     await expect.poll(async () => (await status()).settings.enabled).toBe(true);
     const context = memory.getByLabel("Maximum allowed context before compression (tokens)");
     await expect(context).toBeEnabled();
@@ -204,13 +204,18 @@ test("Roleplay wizard reuses automatic memory settings without downloaded agents
         if (!staleStatusAborted) throw error;
       }
     });
-    // Capture a normal status poll before saving, so its old response cannot overwrite the saved limits.
+    // Reopen the settings after their one-second freshness window. Ready archives
+    // no longer poll; an explicit revisit still refreshes and can race with a save.
+    await page.waitForTimeout(1100);
+    await wizard.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(wizard.getByRole("heading", { name: "Attach Lorebooks", exact: true })).toBeVisible();
+    await next.click();
     await expect.poll(() => staleStatusCaptured).toBe(true);
     await context.fill("16000");
     await context.press("Enter");
     await contextSaved;
     // A slow autosave must not disable or reject edits based on stale related limits.
-    const summaryBudget = memory.getByLabel("Maximum constant summary size (tokens)");
+    const summaryBudget = memory.getByLabel("Summary and recall budget (tokens)");
     await expect(summaryBudget).toBeEnabled();
     await summaryBudget.fill("20000");
     await summaryBudget.press("Enter");

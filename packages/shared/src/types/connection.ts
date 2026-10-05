@@ -21,7 +21,37 @@ export type APIProvider =
   | "custom"
   | "image_generation"
   | "video_generation"
-  | "audio";
+  | "audio"
+  | "decision";
+
+/**
+ * `custom` is a System One server; `openai_compatible` is an ordinary chat model on a
+ * server the user already runs (Ollama, LM Studio, llama.cpp), asked for one yes/no
+ * token and read from its log-probabilities, the way the local slots are.
+ */
+export const DECISION_SOURCES = ["typesafe", "openrouter", "custom", "openai_compatible"] as const;
+export type DecisionSource = (typeof DECISION_SOURCES)[number];
+
+export const DECISION_SOURCE_BASE_URLS = {
+  typesafe: "https://api.typesafe.ai",
+  openrouter: "https://openrouter.ai/api",
+  custom: "",
+  openai_compatible: "",
+} as const;
+
+/**
+ * Sources that run on a server the user names: the base URL is required, the key is
+ * optional and may be borrowed from a same-origin custom chat connection, and the state
+ * budget defaults to 3,500 tokens. TypeSafe may also be given a base URL (#7084) but keeps
+ * the hosted rules.
+ */
+export function decisionSourceTakesUrl(source: string | null | undefined): boolean {
+  return source === "custom" || source === "openai_compatible";
+}
+
+export function defaultDecisionStateTokens(source: string | null | undefined): number {
+  return decisionSourceTakesUrl(source) ? 3500 : 30000;
+}
 
 /** Audio backends an audio connection can target (the former TTS sources). */
 export const AUDIO_GENERATION_SOURCES = ["openai", "elevenlabs", "pockettts", "xai"] as const;
@@ -55,7 +85,7 @@ export interface APIConnection {
   fallbackForAgents: boolean;
   /** Whether provider-native prompt caching is enabled */
   enableCaching: boolean;
-  /** Anthropic only: use the 1-hour prompt-cache TTL instead of the default 5-minute TTL */
+  /** Anthropic and Claude Subscription: request a 1-hour prompt-cache TTL. */
   anthropicExtendedCacheTtl: boolean;
   /** Conversation message depth for Anthropic cache breakpoints */
   cachingAtDepth: number;
@@ -85,6 +115,12 @@ export interface APIConnection {
   videoService: string | null;
   /** Audio backend for audio connections (e.g. "elevenlabs"). Null for non-audio providers. */
   audioSource: AudioGenerationSource | null;
+  /** System One backend; absent on older connections. */
+  decisionSource?: DecisionSource | null;
+  credentialsFromConnectionId?: string | null;
+  maxStateTokens?: number | null;
+  /** How long a Decision connection may take to answer, in milliseconds; null is the default. */
+  decisionTimeoutMs?: number | null;
   /** Default voice id/name for speech synthesis on this audio connection. */
   audioVoice: string | null;
   /** Whether this audio connection may generate game sound effects (ElevenLabs only today). */
@@ -105,6 +141,8 @@ export interface APIConnection {
   treatAsLocalEndpoint: boolean;
   /** Folder this connection belongs to (null = root/unfiled). */
   folderId: string | null;
+  /** NanoGPT only: whether the subscription usage widget is shown. */
+  showUsageWidget: boolean;
   /** Manual sort order within a folder (lower = higher). 0 = use default sort. */
   sortOrder: number;
   createdAt: string;
@@ -145,4 +183,14 @@ export interface ConnectionTestResult {
   message: string;
   latencyMs: number;
   modelName: string | null;
+  decisionProbability?: number;
+  errorCode?: string;
+  /** A Decision connection's limit during chats, to compare `latencyMs` with. */
+  timeLimitMs?: number;
+  /** How long this Decision test waited before giving up. */
+  testTimeoutMs?: number;
+  /** A chat-model Decision connection: whether the server returned log-probabilities. */
+  logprobs?: boolean;
+  /** A chat-model Decision connection: whether the model answered without thinking first. */
+  answersDirectly?: boolean;
 }

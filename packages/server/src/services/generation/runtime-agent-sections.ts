@@ -5,6 +5,7 @@ import {
   nameToXmlTag,
   type ChatMode,
 } from "@marinara-engine/shared";
+import { COMMITTED_TRACKER_AGENT_TYPES } from "./committed-tracker-context.js";
 import type { AgentInjection } from "../agents/agent-pipeline.js";
 import { resolveAgentResultType } from "../agents/agent-executor.js";
 
@@ -104,6 +105,11 @@ export function buildRuntimeAgentSectionEligibleTypes(input: {
   for (const agent of BUILT_IN_AGENTS) {
     if (!activeAgentIds.has(agent.id)) continue;
     if (input.chatMode && !isAgentAvailableInChatMode(input.chatMode, agent.id)) continue;
+    // Trackers place their committed state, not a fresh pre-generation result.
+    if (COMMITTED_TRACKER_AGENT_TYPES.has(agent.id)) {
+      eligible.add(agent.id);
+      continue;
+    }
     if (agent.phase !== "pre_generation") continue;
     const resultType = resolveAgentResultType({ type: agent.id, settings: getDefaultBuiltInAgentSettings(agent.id) });
     if (resultType !== "context_injection" && resultType !== "director_event") {
@@ -221,10 +227,12 @@ export function clearUnusedRuntimeAgentSections(
 
 export const clearUnusedRuntimeAgentSectionsForTest = clearUnusedRuntimeAgentSections;
 
-export function pruneEmptyPromptWrappers(messages: Array<{ content: string }>): void {
+export function pruneEmptyPromptWrappers(
+  messages: Array<{ content: string; images?: readonly unknown[] | null; files?: readonly unknown[] | null }>,
+): void {
   for (let i = messages.length - 1; i >= 0; i--) {
     const content = messages[i]!.content.trim();
-    if (isEmptyPromptWrapper(content)) {
+    if (isEmptyPromptWrapper(content) && !messages[i]!.images?.length && !messages[i]!.files?.length) {
       messages.splice(i, 1);
     } else if (content !== messages[i]!.content) {
       messages[i] = { ...messages[i]!, content };

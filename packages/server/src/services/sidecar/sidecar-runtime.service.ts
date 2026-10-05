@@ -45,6 +45,14 @@ const execFileAsync = promisify(execFile);
 const RUNTIME_DIR = join(getDataDir(), "sidecar-runtime");
 const CURRENT_RUNTIME_PATH = join(RUNTIME_DIR, "current.json");
 const SERVER_LOG_PATH = join(RUNTIME_DIR, "server.log");
+/** A llama.cpp runtime folder, named `<release tag>-<variant>` such as `b10188-linux-x64-vulkan`. */
+const LLAMA_RUNTIME_DIRECTORY = /^b\d+-/;
+/**
+ * What this service downloads or unpacks: release archives such as
+ * `llama-b10188-bin-win-vulkan-x64.zip` or `cudart-llama-bin-win-cuda-13.3-x64.zip`, and
+ * `<runtime folder>.extract-…` scratch folders.
+ */
+const LLAMA_DOWNLOAD = /^(?:llama-b\d+-|cudart-llama-|b\d+-)/;
 const WINDOWS_CUDA_DLL_PATTERNS = [
   { label: "cudart64_*.dll", pattern: /^cudart64_\d+\.dll$/i },
   { label: "cublas64_*.dll", pattern: /^cublas64_\d+\.dll$/i },
@@ -405,10 +413,6 @@ class SidecarRuntimeService {
     options: { preserveRuntimeDirectories?: boolean } = {},
   ): void {
     for (const entry of readdirSync(RUNTIME_DIR, { withFileTypes: true })) {
-      if (entry.name === "mlx" || entry.name === "server.log") {
-        continue;
-      }
-
       const fullPath = join(RUNTIME_DIR, entry.name);
       if (entry.name === "current.json") {
         if (!keepDirectoryName) {
@@ -421,8 +425,14 @@ class SidecarRuntimeService {
         continue;
       }
 
-      const isTemporaryArtifact = /\.(extract(?:-[a-z0-9]+)?|zip)$/i.test(entry.name) || entry.name.endsWith(".tar.gz");
-      if (isTemporaryArtifact || (entry.isDirectory() && !options.preserveRuntimeDirectories)) {
+      // Only llama.cpp runtime folders and downloads are this service's to remove. Other
+      // runtimes keep their own folders beside them, such as `mlx` and the decision
+      // model's `decision`, which a reinstall or update must leave alone (#6982).
+      const isTemporaryArtifact =
+        LLAMA_DOWNLOAD.test(entry.name) &&
+        (/\.(extract(?:-[a-z0-9]+)?|zip)$/i.test(entry.name) || entry.name.endsWith(".tar.gz"));
+      const isRuntimeDirectory = entry.isDirectory() && LLAMA_RUNTIME_DIRECTORY.test(entry.name);
+      if (isTemporaryArtifact || (isRuntimeDirectory && !options.preserveRuntimeDirectories)) {
         rmSync(fullPath, { recursive: true, force: true });
       }
     }

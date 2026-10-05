@@ -120,6 +120,33 @@ The **Timing** fields in the drawer control an entry's behavior across several m
 
 For example, set **Sticky** to 3 to keep a fact in the prompt for a few turns after it comes up. That way the AI does not forget it mid-scene.
 
+## Decision activation
+
+The drawer's **Decision** field lets your **Decision model** decide whether an entry applies. You write a statement about the recent chat, such as `In the latest message, a dragon is physically present`, and choose how it acts:
+
+- **Off**, the default: the entry activates as usual.
+- **Require**: the entry activates the way it normally would (keywords, **Constant**, semantic matching), and only when the statement is also true. This filters passing mentions: an entry keyed on `dragon` stays out when someone only talks about dragons. On a **Constant** entry it makes the entry situational, for example combat rules with `A fight is happening in the latest message`.
+- **Trigger**: the statement adds a way to activate the entry, even when none of its keywords appear. This catches paraphrases and situations, for example `The latest message takes place in the Blackwood Forest`. Ordinary activation routes, including keywords, **Constant**, semantic matches and attached map locations, remain available.
+
+Macros such as `{{user}}` and `{{char}}` work in the statement. For clear wording and a way to test it on your own chats, see [Writing statements](../prompts/conditional-prompts.md#writing-statements).
+
+How it runs:
+
+- **Require** checks an entry that would otherwise qualify through keywords, semantic matching, **Constant**, or an attached map location, subject to its filters, timing and probability roll. It does not scan every unused entry merely because the lorebook is active.
+- **Trigger** can be checked when ordinary keyword activation does not admit an eligible entry. It is not necessarily asked on every turn: a Constant entry, a keyword match or an existing Sticky hold can admit the entry without a Trigger answer. Keep Trigger entries purposeful; they can still add hosted requests.
+- Statements are batched where possible. Activation, entry-content statements and recursive matches can need several batches, so a turn can incur multiple hosted requests. They use the lorebook's share of **Decision statements per turn**; see [Limits and cost](../prompts/conditional-prompts.md#limits-and-cost).
+- Successful answers are normally reused for the same turn and model while cached. Failed answers can be retried, and restart, eviction or changed inputs can cause new requests. A regeneration is not guaranteed to activate identical entries. See [Answer reuse](../prompts/conditional-prompts.md#answer-reuse). A **Sticky** entry is not asked again while its hold applies.
+- The active-lorebook list shows **decision** for an entry a Trigger statement activated.
+- **Peek Prompt** never asks. It uses the answers the turn already has and lists the statements that have none.
+
+**No answer means no new decision activation.** With no Decision model, or when it does not answer, **Require** cannot admit a new entry, though an existing Sticky hold can keep one active. **Trigger** adds no activation route; the entry can still activate through its ordinary keywords, Constant, semantic or map-location behavior, subject to their usual rules. The editor warns when no Decision model is set. Give important Trigger entries an ordinary activation route too. Use Require to filter optional lore, never to gate something the story depends on. See [Decision Models](../connections/decision-models.md).
+
+Decision activation applies to chat turns. Game setup, experience generation, and the lorebook scans agents run for themselves read decision entries as no.
+
+The entry's own **Sticky** and **Cooldown** work with its Decision field. While an entry is sticky it stays in without its statement being asked again, and while it is on cooldown its statement is not asked. So a Trigger statement with Sticky 3 and Cooldown 5 brings the entry in for a few turns, then rests it, without spending statements on it meanwhile.
+
+A `{{#if decision:"..."}}` condition inside the entry's content is different: it trims the text of an entry that has already activated, and the entry still uses its token budget and starts its timers. It is asked only on turns the entry activates, so the rest of a lorebook never uses up **Decision statements per turn**. Use the **Decision** field to decide whether the entry activates at all.
+
 ## More entry options
 
 The expanded drawer holds a few more fields.
@@ -348,6 +375,7 @@ An entry's **Content** is expanded like any other prompt text: prompt macros res
 - `{{random::a::b::c}}` and `{{roll:1d6}}` — pick a random option or roll dice, for flavor that varies each time the entry fires. Add `@` weights, as in `{{random::common@3::rare@1}}`, to make some options more likely than others.
 - `{{#if ...}}...{{else}}...{{/if}}` — change the text based on who is speaking, a variable, or the active character.
 - `{{getvar::name}}` and `{{setvar::name::value}}` — read or set a chat-local persistent variable, so an entry can react to or drive state across later turns without leaking into other chats.
+- `{{include::Entry name}}` — put in the text of another entry from the same lorebook, even one that is turned off, so shared text lives in one place. See [Lorebook include macro](../prompts/macros.md#lorebook-include-macro).
 
 Weighted random pairs well with **Probability** to fold a whole table into a single entry. Instead of a group of twenty monster entries, give one "wandering encounter" entry a low **Probability** (so an encounter is only occasional) and a weighted list of what appears:
 
@@ -366,7 +394,7 @@ Use the **comment macro** to leave a note that never reaches the AI:
 - **An entry never fires.** A **Normal** entry with no keys has nothing for keyword matching to catch — give it keys or make it **Constant**. (A keyless entry can still be recalled by meaning, but only with semantic search fully set up — enabled **Vectors**, a configured embedding model, and the entry vectorized; see [Semantic Search](semantic-search.md).) Check too that the lorebook is enabled and active in the chat.
 - **A keyword stopped working.** Keys are matched only in the last few messages — the lorebook's **Scan Depth** (default 2). Once the trigger word scrolls out of that window, the entry goes quiet. Raise **Scan Depth**, add **Sticky** so a fact lingers once it fires, or make the entry **Constant**.
 - **An entry fires in the wrong scenes.** A broad key like `home` or `king` matches too much. Tighten it with **Whole Words**, gate it with **Selective** secondary keys, or filter the entry to the right character.
-- **Important lore keeps getting dropped.** When more entries match than the budget allows, the tail is trimmed. Give the entries that matter a lower **Order**, raise the **Token Budget**, or move bulky reference lore behind the Knowledge Router agent. The **Active Context** panel shows exactly what was skipped and why (see [Token Budgets and Recursion](token-budgets.md)).
+- **Important lore keeps getting dropped.** When more entries match than the budget allows, the tail is trimmed. Give the entries that matter a lower **Order**, raise the **Token Budget**, or move bulky reference lore behind the Knowledge Router agent. The **Active Context** section of **Chat Settings** shows exactly what was skipped and why (see [Token Budgets and Recursion](token-budgets.md)).
 - **The AI ignores your lore.** Confirm the entry actually activated in **Active Context** — and remember it competes with the rest of the prompt, so a fact buried far from the latest turn has less pull than one at **After chat** or, sparingly, **@ Depth**.
 
 ## Authoring checklist
@@ -405,6 +433,7 @@ Folders only display as groups when you sort by **Order** with no active search.
 ## Related guides
 
 - [Lorebooks Overview](overview.md)
+- [Decision Models](../connections/decision-models.md)
 - [Lorebook Token Budgets and Recursion](token-budgets.md)
 - [Semantic Search for Lorebooks](semantic-search.md)
 - [Knowledge Sources: Retrieval and Router Agents](../agents/knowledge-sources.md)

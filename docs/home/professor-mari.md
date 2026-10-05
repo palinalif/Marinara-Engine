@@ -48,6 +48,7 @@ Here is the trust boundary in plain terms:
 - She cannot write straight into your saved data folder, where your characters and chats live. Instead she uses the reviewable change flow described below.
 - Raw shell commands have no network access, do not inherit server secrets, and may write only ordinary workspace files and a private temporary directory.
 - She can keep editing normal source files directly. Changes to dependency manifests, lockfiles, launchers, installers, and CI workflows are staged and shown to you before Marinara applies them.
+- She can read Marinara's built app files, the `dist` folders the app runs from, but cannot create, edit, move, or delete them. She changes the source files instead.
 - If a source change needs a public npm library, she requests a specific package target. Marinara resolves `latest` to an exact version, shows its registry integrity in a review card, and installs it only after you approve. Package lifecycle scripts stay disabled.
 - If Marinara cannot provide its macOS or Linux shell sandbox, raw shell commands are disabled. She can still use the safer structured file and app-data tools.
 - Commands she runs stop on their own after a short time, so a stuck command cannot run forever.
@@ -85,8 +86,12 @@ The card is titled **Review Mari's changes**. It shows what she did and which da
 
 A few things to know:
 
-- Brand new items, like a fresh character or lorebook, usually skip this step. Nothing existing was overwritten, so there is nothing to undo.
-- A review card expires on its own after 10 minutes if you do not answer it.
+- New items, like a fresh character or lorebook, get a card too. **Restore** removes them again.
+- A card belongs to the Mari chat she made the change in. A new chat starts without the cards of other chats. Deleting a chat keeps its changes and removes its cards. A change made with the `mari` command in a terminal belongs to no chat, so its card shows in every Mari chat.
+- A card stays until you press **Keep** or **Restore**, for up to 14 days. After that it closes on its own and the change stays.
+- If **Restore** says the data changed after Mari made the change, something edited it since then, and restoring would overwrite that newer version. Press **Keep** to dismiss the card; the current data stays as it is.
+- An edit that would leave everything as it was is not saved and gets no card.
+- Mari cannot edit or delete her own card. Marinara resets it to the built-in version on every start.
 - Characters and personas also keep their own version history inside their editors. You can restore an older version there as a second safety net.
 
 Two higher-risk changes wait instead of being applied first:
@@ -95,6 +100,22 @@ Two higher-risk changes wait instead of being applied first:
 - **Dependencies** show the exact public npm package, version, target workspace, dependency type, registry integrity, and declared direct dependencies with **Install** and **Not now**. Raw `npm`, `pnpm`, `yarn`, `pip`, and similar install commands are blocked inside her shell, including cached installs.
 
 Approving a library means trusting its code when Marinara later imports or runs it. Disabling lifecycle scripts prevents installation-time execution, but it cannot make a library harmless at runtime.
+
+## Creating content with Decisions
+
+Mari can write agent **Activation questions**, lorebook-entry **Decision** statements, and conditional prompts in presets, cards, lorebooks, and agent prompts. She checks which Decision model is selected before introducing those features. A selected model is configuration information, not proof that a provider is reachable or a local model will load successfully.
+
+If you have no Decision model selected, she keeps ordinary creations and edits free of new Decision dependencies. Existing Decision content stays intact during unrelated edits. If you explicitly ask for Decision content, she explains the relevant fallback and asks whether to proceed once in that Mari chat. Her record survives reopening the chat and conversations longer than her recent-message window. An unanswered question or a refusal is not permission.
+
+You can tell her, **“Stop reminding me to set up a Decision model.”** She stops in the current chat and can save that preference as a Memory. Use **Keep & Enable** to apply it in future chats too. Turning that Memory off or deleting it removes the standing preference. Suppressing setup reminders does not invite her to add Decisions to ordinary requests.
+
+With a model selected, she follows your relevant enabled Memories and Skills. If they contain no authoring preference, she asks whether you want Decisions used and whether to remember your answer. You can allow or decline them, or approve only the current task. A Skill that merely explains Decision syntax does not count as permission. A direct request such as “add Decision activation to this entry” already supplies permission for that task.
+
+Her default is sparse use with a suitable timing control: **Sticky** or **Cooldown** for lorebook entries, **Trigger Cadence** for agent activation, and `sticky`, `cooldown`, or `every` in prompt conditions. Sticky and Cooldown reduce repeated checks after a positive activation; they do not prevent repeated checks while a statement keeps answering no. `every` skips checks between scheduled turns and reads as no then, so it is not always suitable for fleeting events.
+
+Mari also aims to keep the early assembled prompt stable. She asks before adding changing content early in a prompt or inserting context inside chat history unless your instruction or enabled preference already permits that placement. There is no universal “safe after 1,000 tokens” rule: cache reuse depends on the provider, model, and matching rendered prefix. Approving Decision use does not automatically approve these placements.
+
+The usual Permissions Mode and review controls still apply to her edits. Memories she saves start disabled until you enable them. For what each Decision feature sees, its fallbacks, and examples, see [Decision Models](../connections/decision-models.md), [Conditional Prompts](../prompts/conditional-prompts.md), [Custom Agents](../agents/custom-agents.md#activation-questions), and [Lorebook Entries](../lorebooks/entries.md#decision-activation).
 
 ## Custom Skills
 

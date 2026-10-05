@@ -209,6 +209,7 @@ export function createPromptsStorage(db: DB) {
           injectionDepth: s.injectionDepth,
           injectionOrder: s.injectionOrder,
           forbidOverrides: s.forbidOverrides === "true",
+          skipWrap: s.skipWrap === "true",
         });
         if (newSection) sectionMap.set(s.id, newSection.id);
       }
@@ -359,6 +360,7 @@ export function createPromptsStorage(db: DB) {
         injectionDepth: input.injectionDepth ?? 0,
         injectionOrder: input.injectionOrder ?? 100,
         forbidOverrides: String(input.forbidOverrides ?? false),
+        skipWrap: String(input.skipWrap ?? false),
       });
       // Add to preset's section order
       const preset = await this.getById(input.presetId);
@@ -383,6 +385,7 @@ export function createPromptsStorage(db: DB) {
       if (data.injectionDepth !== undefined) updateFields.injectionDepth = data.injectionDepth;
       if (data.injectionOrder !== undefined) updateFields.injectionOrder = data.injectionOrder;
       if (data.forbidOverrides !== undefined) updateFields.forbidOverrides = String(data.forbidOverrides);
+      if (data.skipWrap !== undefined) updateFields.skipWrap = String(data.skipWrap);
       await db.update(promptSections).set(updateFields).where(eq(promptSections.id, id));
       return this.getSection(id);
     },

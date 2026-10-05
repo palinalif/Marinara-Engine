@@ -2,11 +2,12 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-const FILE_TIMEOUT_MS = 30_000; // Each regression has a fixed 30-second budget.
+const FILE_TIMEOUT_MS = 30_000;
 const REGRESSION_SUFFIXES = ['.regression.ts', '.regression.mjs', '.regression.js'];
 const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGBREAK: 1 };
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,6 +20,15 @@ let interruption;
 
 function repositoryRelative(file) {
   return path.relative(repositoryRoot, file).split(path.sep).join('/');
+}
+
+export function regressionTimeoutMs(relativePath) {
+  if (relativePath === 'scripts/regressions/server-signal-shutdown.regression.ts') {
+    // 20s main-server phase + six sequential 40s PTY bounds + 10s setup/cleanup margin.
+    return 270_000;
+  }
+  if (relativePath === 'scripts/regressions/restart-supervisor.regression.ts') return 90_000;
+  return FILE_TIMEOUT_MS;
 }
 
 function discoverRegressions(directory = regressionsRoot) {
@@ -110,10 +120,6 @@ function handleRunnerSignal(signal) {
   terminateActiveChild();
 }
 
-for (const signal of process.platform === 'win32' ? ['SIGINT', 'SIGTERM', 'SIGBREAK'] : ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => handleRunnerSignal(signal));
-}
-
 function commandFor(relativePath) {
   if (relativePath.endsWith('.regression.ts')) {
     return {
@@ -130,15 +136,30 @@ function commandFor(relativePath) {
   };
 }
 
+// Each file gets throwaway storage and an empty .env: the repo .env can point DATA_DIR and FILE_STORAGE_DIR at a
+// real data folder, and a regression that forgets to isolate itself must never open (or be blocked by) that store.
+function regressionEnvironment(scratchDir) {
+  const dataDir = path.join(scratchDir, 'data');
+  return {
+    ...process.env,
+    MARINARA_ENV_FILE: path.join(scratchDir, '.env'),
+    DATA_DIR: dataDir,
+    FILE_STORAGE_DIR: path.join(dataDir, 'storage'),
+  };
+}
+
 function runRegression(relativePath) {
   const { args, command, cwd } = commandFor(relativePath);
+  const timeoutMs = regressionTimeoutMs(relativePath);
   const startedAt = Date.now();
   process.stdout.write(`[${relativePath}] START\n`);
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marinara-regression-'));
 
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
       detached: process.platform !== 'win32',
+      env: regressionEnvironment(scratchDir),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -150,15 +171,20 @@ function runRegression(relativePath) {
     let timedOut = false;
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
-      process.stderr.write(`[${relativePath}] TIMEOUT after ${FILE_TIMEOUT_MS / 1000}s; terminating child.\n`);
+      process.stderr.write(`[${relativePath}] TIMEOUT after ${timeoutMs / 1000}s; terminating child.\n`);
       terminateActiveChild();
-    }, FILE_TIMEOUT_MS);
+    }, timeoutMs);
 
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutTimer);
       releaseActiveChild(child);
+      try {
+        fs.rmSync(scratchDir, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        // A child still exiting can hold a file open on Windows; the OS temp cleaner removes it.
+      }
       resolve({ ...result, durationMs: Date.now() - startedAt });
     };
 
@@ -176,6 +202,9 @@ function runRegression(relativePath) {
 }
 
 async function main() {
+  for (const signal of process.platform === 'win32' ? ['SIGINT', 'SIGTERM', 'SIGBREAK'] : ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => handleRunnerSignal(signal));
+  }
   const { filter, list } = parseArguments(process.argv.slice(2));
   const discovered = discoverRegressions();
   if (discovered.length === 0) throw new Error('No regression files were discovered.');
@@ -202,12 +231,15 @@ async function main() {
     process.stdout.write(`[${file}] ${result.status.toUpperCase()} (${result.durationMs}ms)${detail}\n`);
   }
 
-  const failed = results.filter((result) => result.status !== 'passed').length;
-  process.stdout.write(`Regression summary: ${results.length - failed}/${results.length} passed; ${failed} failed.\n`);
-  if (failed > 0) process.exitCode = 1;
+  const failed = results.filter((result) => result.status !== 'passed');
+  for (const result of failed) process.stdout.write(`Regression not passed (${result.status}): ${result.file}\n`);
+  process.stdout.write(`Regression summary: ${results.length - failed.length}/${results.length} passed; ${failed.length} failed.\n`);
+  if (failed.length > 0) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  process.stderr.write(`[runner] ${error.message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`[runner] ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

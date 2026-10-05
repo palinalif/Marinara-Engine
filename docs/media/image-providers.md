@@ -1,6 +1,6 @@
 # Image Generation Providers and Setup
 
-This guide explains how to connect an image generation service to Marinara Engine. It also covers what each of the 17 services needs. Image generation powers scene illustrations, selfies, scene backgrounds, and generated avatars, portraits, and sprites.
+This guide explains how to connect an image generation service to Marinara Engine. It also covers what each service needs. Image generation powers scene illustrations, selfies, scene backgrounds, and generated avatars, portraits, and sprites.
 
 You set up image generation as a special kind of connection. Once one image connection works, every image feature in the app can use it.
 
@@ -23,13 +23,14 @@ If **Test Image** returns a picture, your connection is ready. If it fails, chec
 
 ## Choosing a service
 
-The 17 services fall into three groups. Cloud services need an API key and an account. Free services need no key. Local services run image software on your own computer.
+The services fall into three groups. Cloud services need an account, and most also need an API key. Free services need no key. Local services run image software on your own computer.
 
 The table below shows each service at a glance. Details and quirks follow in the per-service sections.
 
 | Service | API key | Where it runs |
 | --- | --- | --- |
 | OpenAI (DALL-E) | Yes | Cloud |
+| ChatGPT (Codex login) | No, uses your `codex login` | Cloud |
 | Stability AI | Yes | Cloud |
 | Together AI | Yes | Cloud |
 | NovelAI | Yes | Cloud |
@@ -38,6 +39,7 @@ The table below shows each service at a glance. Details and quirks follow in the
 | Venice.ai | Yes | Cloud |
 | Z.AI | Yes | Cloud |
 | Atlas Cloud | Yes | Cloud |
+| fal.ai | Yes | Cloud |
 | NanoGPT | Yes | Cloud |
 | Block Entropy | Yes | Cloud |
 | RunPod Serverless (ComfyUI) | Yes | Cloud |
@@ -50,6 +52,14 @@ The table below shows each service at a glance. Details and quirks follow in the
 ## OpenAI (DALL-E)
 
 Cloud service with the default Base URL `https://api.openai.com/v1`. It needs an API key from your OpenAI account. It offers DALL-E and GPT Image models. It accepts up to 16 reference images.
+
+## ChatGPT (Codex login)
+
+Cloud service that uses your ChatGPT plan instead of an API key, so images don't need OpenAI API credits. On the computer that runs the Marinara server, install the Codex CLI and run `codex login` once. It is the same sign-in the **OpenAI (ChatGPT)** chat connection uses; see [Claude, ChatGPT, and Grok Subscription Connections](../connections/subscription-clis.md#openai-chatgpt) for the steps. There is no API key or Base URL to fill in. Marinara fills in the model `gpt-image-2`, the one Codex itself uses for images.
+
+**Test Connection** only checks that Marinara can read your Codex login. **Test Image** makes a real image and counts against your ChatGPT image limits. With reference images, Marinara sends an edit request with up to 16 of them. ChatGPT may return a different pixel size than the one asked for, so Marinara also states the wanted aspect ratio in the prompt.
+
+This service talks to the ChatGPT image endpoint that Codex uses, not the public OpenAI API, so OpenAI can change it without notice.
 
 ## Stability AI
 
@@ -81,7 +91,13 @@ Cloud service with the default Base URL `https://api.z.ai/api/paas/v4`. It needs
 
 ## Atlas Cloud
 
-Cloud service with the default Base URL `https://api.atlascloud.ai/api/v1`. It needs an Atlas Cloud API key. Marinara supplies a small starter catalog for Nano Banana, Gemini Flash Image, and FLUX 1.1 Pro, and you can type another exact Atlas Cloud image model ID. Jobs run asynchronously, so Marinara starts the generation and polls Atlas Cloud until the image is ready. Common text-to-image controls are mapped automatically; reference images are sent for model IDs that advertise image-to-image, edit, or Kontext behavior. Because Atlas model schemas can differ, check the selected model's Atlas Cloud documentation when using another model ID.
+Cloud service with the default Base URL `https://api.atlascloud.ai/api/v1`. It needs an Atlas Cloud API key. **Fetch Models** loads Atlas Cloud's current text-to-image and image-to-image catalog. If the catalog cannot be reached, Marinara shows a small starter list for Nano Banana, Gemini Flash Image, and FLUX 1.1 Pro instead, and you can always type an exact Atlas Cloud image model ID. Jobs run asynchronously, so Marinara starts the generation and polls Atlas Cloud until the image is ready. Common text-to-image controls are mapped automatically; reference images are sent for model IDs that advertise image-to-image, edit, or Kontext behavior. Because Atlas model schemas can differ, check the selected model's Atlas Cloud documentation when using another model ID.
+
+## fal.ai
+
+Cloud service with the default **Base URL** `https://fal.run`. Create an API key at [fal.ai](https://fal.ai/dashboard/keys), then select **fal.ai** in the image service grid. The starter **Model** list offers `fal-ai/flux/schnell` and `fal-ai/flux/dev`; you can type another text-to-image endpoint ID with a compatible input/output schema. **Test Connection** checks the configuration only. **Test Image** sends a real generation request and uses your fal.ai credits.
+
+Marinara sends the prompt and requested dimensions, then downloads the first returned image into its existing image workflow. Negative prompts are appended as text instructions. Use **Custom Parameters** for model-specific options such as `seed`, `num_inference_steps`, or `image_size`. This integration uses synchronous text-to-image requests; it does not send reference images or resume interrupted jobs. Check the selected model's [API reference](https://fal.ai/models/fal-ai/flux/schnell/api) for its supported inputs.
 
 ## NanoGPT
 
@@ -172,6 +188,7 @@ A **reference image** is an existing picture you send along with your prompt. It
 | Provider | Reference images |
 | --- | --- |
 | OpenAI (DALL-E) | Up to 16 |
+| ChatGPT (Codex login) | Up to 16 |
 | NovelAI | Up to 16, V4.5 model only |
 | xAI / Grok Imagine | Up to 3 |
 | Venice.ai | Not supported for text-to-image generation |

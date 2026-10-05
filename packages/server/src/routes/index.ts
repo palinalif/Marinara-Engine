@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 import type { FastifyInstance } from "fastify";
 import { chatsRoutes } from "./chats.routes.js";
+import { chatInsightsRoutes } from "./chat-insights.routes.js";
 import { advancedMemoryRoutes } from "./advanced-memory.routes.js";
 import { charactersRoutes } from "./characters.routes.js";
 import { lorebooksRoutes } from "./lorebooks.routes.js";
@@ -10,8 +11,9 @@ import { promptsRoutes } from "./prompts.routes.js";
 import { connectionsRoutes } from "./connections.routes.js";
 import { agentsRoutes } from "./agents.routes.js";
 import { customToolsRoutes } from "./custom-tools.routes.js";
-import { generateRoutes } from "./generate.routes.js";
+import { generateRoutes, type GenerationRunner } from "./generate.routes.js";
 import { utilitySidecarRoutes } from "./utility-sidecar.routes.js";
+import { decisionRoutes } from "./decision.routes.js";
 import { importRoutes } from "./import.routes.js";
 import { backgroundsRoutes } from "./backgrounds.routes.js";
 import { avatarsRoutes } from "./avatars.routes.js";
@@ -35,7 +37,6 @@ import { translateRoutes } from "./translate.routes.js";
 import { hapticRoutes } from "./haptic.routes.js";
 import { botBrowserRoutes } from "./bot-browser.routes.js";
 import { botBrowserJannyRoutes } from "./bot-browser-janny.routes.js";
-import { botBrowserChartavernRoutes } from "./bot-browser-chartavern.routes.js";
 import { botBrowserPygmalionRoutes } from "./bot-browser-pygmalion.routes.js";
 import { botBrowserWyvernRoutes } from "./bot-browser-wyvern.routes.js";
 import { botBrowserDatacatRoutes } from "./bot-browser-datacat.routes.js";
@@ -49,7 +50,10 @@ import { themesRoutes } from "./themes.routes.js";
 import { appSettingsRoutes } from "./app-settings.routes.js";
 import { achievementsRoutes } from "./achievements.routes.js";
 import { gameRoutes } from "./game.routes.js";
+import { combatDirectorRoutes } from "./combat-director.routes.js";
+import { gameInventoryRoutes } from "./game-inventory.routes.js";
 import { gameAssetsRoutes } from "./game-assets.routes.js";
+import { gameRulesetsRoutes } from "./game-rulesets.routes.js";
 import { turnGamesRoutes } from "./turn-games.routes.js";
 import { sidecarRoutes } from "./sidecar.routes.js";
 import { ttsRoutes } from "./tts.routes.js";
@@ -62,25 +66,50 @@ import { personalExtensionsRoutes } from "./personal-extensions.routes.js";
 import { notificationSoundRoutes } from "./notification-sound.routes.js";
 import { libraryFoldersRoutes } from "./library-folders.routes.js";
 import { androidLocalAuthRoutes } from "../middleware/android-local-auth.js";
+import { multiplayerRoutes } from "./multiplayer.routes.js";
+import { MultiplayerService, type MultiplayerGameRuntime } from "../services/multiplayer/service.js";
+import { loadTlsOptions, multiplayerAvailable } from "../config/runtime-config.js";
 
 export async function registerRoutes(app: FastifyInstance) {
   // Sibling routes must see the same in-flight generations as the generation plugin.
   if (!app.hasDecorator("activeGenerations")) app.decorate("activeGenerations", new Map());
+  const multiplayer = new MultiplayerService({
+    db: app.db,
+    available: multiplayerAvailable,
+    tls: loadTlsOptions,
+    abortGeneration: (chatId) => {
+      const active = (
+        app as unknown as {
+          activeGenerations: Map<string, { abortController: AbortController; agentAbortController?: AbortController }>;
+        }
+      ).activeGenerations.get(chatId);
+      active?.abortController.abort();
+      active?.agentAbortController?.abort();
+    },
+  });
+  await multiplayer.initialize();
+  app.decorate("multiplayer", multiplayer);
+  app.addHook("onClose", () => multiplayer.close());
   await app.register(androidLocalAuthRoutes, { prefix: "/api/android-auth" });
   await app.register(chatsRoutes, { prefix: "/api/chats" });
   await app.register(advancedMemoryRoutes, { prefix: "/api/chats" });
+  await app.register(chatInsightsRoutes, { prefix: "/api/chat-insights" });
   await app.register(chatFoldersRoutes, { prefix: "/api/chat-folders" });
   await app.register(chatPresetsRoutes, { prefix: "/api/chat-presets" });
   await app.register(charactersRoutes, { prefix: "/api/characters" });
   await app.register(lorebooksRoutes, { prefix: "/api/lorebooks" });
   await app.register(promptsRoutes, { prefix: "/api/prompts" });
   await app.register(connectionsRoutes, { prefix: "/api/connections" });
+  await app.register(decisionRoutes, { prefix: "/api/decision" });
   await app.register(connectionFoldersRoutes, { prefix: "/api/connection-folders" });
   await app.register(libraryFoldersRoutes, { prefix: "/api/library-folders" });
   await app.register(agentsRoutes, { prefix: "/api/agents" });
   await app.register(utilitySidecarRoutes, { prefix: "/api/utility-sidecar" });
   await app.register(customToolsRoutes, { prefix: "/api/custom-tools" });
-  await app.register(generateRoutes, { prefix: "/api/generate" });
+  await app.register(generateRoutes, {
+    prefix: "/api/generate",
+    onRunnerReady: (runner: GenerationRunner) => multiplayer.setRunner(runner),
+  });
   await app.register(importRoutes, { prefix: "/api/import" });
   await app.register(backgroundsRoutes, { prefix: "/api/backgrounds" });
   await app.register(avatarsRoutes, { prefix: "/api/avatars" });
@@ -104,7 +133,6 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(hapticRoutes, { prefix: "/api/haptic" });
   await app.register(botBrowserRoutes, { prefix: "/api/bot-browser" });
   await app.register(botBrowserJannyRoutes, { prefix: "/api/bot-browser" });
-  await app.register(botBrowserChartavernRoutes, { prefix: "/api/bot-browser" });
   await app.register(botBrowserPygmalionRoutes, { prefix: "/api/bot-browser" });
   await app.register(botBrowserWyvernRoutes, { prefix: "/api/bot-browser" });
   await app.register(botBrowserDatacatRoutes, { prefix: "/api/bot-browser" });
@@ -114,8 +142,15 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(themesRoutes, { prefix: "/api/themes" });
   await app.register(appSettingsRoutes, { prefix: "/api/app-settings" });
   await app.register(achievementsRoutes, { prefix: "/api/achievements" });
-  await app.register(gameRoutes, { prefix: "/api/game" });
+  await app.register(gameRoutes, {
+    prefix: "/api/game",
+    onRoomRuntimeReady: (runtime: MultiplayerGameRuntime) => multiplayer.setGameRuntime(runtime),
+  });
+  await app.register(multiplayerRoutes, { prefix: "/api/multiplayer", service: multiplayer });
+  await app.register(combatDirectorRoutes, { prefix: "/api/game/combat/director" });
+  await app.register(gameInventoryRoutes, { prefix: "/api/game/inventory" });
   await app.register(gameAssetsRoutes, { prefix: "/api/game-assets" });
+  await app.register(gameRulesetsRoutes, { prefix: "/api/game-rulesets" });
   await app.register(turnGamesRoutes, { prefix: "/api/turn-games" });
   await app.register(ttsRoutes, { prefix: "/api/tts" });
   await app.register(promptOverridesRoutes, { prefix: "/api/prompt-overrides" });

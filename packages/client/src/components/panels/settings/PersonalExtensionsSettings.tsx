@@ -531,7 +531,7 @@ function ExtensionSettings({ showIntro, mode }: { showIntro: boolean; mode: Exte
           <button
             type="button"
             onClick={closeEditor}
-            className="flex min-h-9 self-start items-center gap-1.5 rounded-md px-2 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--secondary)] hover:text-[var(--foreground)]"
+            className="flex min-h-9 self-start items-center gap-1.5 rounded-md px-2 text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)]"
           >
             <ChevronLeft size="0.875rem" />
             {isExternal
@@ -993,7 +993,7 @@ function ExtensionSettings({ showIntro, mode }: { showIntro: boolean; mode: Exte
                       "flex items-stretch gap-2 rounded-lg border px-1.5 py-1.5 transition-colors",
                       extension.enabled
                         ? "border-[var(--primary)]/30 bg-[var(--primary)]/[0.07]"
-                        : "border-[var(--border)] bg-[var(--secondary)]/45 hover:bg-[var(--secondary)]/70",
+                        : "border-[var(--border)] bg-[var(--secondary)]/45 hover:bg-[var(--accent)]/70",
                     )}
                   >
                     <div

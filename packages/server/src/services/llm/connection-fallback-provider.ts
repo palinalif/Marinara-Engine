@@ -2,49 +2,26 @@ import { allowsDefaultChatModel } from "./local-context-limit.js";
 import type { ChatCompletionResult, ChatMessage, ChatOptions, LLMUsage } from "./base-provider.js";
 import { BaseLLMProvider } from "./base-provider.js";
 import { createLLMProvider } from "./provider-registry.js";
-import { withRateLimitAwareProvider } from "./rate-limit-aware-provider.js";
+import { RateLimitAwareProvider, withRateLimitAwareProvider } from "./rate-limit-aware-provider.js";
 import { mergeCustomParameters, parseStoredGenerationParameters } from "../../routes/generate/generate-route-utils.js";
 import { logger } from "../../lib/logger.js";
+import { keepsCodexDefaultEffort } from "../generation/generation-parameters.js";
 import { notifyGenerationFallback, type GenerationFallbackNotifier } from "../generation/fallback-notification.js";
 import {
   isConnectionAdmissionFailure,
   splitConnectionAttemptAcrossFallback,
   withConnectionAdmissionProvider,
-  type ConnectionAdmissionMode,
 } from "../generation/connection-admission.js";
 
-export type FallbackConnection = {
-  id: string;
-  name?: string | null;
-  provider: string;
-  baseUrl: string | null;
-  apiKey: string;
-  model: string;
-  maxContext?: number | null;
-  openrouterProvider?: string | null;
-  maxTokensOverride?: number | null;
-  defaultParameters?: unknown;
-  maxParallelJobs?: number | null;
-  enableCaching?: string | boolean | null;
-  anthropicExtendedCacheTtl?: string | boolean | null;
-  cachingAtDepth?: number | null;
-  claudeFastMode?: string | boolean | null;
-  treatAsLocalEndpoint?: string | boolean | null;
-};
+import type { FallbackConnection, GenerationProviderOrigin } from "@marinara-engine/shared";
+export type { FallbackConnection, GenerationProviderOrigin } from "@marinara-engine/shared";
 
-export type GenerationProviderOrigin = { kind: "primary" } | { kind: "fallback"; provider: string; model: string };
-
-type ConnectionFallbackProviderArgs = {
+type ConnectionFallbackProviderArgs = Omit<
+  import("@marinara-engine/shared").CapabilityConnectionFallbackOptions,
+  "primary"
+> & {
   primary: BaseLLMProvider;
-  primaryConnectionId: string;
-  fallbackConnection: FallbackConnection | null | undefined;
-  fallbackBaseUrl: string;
-  category: "main" | "agents";
-  onFallback?: GenerationFallbackNotifier;
-  onProviderUsed?: (origin: GenerationProviderOrigin) => void;
-  admissionMode?: ConnectionAdmissionMode;
-  primarySupportsAssistantReasoningPrefill?: boolean;
-  fallbackSupportsAssistantReasoningPrefill?: boolean;
+  wrapProvider?: (provider: BaseLLMProvider) => BaseLLMProvider;
 };
 
 function isEnabled(value: unknown): boolean {
@@ -108,13 +85,15 @@ function fallbackOptions(options: ChatOptions, connection: FallbackConnection): 
         : undefined;
   const reasoningSendDisabled = stored?.enabledParameters?.reasoningEffort === false;
   const hasStoredReasoningEffort = stored?.reasoningEffort !== undefined;
-  const reasoningEffort = reasoningSendDisabled
-    ? undefined
-    : stored?.reasoningEffort === "maximum"
-      ? "max"
-      : stored?.reasoningEffort === null
-        ? "none"
-        : (stored?.reasoningEffort ?? options.reasoningEffort);
+  // A Codex fallback with no saved level keeps Codex's default rather than taking the main connection's level.
+  const reasoningEffort =
+    reasoningSendDisabled || keepsCodexDefaultEffort(connection.provider, stored)
+      ? undefined
+      : stored?.reasoningEffort === "maximum"
+        ? "max"
+        : stored?.reasoningEffort === null
+          ? "none"
+          : (stored?.reasoningEffort ?? options.reasoningEffort);
   const enableThinking = reasoningSendDisabled
     ? false
     : hasStoredReasoningEffort
@@ -359,6 +338,7 @@ export class ConnectionFallbackProvider extends BaseLLMProvider {
 
 export function withConnectionFallbackProvider({
   primary,
+  wrapProvider = (provider) => provider,
   primaryConnectionId,
   fallbackConnection,
   fallbackBaseUrl,
@@ -375,26 +355,35 @@ export function withConnectionFallbackProvider({
     // Rate-limit-aware wraps outside admission so a 429 pauses/retries this connection here too —
     // the main chat/agent path builds `primary` without a connectionId, so it is added here.
     return withRateLimitAwareProvider(
-      withConnectionAdmissionProvider(primary, primaryConnectionId, admissionMode),
+      withConnectionAdmissionProvider(wrapProvider(primary), primaryConnectionId, admissionMode),
       primaryConnectionId,
     );
   }
+  // A fallback exists, so a transient failure on the primary goes straight to it instead of
+  // waiting out a transient backoff first (PROVIDER_RETRY_TRANSIENT_ERRORS). Rate limits are
+  // unchanged. A primary that is already wrapped (createLLMProvider with a connectionId, or a
+  // capability package passing one to llm.withFallback) has its own wrapper opted out too, since
+  // admission may sit between it and the outer wrapper below.
+  const primaryLeg = primary instanceof RateLimitAwareProvider ? primary.withoutTransientRetry() : primary;
   const admittedPrimary = withRateLimitAwareProvider(
-    withConnectionAdmissionProvider(primary, primaryConnectionId, primaryMode),
+    withConnectionAdmissionProvider(wrapProvider(primaryLeg), primaryConnectionId, primaryMode),
     primaryConnectionId,
+    { transientRetry: false },
   );
   const fallback = withRateLimitAwareProvider(
     withConnectionAdmissionProvider(
-      createLLMProvider(
-        fallbackConnection.provider,
-        fallbackBaseUrl,
-        fallbackConnection.apiKey,
-        fallbackConnection.maxContext,
-        fallbackConnection.openrouterProvider,
-        fallbackConnection.maxTokensOverride,
-        isEnabled(fallbackConnection.claudeFastMode),
-        isEnabled(fallbackConnection.treatAsLocalEndpoint),
-        fallbackConnection.defaultParameters,
+      wrapProvider(
+        createLLMProvider(
+          fallbackConnection.provider,
+          fallbackBaseUrl,
+          fallbackConnection.apiKey,
+          fallbackConnection.maxContext,
+          fallbackConnection.openrouterProvider,
+          fallbackConnection.maxTokensOverride,
+          isEnabled(fallbackConnection.claudeFastMode),
+          isEnabled(fallbackConnection.treatAsLocalEndpoint),
+          fallbackConnection.defaultParameters,
+        ),
       ),
       fallbackConnection.id,
       fallbackMode,

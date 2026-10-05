@@ -34,6 +34,8 @@ for (const [contents, expected] of [
       id: `entry-${order}`,
       position: 0,
       embedding: null,
+      sourceAgentId: null,
+      sourceMessageRefs: [],
       createdAt: "2026-09-13T00:00:00.000Z",
       updatedAt: "2026-09-13T00:00:00.000Z",
     },
@@ -56,7 +58,7 @@ for (const [path, expression] of [
   ],
   [
     "packages/server/src/routes/generate.routes.ts",
-    'estimateTextTokens( (assembled.lorebookActivatedEntries ?? []).map((entry) => entry.content).join(""), )',
+    'estimateTextTokens((assembled.lorebookActivatedEntries ?? []).map((entry) => entry.content).join(""))',
   ],
   [
     "packages/server/src/routes/lorebooks.routes.ts",

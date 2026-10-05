@@ -10,7 +10,16 @@ import type {
   SessionSummary,
   HudWidget,
 } from "@marinara-engine/shared";
-import { DEFAULT_GAME_SYSTEM_PROMPT, wrapGameInstructions } from "@marinara-engine/shared";
+import {
+  DEFAULT_GAME_SYSTEM_PROMPT,
+  gameInventoryBagKey,
+  rulesetDefenseLabel,
+  rulesetItemStatsRead,
+  rulesetLayeredCurrencies,
+  wrapGameInstructions,
+  type GameInventoryBearerStatus,
+  type RulesetLayerOptions,
+} from "@marinara-engine/shared";
 import type { CharacterSpriteInfo } from "./sprite.service.js";
 
 /**
@@ -52,6 +61,8 @@ export interface GmPromptContext {
   difficulty: string;
   /** "classic" (menu combat) or "tactical" (grid battle). Absent = classic. */
   combatStyle?: string;
+  /** Bounded summary of the accepted generated battlefield for later narration. */
+  tacticalBattlefieldContext?: string;
   genre: string;
   setting: string;
   tone: string;
@@ -90,7 +101,44 @@ export interface GmPromptContext {
   /** Available sprite expressions per character (name → expressions + custom fullBody aliases) */
   characterSprites?: CharacterSpriteInfo[];
   /** Player's current inventory items (for GM context) */
-  playerInventory?: Array<{ name: string; quantity: number }>;
+  /** `ownName` is the item's own name when `name` is a nickname the player gave it; `item` is the
+   *  ruleset item it is, when it is one. */
+  playerInventory?: Array<{
+    name: string;
+    quantity: number;
+    ownName?: string;
+    item?: string;
+    equipped?: number;
+    bound?: number;
+    charges?: Array<{ now: number; max: number }>;
+  }>;
+  /** Each bag's totals, the player's first (no `holder`). Read instead of `playerInventory` once
+   *  anybody but the player carries something, so the Game Master knows who holds what. */
+  partyInventory?: Array<{
+    holder?: string;
+    items: Array<{
+      name: string;
+      quantity: number;
+      ownName?: string;
+      item?: string;
+      equipped?: number;
+      bound?: number;
+      charges?: Array<{ now: number; max: number }>;
+    }>;
+  }>;
+  /** What each ruleset item held is, by item id, as one line (`rulesetItemPromptFacts`). */
+  inventoryItemFacts?: Record<string, string>;
+  /** What each character carries, binds and wears against what they can, by bag key
+   *  (`gameInventoryBagKey`, the player's is ""), in a game whose ruleset says so. */
+  inventoryBearers?: Record<string, GameInventoryBearerStatus>;
+  /** What each bag's coins are worth ("Coin worth 432 bits"), by bag key, where the ruleset has coins. */
+  inventoryPurses?: Record<string, string>;
+  /** The market block for the place the scene is in (`rulesetMarketPromptText`), where the ruleset
+   *  has a market (#6917). */
+  market?: string;
+  /** The layers the game's ruleset really plays with, for what a layer hides without rewriting the
+   *  ruleset (its coins). */
+  rulesetLayerOptions?: RulesetLayerOptions;
   /** Language for all narration and dialogue */
   language?: string;
   /** User-overridable GM instruction body. Wrapped in <instructions> before sending. */
@@ -405,8 +453,135 @@ function buildCampaignPlanLines(plan?: GameCampaignPlan | null): string[] {
   return lines;
 }
 
-function buildCompactInventoryLine(items: Array<{ name: string; quantity: number }>): string {
-  return items.map((item) => `${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ""}`).join("; ");
+function buildCompactInventoryLine(
+  items: Array<{ name: string; quantity: number; facts?: string; worn?: string }>,
+): string {
+  return items
+    .map(
+      (item) =>
+        `${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ""}${item.worn ? ` (${item.worn})` : ""}${item.facts ? ` [${item.facts}]` : ""}`,
+    )
+    .join("; ");
+}
+
+/** What one character carries and wears against what they can, as the Game Master reads it:
+ *  "load 7 of 8, most 12, encumbered; Attuned 1 of 3; Hands 1 of 2, Body 0 of 1". */
+function bearerNote(status: GameInventoryBearerStatus | undefined, bindingLabel: string | undefined): string {
+  if (!status) return "";
+  const round = (value: number) => String(Math.round(value * 100) / 100);
+  const parts: string[] = [];
+  if (status.encumberedAbove !== undefined || status.limit !== undefined) {
+    parts.push(
+      [
+        `load ${round(status.load)}${status.encumberedAbove !== undefined ? ` of ${round(status.encumberedAbove)}` : ""}`,
+        ...(status.limit !== undefined ? [`most ${round(status.limit)}`] : []),
+        ...(status.encumbered ? ["encumbered"] : []),
+      ].join(", "),
+    );
+  }
+  if (status.bindingMax !== undefined) parts.push(`${bindingLabel || "Bound"} ${status.bound} of ${status.bindingMax}`);
+  if (status.slots.length > 0)
+    parts.push(status.slots.map((slot) => `${slot.label} ${slot.used} of ${slot.count}`).join(", "));
+  return parts.join("; ");
+}
+
+/** The tag line for wearing: only the actions this ruleset has, putting on for slots and binding for a
+ *  binding limit, so a model is never offered one the Engine would refuse every time. */
+/** The ruleset's coins, family by family, largest first: "Coin: sovereigns, marks, bits; Salt: cakes,
+ *  pinches". */
+function promptCoins(
+  families: ReadonlyArray<{ label: string; units: ReadonlyArray<{ label: string; value: number }> }>,
+): string {
+  return families
+    .map(
+      (family) =>
+        `${normalizePromptText(family.label)}: ${[...family.units]
+          .sort((a, b) => b.value - a.value)
+          .map((unit) => normalizePromptText(unit.label))
+          .join(", ")}`,
+    )
+    .join("; ");
+}
+
+/** The ruleset's loot tables as the Game Master names them: "grave_goods (Grave goods)". */
+function promptLootTables(tables: ReadonlyArray<{ id: string; label: string }>): string {
+  return tables.map((table) => `${table.id} (${normalizePromptText(table.label)})`).join(", ");
+}
+
+function wearGrammarLine(slots: boolean, bindingLabel: string | undefined): string {
+  const binding = bindingLabel === undefined ? undefined : normalizePromptText(bindingLabel);
+  const actions = [...(slots ? ["equip", "unequip"] : []), ...(binding !== undefined ? ["bind", "unbind"] : [])];
+  const when = [
+    ...(slots
+      ? ["puts on, wields or readies one of the ruleset's items (equip) or takes it off or puts it away (unequip)"]
+      : []),
+    ...(binding !== undefined ? [`binds one${slots ? "" : " of the ruleset's items"} (${binding}) or unbinds it`] : []),
+  ].join(", or ");
+  const checks = [...(slots ? ["the slots"] : []), ...(binding !== undefined ? ["the binding limit"] : [])].join(
+    " and ",
+  );
+  return `- [inventory: action="${actions.join("|")}" item="Name" who="Name"] - when a character ${when}. It must be in who's own bag (the player's when who is left out); the Engine checks ${checks} shown beside each character, and refuses what does not fit.`;
+}
+
+/** How the Game Master invents an item of the ruleset: the proposal form, and the ruleset's own words
+ *  for every part of it (stats it is not shown are left out). */
+function inventGrammarLines(
+  items: NonNullable<import("@marinara-engine/shared").RulesetDefinition["items"]>,
+  sheet: import("@marinara-engine/shared").RulesetDefinition["sheet"],
+  /** Whether the ruleset has fights of its own, where a weapon item is an attack, the word it uses
+   *  for defense when it has one, and the item stats that defense already counts. */
+  fights: { defense?: string; counted: string[] } | undefined,
+): string[] {
+  const ids = (words: ReadonlyArray<{ id: string }> | undefined) => (words ?? []).map((word) => word.id).join(", ");
+  const statKind = (stat: NonNullable<typeof items.stats>[number]): string => {
+    switch (stat.type) {
+      case "number":
+        return `number ${stat.min} to ${stat.max}`;
+      case "dice":
+        return "dice";
+      case "boolean":
+        return "yes or no";
+      case "enum":
+        return `one of ${stat.values.map((value) => normalizePromptText(value)).join(", ")}`;
+      case "text":
+        return "text";
+    }
+  };
+  const stats = (items.stats ?? [])
+    .filter((stat) => stat.promptVisible)
+    .map((stat) => `${stat.id} (${statKind(stat)})`)
+    .join(", ");
+  // Only the stats it is shown: a hidden stat's cap would tell it the stat is there.
+  const shown = new Set((items.stats ?? []).filter((stat) => stat.promptVisible).map((stat) => stat.id));
+  // And the most a worn or carried bonus may add, beside the stats.
+  const caps = (items.rarityCaps ?? [])
+    .map((cap) => ({
+      rarity: cap.rarity,
+      most: [
+        ...Object.entries(cap.stats ?? {}).filter(([id]) => shown.has(id)),
+        ...(cap.bonus !== undefined ? [["worn or carried bonus", cap.bonus] as [string, number]] : []),
+      ],
+    }))
+    .filter((cap) => cap.most.length > 0)
+    .map((cap) => `${cap.rarity} ${cap.most.map(([id, most]) => `${id} ${most}`).join(", ")}`)
+    .join("; ");
+  // What a worn or carried effect is on: the sheet's skills and saves, by name, since that is how the
+  // Game Master writes them.
+  const labels = (entries: ReadonlyArray<{ label: string }>) => entries.map((entry) => entry.label).join(", ");
+  const words = [
+    `categories ${ids(items.categories)}`,
+    ...(items.rarities?.length ? [`rarities ${ids(items.rarities)} (lowest first)`] : []),
+    ...(items.tags?.length ? [`tags ${ids(items.tags)}`] : []),
+    ...(stats ? [`stats ${stats}`] : []),
+    ...(items.slots?.length ? [`slots ${items.slots.map((slot) => `${slot.id} (${slot.count})`).join(", ")}`] : []),
+    ...(sheet.skills.length ? [`skills ${labels(sheet.skills)}`] : []),
+    ...(sheet.saves.length ? [`saves ${labels(sheet.saves)}`] : []),
+    ...(sheet.abilities.length ? [`abilities ${labels(sheet.abilities)}`] : []),
+  ].join("; ");
+  return [
+    `  To give an item this ruleset does not list, invent one of its items in the add: [inventory: action="add" item="New name" category="..." rarity="..." tags="a, b" stats="id=value, id=value" slots="id=count"${items.binding ? ` binds="yes|cursed"` : ""} worn="+1 Skill" summary="one line"]. Every part but item is optional. worn is what it does while worn, and carried="..." what it does while only carried: changes split by ";", each +N, -N, advantage, disadvantage, or fails (saves only), on skills or saves by name, or on checks or saves for all of them; +N or -N on an ability's name raises or lowers that ability${fights ? `; in a fight, +N, -N, advantage or disadvantage on attacks, and +N or -N on ${fights.defense ? `${normalizePromptText(fights.defense)} (defense${fights.counted.length ? `; an item's ${fights.counted.join(" or ")} stat already adds to it, so give one or the other` : ""})` : "defense"}` : ""}. A bonus or penalty to a skill, save or ability always goes in worn or carried, never in stats. To start from one of the ruleset's own items, add like="that item's exact name" (leave like out otherwise); what else you give replaces its parts${fights ? ", and a weapon made like one fights like it" : ""}. The Engine keeps only what this ruleset has${caps ? " and holds each number to the most its rarity allows" : ""}; the answer's note says what it changed, and from then on that name is that item.`,
+    `  Its words: ${words}.${caps ? ` The most at each rarity: ${caps}.` : ""}`,
+  ];
 }
 
 function buildWidgetSummaryLines(widgets: HudWidget[]): string[] {
@@ -467,6 +642,16 @@ export function buildGmSystemPrompt(ctx: GmPromptContext): string {
   }
   gameBlockLines.push(`</game>`);
   sections.push(...gameBlockLines);
+
+  if (ctx.tacticalBattlefieldContext) {
+    sections.push(
+      `<tactical_battlefield>`,
+      `This is the accepted generated board for the active tactical encounter:`,
+      ctx.tacticalBattlefieldContext,
+      `Keep later combat narration consistent with this resolved board and its terrain.`,
+      `</tactical_battlefield>`,
+    );
+  }
 
   sections.push(wrapGameInstructions(normalizePromptText(ctx.gameSystemPrompt) || DEFAULT_GAME_SYSTEM_PROMPT));
 
@@ -624,6 +809,352 @@ export function buildGmSystemPrompt(ctx: GmPromptContext): string {
  * Build the GM format reminder — injected as the last user message so the
  * output format and available commands sit closest to generation in context.
  */
+/** A re-throw in words: which faces are thrown again, and whether until they clear it. */
+function rerollWords(reroll: { upTo: number; mode: "once" | "until" }): string {
+  return `dice showing ${reroll.upTo} or less${reroll.mode === "until" ? ", until they show more" : ", once"}`;
+}
+
+/** Where a number on the sheet comes from, in the ruleset's own words, for a line that cannot say
+ *  the number itself because it differs for every character. */
+function describeSheetValue(
+  ruleset: import("@marinara-engine/shared").RulesetDefinition,
+  ref: import("@marinara-engine/shared").RulesetValueRef,
+): string {
+  const { sheet } = ruleset;
+  const labelOf = (entries: ReadonlyArray<{ id: string; label: string }>, id: string) =>
+    entries.find((entry) => entry.id === id)?.label ?? id;
+  if (ref.const !== undefined) return String(ref.const);
+  if (ref.field !== undefined) return `the sheet's ${labelOf(sheet.fields, ref.field)}`;
+  if (ref.derived !== undefined) return `the sheet's ${labelOf(sheet.derived, ref.derived)}`;
+  if (ref.abilityScore !== undefined) return `the sheet's ${labelOf(sheet.abilities, ref.abilityScore)}`;
+  if (ref.abilityMod !== undefined) return `the sheet's ${labelOf(sheet.abilities, ref.abilityMod)} modifier`;
+  if (ref.abilityModFromField !== undefined) {
+    return `the modifier of the ability the sheet's ${labelOf(sheet.fields, ref.abilityModFromField)} names`;
+  }
+  if (ref.skillMod !== undefined) return `the sheet's ${labelOf(sheet.skills, ref.skillMod)}`;
+  if (ref.saveMod !== undefined) return `the sheet's ${labelOf(sheet.saves, ref.saveMod)}`;
+  if (ref.livePool !== undefined) return `the ${labelOf(sheet.live.pools, ref.livePool)} left`;
+  if (ref.liveTrack !== undefined) {
+    const track = labelOf(sheet.live.tracks, ref.liveTrack);
+    if (ref.read === "penalty") return `the penalty from ${track}`;
+    if (ref.read === "remaining") return `the room left on ${track}`;
+    if (ref.read === "filled") return `the ${track} above its floor`;
+    return `the current ${track}`;
+  }
+  if (ref.listSum !== undefined) {
+    const list = sheet.lists.find((entry) => entry.id === ref.listSum!.list);
+    const column = list?.columns.find((entry) => entry.id === ref.listSum!.column)?.label ?? ref.listSum.column;
+    return `the ${column} of the sheet's ${list?.label ?? ref.listSum.list} added up`;
+  }
+  return "a number on the sheet";
+}
+
+/** The ruleset's own check line, in place of the built-in one. Everything in it is the ruleset's
+ *  validated, prompt-safe text; the Engine adds only the tag shape and the ladder. */
+function renderRulesetSkillCheckLine(
+  ruleset: import("@marinara-engine/shared").RulesetDefinition,
+  playerDiceRollSubmitted: boolean,
+  oneRequestDice: boolean,
+): string {
+  const resolution = ruleset.resolution;
+  // `with=` needs somewhere to go: a sheet with one ability has no other ability to roll with.
+  const withClause =
+    ruleset.sheet.abilities.length >= 2
+      ? [`Add with="Ability" to roll a skill or save with another ability than its own.`]
+      : [];
+  const branchClause = oneRequestDice
+    ? [
+        `When the outcome splits two ways, add branch="label" to this tag and write the branch block described under DICE.`,
+      ]
+    : [];
+  const whoClause = `Add who="Character Name" to roll for a party member; without it the player is checked.`;
+  // Every ruleset has a ladder, so every ruleset can be asked for a step by name.
+  const difficultyClause = `Or name a step with difficulty="Label" in place of dc.`;
+  // What having no training does, named by the section that says it or the skill or save that says
+  // its own, so the Game Master asks for checks a character can actually make.
+  const untrainedWords = (rule: import("@marinara-engine/shared").RulesetUntrained): string =>
+    rule === "refuse"
+      ? "cannot be attempted"
+      : rule === "harder"
+        ? "one step harder"
+        : typeof rule === "object"
+          ? `${rule.by > 0 ? "+" : ""}${rule.by}${resolution.kind === "dice-pool" ? (Math.abs(rule.by) === 1 ? " die" : " dice") : ""}`
+          : "";
+  const untrainedItems = [
+    ...ruleset.sheet.sections.flatMap((section) =>
+      section.untrained && section.untrained !== "normal"
+        ? [`${section.label} (${untrainedWords(section.untrained)})`]
+        : [],
+    ),
+    ...[...ruleset.sheet.skills, ...ruleset.sheet.saves].flatMap((entry) =>
+      entry.untrained && entry.untrained !== "normal" ? [`${entry.label} (${untrainedWords(entry.untrained)})`] : [],
+    ),
+  ];
+  const refusesAny =
+    ruleset.sheet.sections.some((section) => section.untrained === "refuse") ||
+    [...ruleset.sheet.skills, ...ruleset.sheet.saves].some((entry) => entry.untrained === "refuse");
+  // What the engine brings to a check on its own (#6832): the character's conditions and what they wear
+  // or carry. Taught where the ruleset has either, so the Game Master does not count them twice.
+  const effectSources = [...(ruleset.combat?.conditions ?? []), ...(ruleset.combat?.levels ?? [])];
+  const conditionsChange = effectSources.some(
+    (entry) =>
+      entry.effects.some((effect) => effect.startsWith("own-checks") || effect.startsWith("own-saves")) ||
+      (entry.modifiers ?? []).some((modifier) => modifier.to === "checks" || modifier.to === "saves") ||
+      !!entry.failsSaves?.length,
+  );
+  const failsAny = !!ruleset.items || effectSources.some((entry) => !!entry.failsSaves?.length);
+  const changedBy =
+    conditionsChange && ruleset.items
+      ? "conditions and what they wear or carry"
+      : conditionsChange
+        ? "conditions"
+        : "worn and carried items";
+  const effectsClause =
+    conditionsChange || ruleset.items
+      ? [
+          `The engine applies each character's own ${changedBy} to their checks and saves; do not add those yourself. A check marked from="..." says what changed it${
+            failsAny ? `, and automatic="true" a save that failed without a roll` : ""
+          }.`,
+        ]
+      : [];
+  const untrainedClause =
+    untrainedItems.length > 0
+      ? [
+          `Untrained checks: ${untrainedItems.join(", ")}.${
+            refusesAny
+              ? ` A check the engine marks reason="untrained" was not rolled: the character could not attempt it.`
+              : ""
+          }`,
+        ]
+      : [];
+
+  if (resolution.kind === "dice-pool") {
+    const { target, situationalDice, difficultyLadder, die, explode, double, botch, pool } = resolution;
+    // A face rule is taught only where the ruleset lets a check move it, and says what happens when
+    // nobody asks, which for a rule with no `from` is nothing at all.
+    const faceClause = (key: "explode" | "double", rule: typeof explode, does: string) =>
+      rule?.min === undefined
+        ? []
+        : [
+            `Add ${key}="N" to make dice showing N or more ${does} on this check, from ${rule.min} to ${die.sides}; without it ${
+              rule.from === undefined ? "none do" : `dice showing ${rule.from} or more do`
+            }.`,
+          ];
+    const [firstAbility, secondAbility] = ruleset.sheet.abilities;
+    const ladder = difficultyLadder
+      .map(
+        (step) =>
+          `${step.label} ${step.successes} ${step.successes === 1 ? "success" : "successes"}${
+            step.target === undefined ? "" : ` (target ${step.target})`
+          }`,
+      )
+      .join(", ");
+    return [
+      `- [skill_check: skill="Name" dc="N"] - ${ruleset.gm.checkGuidance}`,
+      `dc is how many successes the check needs.`,
+      `Difficulty: ${ladder}.`,
+      // The step's own target only means something where a step names one.
+      difficultyLadder.some((step) => step.target !== undefined)
+        ? `${difficultyClause} A step's target is the one the check counts with unless you add threshold.`
+        : difficultyClause,
+      whoClause,
+      // Both are offered only where this ruleset declares them, so the prompt never teaches an
+      // attribute the resolver would then ignore.
+      ...(target.min < target.max
+        ? [
+            `Add threshold="N" to move the per-die target, from ${target.min} to ${target.max}; without it the target is ${target.default}.`,
+          ]
+        : []),
+      ...(situationalDice
+        ? [
+            `Add bonus="+N" or bonus="-N" to add or take dice for this check, from ${situationalDice.min} to ${situationalDice.max}.`,
+          ]
+        : []),
+      // The standing re-throws the Game Master may name, each with the faces it throws again.
+      ...(resolution.reroll?.length
+        ? [
+            `When the rules let a roll be thrown again, add reroll="id": ${resolution.reroll
+              .map((reroll) => `${reroll.id} (${rerollWords(reroll)})`)
+              .join(", ")}.`,
+          ]
+        : []),
+      ...(resolution.spend ?? []).map((spend) => {
+        const pool = ruleset.sheet.live.pools.find((entry) => entry.id === spend.pool);
+        const buys = [
+          spend.successes ? `${spend.successes} automatic ${spend.successes === 1 ? "success" : "successes"}` : "",
+          spend.dice ? `${spend.dice} extra ${spend.dice === 1 ? "die" : "dice"}` : "",
+          spend.reroll ? `a throw again of ${rerollWords(spend.reroll)}` : "",
+        ]
+          .filter(Boolean)
+          .join(" and ");
+        // How many purchases one check may make, said the way the ruleset set it: a number, the check's
+        // own dice, or a number on each character's sheet, which the engine reads for whoever rolls.
+        const cap =
+          typeof spend.perCheck === "number"
+            ? `up to ${spend.perCheck} ${spend.perCheck === 1 ? "time" : "times"} per check`
+            : spend.perCheck === "pool"
+              ? `up to as many times per check as the check has dice`
+              : `up to as many times per check as ${describeSheetValue(ruleset, spend.perCheck)}`;
+        // Taught only where this ruleset declares it, so the prompt never offers a purchase the
+        // resolver would then ignore. What it costs and what it buys are said in the ruleset's own
+        // words; the engine works out both, and a pool that cannot cover it buys nothing.
+        return `When the player spends to change a roll, add spend="${spend.pool}:N" to that same check: every ${spend.amount} ${pool?.label ?? spend.pool} buys ${buys}, ${cap}. Do not also write a sheet command for it, and do not change the dice yourself.`;
+      }),
+      // Taught whenever this ruleset has any entry that changes a check. What each one DOES is the
+      // entry's own business and the Engine reads it; the Game Master only names it.
+      ...((ruleset.catalogs ?? []).some(
+        (catalog) =>
+          catalog.holds === "rows" &&
+          (catalog.asset || (catalog.entries ?? []).some((entry) => entry.mechanics?.check)),
+      )
+        ? [
+            `When a character uses something from their sheet to change a roll, add use="Its name" to that same check. Do not write a separate sheet command for it: the engine pays for it and applies it on the same roll.`,
+          ]
+        : []),
+      ...faceClause("explode", explode, "roll one more die"),
+      ...faceClause("double", double, "count twice"),
+      ...withClause,
+      ...untrainedClause,
+      ...effectsClause,
+      // Named with this ruleset's own first two abilities, so the example is never another game's.
+      ...(pool.abilityPlusAbility && firstAbility && secondAbility
+        ? [
+            `On an ability check, with= adds a second ability's dice: skill="${firstAbility.label}" with="${secondAbility.label}".`,
+          ]
+        : []),
+      ...(botch?.rule === "halfOrMore"
+        ? [
+            `A check the engine marks complication="true" kept its result, but something went wrong alongside it: narrate both.`,
+          ]
+        : []),
+      `Do NOT write rolls, modifier, total or result: the engine rolls the pool from the character sheet and counts the successes.`,
+      ...branchClause,
+    ].join(" ");
+  }
+
+  const { dice, advantage, difficultyLadder } = resolution;
+  const ladder = difficultyLadder.map((step) => `${step.label} ${step.dc}`).join(", ");
+  const playerDie = playerDiceRollSubmitted && dice.count === 1 && dice.sides === 20;
+  return [
+    `- [skill_check: skill="Name" dc="N"${playerDie ? ` rolls="the player's d20 result"` : ""}] - ${ruleset.gm.checkGuidance}`,
+    `Difficulty: ${ladder}.`,
+    difficultyClause,
+    whoClause,
+    ...(advantage ? [`Add mode="advantage" or mode="disadvantage" when the rules grant one.`] : []),
+    ...withClause,
+    ...untrainedClause,
+    ...effectsClause,
+    playerDie
+      ? `Use the player's exact die. Do NOT write modifier, total or result: the engine applies the character sheet.`
+      : `Do NOT write rolls, modifier, total or result: the engine rolls ${dice.count}d${dice.sides} and applies the character sheet.`,
+    ...branchClause,
+  ].join(" ");
+}
+
+/** The sheet command, the ruleset's own guidance for it, and the party's sheets as they stand.
+ *  The command grammar is the Engine's and is the same for every ruleset; every NAME in it (pools,
+ *  tracks, conditions, rests) comes from the ruleset and is shown on the sheets themselves. */
+function renderRulesetSheetSection(
+  ruleset: import("@marinara-engine/shared").RulesetDefinition,
+  sheetBlocks: string[],
+): string[] {
+  const blocks = sheetBlocks.map((block) => block.trim()).filter(Boolean);
+  if (blocks.length === 0) return [];
+  const names = (entries: ReadonlyArray<{ label: string }>) => entries.map((entry) => entry.label).join(", ");
+  // A wound track is marked with a kind of harm rather than counted, so it has a command of its own
+  // and is listed apart from the tracks `op="track"` moves.
+  const woundTracks = ruleset.sheet.live.tracks.flatMap((track) =>
+    (track.levels || track.boxes) && track.kinds ? [{ ...track, kinds: track.kinds }] : [],
+  );
+  const plainTracks = ruleset.sheet.live.tracks.filter((track) => !track.levels && !track.boxes);
+  const lines = [
+    ``,
+    `CHARACTER SHEETS:`,
+    `The Engine keeps every character sheet. Record each change with one command per change, written where it happens:`,
+    `- [sheet: who="Name" op="spend" pool="Pool" amount="N"] - uses up a resource. Refused when not enough is left.`,
+    `- [sheet: who="Name" op="restore" pool="Pool" amount="N"] - gives it back, up to the maximum (healing included).`,
+    `- [sheet: who="Name" op="damage" pool="Pool" amount="N"] - takes it away, temporary points first.`,
+    `- [sheet: who="Name" op="temp" pool="Pool" amount="N"] - sets temporary points on a pool that has them.`,
+    `- [sheet: who="Name" op="track" track="Track" by="+1"] - or to="N" to set it.`,
+    ...(woundTracks.length > 0
+      ? [
+          `- [sheet: who="Name" op="damage" track="Track" kind="Kind" amount="N"] - marks harm of that kind on a wound track; a negative amount heals marks of that kind, or the lightest when kind is left out.`,
+          // Taught only where a track fills by box, since everywhere else a box number means nothing.
+          ...(woundTracks.some((track) => track.fill === "indexed")
+            ? [
+                `  On a track that fills by box, add box="N" for the box the hit lands on; it takes the next free box above when that one is marked, and is refused when none is free.`,
+              ]
+            : []),
+        ]
+      : []),
+    `- [sheet: who="Name" op="condition" condition="Condition" state="on|off"]`,
+    ...(ruleset.sheet.live.states.length > 0
+      ? [`- [sheet: who="Name" op="state" state="State" value="Value"] - sets a state to one of its values.`]
+      : []),
+    `- [sheet: who="Name" op="note" field="Field" value="text"] - an empty value clears it.`,
+    ...(ruleset.rests.length > 0
+      ? [`- [sheet: who="Name" op="rest" rest="Rest"] - rests: ${names(ruleset.rests)}.`]
+      : []),
+    // Only a ruleset with catalogs of ROWS has entries to use: a bestiary or an item catalog writes
+    // nothing onto a sheet, so without one of those nothing on a sheet carries a price the Engine
+    // could pay, and the line would describe a command that always refuses.
+    ...(ruleset.catalogs?.some((catalog) => catalog.holds === "rows")
+      ? [
+          `- [sheet: who="Name" op="use" name="Name on the sheet"] - pays what that ability costs. Add pool="Pool" to pay from a higher pool of the same group.`,
+        ]
+      : []),
+    `Leave out who for the player; who="party" applies to every member. Use the pool, track, field and condition names shown on the sheets. Never write result, reason or now yourself: the Engine adds them. A refused command did not happen, so do not narrate it as if it had.`,
+    // A sheet block leaves out a track or a note that still has its default, so the names a command
+    // can use are listed once here.
+    ...(plainTracks.length > 0
+      ? [
+          `Tracks: ${plainTracks
+            .map(
+              (track) =>
+                `${track.label} (${track.min} to ${typeof track.max === "number" ? track.max : "the character's own maximum"})`,
+            )
+            .join(", ")}.`,
+        ]
+      : []),
+    // Best rung to worst, and the kinds a mark may be, so a damage command names real ones.
+    ...(woundTracks.length > 0
+      ? [
+          `Wound tracks: ${woundTracks
+            .map(
+              (track) =>
+                `${track.label} (${track.levels ? `${track.levels[0]!.label} to ${track.levels[track.levels.length - 1]!.label}` : "numbered boxes"}${track.fill === "indexed" ? ", fills by box" : ""}${track.onFull === "refuse" || track.fill === "indexed" ? ", refuses a mark when full" : ""}; ${track.kinds.map((kind) => kind.id).join(", ")})`,
+            )
+            .join(", ")}.`,
+        ]
+      : []),
+    ...(ruleset.sheet.live.text.length > 0 ? [`Note fields: ${names(ruleset.sheet.live.text)}.`] : []),
+    ...(ruleset.sheet.live.conditions.length > 0 ? [`Conditions: ${names(ruleset.sheet.live.conditions)}.`] : []),
+    // Every value a state may take, by the name the sheets show, so a command names a real one.
+    ...(ruleset.sheet.live.states.length > 0
+      ? [
+          `States: ${ruleset.sheet.live.states
+            .map(
+              (state) =>
+                `${state.label} (${state.values.map((value) => state.valueLabels?.[value] ?? value).join(", ")})`,
+            )
+            .join(", ")}.`,
+        ]
+      : []),
+    ...(ruleset.gm.sheetGuidance ? [ruleset.gm.sheetGuidance] : []),
+    ``,
+    // The sheets are data, and part of that data is free text (names, notes the model wrote with
+    // the note command on an earlier turn). The tag marks where data starts and stops; the values
+    // inside have had angle brackets removed, so nothing in them can close it. The ruleset's own
+    // guidance above is not wrapped: it is a trusted package's one-line text, held to the same
+    // `promptSafeText` rule as its check guidance.
+    `<character_sheets>`,
+  ];
+  for (const block of blocks) lines.push(block, ``);
+  lines.pop();
+  lines.push(`</character_sheets>`);
+  return lines;
+}
+
 export function buildGmFormatReminder(
   ctx: Pick<
     GmPromptContext,
@@ -640,6 +1171,12 @@ export function buildGmFormatReminder(
     | "playerName"
     | "characterSprites"
     | "playerInventory"
+    | "partyInventory"
+    | "inventoryItemFacts"
+    | "inventoryBearers"
+    | "inventoryPurses"
+    | "market"
+    | "rulesetLayerOptions"
     | "language"
     | "rating"
     | "enableQuickTimeEvents"
@@ -649,6 +1186,14 @@ export function buildGmFormatReminder(
     addressMode?: "party" | "gm";
     /** Whether the current player turn already includes a resolved [dice: ...] roll. */
     playerDiceRollSubmitted?: boolean;
+    /** The ruleset this game pinned, when the install can honour it. Its check guidance and
+     *  difficulty ladder replace the built-in skill-check lines. Absent is the Engine's own rules
+     *  and renders today's reminder byte for byte. */
+    ruleset?: import("@marinara-engine/shared").RulesetDefinition;
+    /** One rendered sheet block per party member (`renderRulesetSheetBlock`), current as of this
+     *  turn. They live in this late reminder and never in the system prompt, because live state
+     *  changes every turn and the system prompt is what a provider caches. Only read with `ruleset`. */
+    rulesetSheetBlocks?: string[];
     /** Built-in systems an installed experience replaces with its own. Undeclared systems stay built-in. */
     experienceProvidedSystems?: { inventory?: boolean };
     /** Rendered COMMANDS lines for the verbs an installed experience declares (#5798). They belong
@@ -679,6 +1224,11 @@ export function buildGmFormatReminder(
   // One-request dice (#6215). Everything this gates is additive: with the switch
   // off every line below renders exactly the bytes it renders today.
   const oneRequestDice = ctx.oneRequestDice === true;
+  // A die the player threw is one d20, so it stands in only for a ruleset that rolls exactly that.
+  // A pool ruleset has no `dice` at all, which is why the kind is read before the count.
+  const rulesetResolution = ctx.ruleset?.resolution;
+  const rulesetRollsOneD20 =
+    rulesetResolution?.kind === "dice-sum" && rulesetResolution.dice.count === 1 && rulesetResolution.dice.sides === 20;
 
   const partyNames = normalizePromptTextList(ctx.partyNames);
   const hasParty = partyNames.length > 0;
@@ -704,15 +1254,66 @@ export function buildGmFormatReminder(
   // An experience that tracks items itself owns the whole loop, so asking the GM for [inventory:] here
   // would only produce commands nothing consumes.
   const experienceOwnsInventory = ctx.experienceProvidedSystems?.inventory === true;
+  // A nicknamed item is shown with its own name too, which is how the Game Master can also name it.
+  const inventoryName = (item: { name?: unknown; ownName?: unknown } | undefined) => {
+    const name = normalizePromptText(item?.name);
+    const own = normalizePromptText(item?.ownName);
+    return name && own && own.toLowerCase() !== name.toLowerCase() ? `${name} (${own})` : name;
+  };
+  // A ruleset item also says what it is, from its ruleset: category, rarity, tags and visible stats.
+  const itemFacts = (item: { item?: unknown } | undefined) => {
+    const facts = typeof item?.item === "string" ? ctx.inventoryItemFacts?.[item.item] : undefined;
+    const text = normalizePromptText(facts);
+    return text ? { facts: text } : {};
+  };
+  // How many of an item are worn and bound, in the ruleset's own word for bound.
+  const bindingName = normalizePromptText(ctx.ruleset?.items?.binding?.label);
+  const bindingLabel = bindingName.toLowerCase();
+  const itemWorn = (
+    item: { equipped?: unknown; bound?: unknown; charges?: Array<{ now: number; max: number }> } | undefined,
+  ) => {
+    const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
+    // What an item that holds charges has left, each stack's: "2 of 3 charges left".
+    const charges = Array.isArray(item?.charges)
+      ? item.charges.filter((entry) => Number.isFinite(entry?.now) && Number.isFinite(entry?.max))
+      : [];
+    const worn = [
+      ...(count(item?.equipped) ? [`${count(item?.equipped)} worn`] : []),
+      ...(count(item?.bound) ? [`${count(item?.bound)} ${bindingLabel || "bound"}`] : []),
+      ...(charges.length ? [`${charges.map((entry) => `${entry.now} of ${entry.max}`).join(", ")} charges left`] : []),
+    ].join(", ");
+    return worn ? { worn } : {};
+  };
+  const coins = ctx.ruleset ? rulesetLayeredCurrencies(ctx.ruleset, ctx.rulesetLayerOptions) : [];
+  const bearerFor = (holder: string | undefined) =>
+    [
+      bearerNote(ctx.inventoryBearers?.[gameInventoryBagKey(holder)], bindingName),
+      normalizePromptText(ctx.inventoryPurses?.[gameInventoryBagKey(holder)]),
+    ]
+      .filter(Boolean)
+      .join("; ");
   const playerInventory = Array.isArray(ctx.playerInventory)
     ? ctx.playerInventory.flatMap((item) => {
-        const name = normalizePromptText(item?.name);
+        const name = inventoryName(item);
         if (!name) return [];
         const quantity =
           typeof item?.quantity === "number" && Number.isFinite(item.quantity) ? Math.max(1, item.quantity) : 1;
-        return [{ name, quantity }];
+        return [{ name, quantity, ...itemWorn(item), ...itemFacts(item) }];
       })
     : [];
+  // Bags other than the player's, each with a name to show; only these make the block per member.
+  const partyBags = (Array.isArray(ctx.partyInventory) ? ctx.partyInventory : []).flatMap((bag) => {
+    const holder = bag.holder ? normalizePromptText(bag.holder) : "";
+    const items = (Array.isArray(bag.items) ? bag.items : []).flatMap((item) => {
+      const name = inventoryName(item);
+      if (!name) return [];
+      const quantity =
+        typeof item?.quantity === "number" && Number.isFinite(item.quantity) ? Math.max(1, item.quantity) : 1;
+      return [{ name, quantity, ...itemWorn(item), ...itemFacts(item) }];
+    });
+    return items.length > 0 ? [{ holder, items, note: bearerFor(bag.holder) }] : [];
+  });
+  const carriedByOthers = partyBags.some((bag) => bag.holder);
 
   // ── Current State (closest to generation) ──
   lines.push(
@@ -802,7 +1403,9 @@ export function buildGmFormatReminder(
   );
 
   // The engine supplies numbers before the GM writes outcome narration.
-  if (ctx.playerDiceRollSubmitted) {
+  if (ctx.ruleset) {
+    lines.push(renderRulesetSkillCheckLine(ctx.ruleset, ctx.playerDiceRollSubmitted === true, oneRequestDice));
+  } else if (ctx.playerDiceRollSubmitted) {
     lines.push(
       `- [skill_check: skill="Skill Name" dc="1-20" rolls="the player's d20 result"] - use the player's exact die and choose a fair DC (5 trivial, 10 routine under pressure, 15 hard, 20 desperate). Do NOT write modifier, total or result: the engine applies their character-sheet modifiers.`,
     );
@@ -821,7 +1424,12 @@ export function buildGmFormatReminder(
         ? ` When the number does not fork the prose, write a [[roll: 3d8+2]] placeholder in the sentence instead of this tag and keep writing.`
         : ""
     }`,
-    `- For other checks, declare the actual notation: [skill_check: skill="Endurance" dc="12" dice="3d6+2"]. These use the notation's modifier, not d20 character-sheet modifiers. For a pool, declare the per-die threshold and required successes: [skill_check: skill="Intimidation" dc="4" dice="6d10" resolution="successes" threshold="6"]. Each die at or above threshold counts once; dc is the number of successes needed. Exploding dice, botches, or other special pool rules are not implemented. Never invent pool results or omit its threshold.`,
+    // A ruleset game has one rules system, so the line teaching other notations is dropped.
+    ...(ctx.ruleset
+      ? []
+      : [
+          `- For other checks, declare the actual notation: [skill_check: skill="Endurance" dc="12" dice="3d6+2"]. These use the notation's modifier, not d20 character-sheet modifiers. For a pool, declare the per-die threshold and required successes: [skill_check: skill="Intimidation" dc="4" dice="6d10" resolution="successes" threshold="6"]. Each die at or above threshold counts once; dc is the number of successes needed. Exploding dice, botches, or other special pool rules are not implemented. Never invent pool results or omit its threshold.`,
+        ]),
     // The stop-at-the-attempt line is exactly the instruction the second request exists to
     // serve, so it is dropped while the turn has to finish itself.
     ...(oneRequestDice
@@ -845,7 +1453,61 @@ export function buildGmFormatReminder(
     ...(experienceOwnsInventory
       ? []
       : [
-          `- [inventory: action="add|remove" item="Item A, Item B" count="3"] - every real item gain or loss, keep names short and use count/quantity for stacked items.`,
+          `- [inventory: action="add|remove|give" item="Item A, Item B" count="3" who="Name" to="Name"] - every real item gain or loss, keep names short and use count/quantity for stacked items. Everyone in the party carries their own things: who is whose bag an item goes into or comes out of, and leaving it out means the player (a remove without who then takes from the rest of the party once the player has none). A give hands items from who to to. An item listed as "Nickname (Name)" is one item: write either name in item, never both. Never write result, reason or now yourself: the Engine adds them, and a refused one did not happen.`,
+          ...(ctx.ruleset?.catalogs?.some((catalog) => catalog.holds === "items")
+            ? [
+                `  This game's ruleset has its own items: an item named exactly as one of them becomes that item, and what an item of the ruleset is shows in [brackets] after it in the inventory below (never write the brackets in item).`,
+              ]
+            : []),
+          ...(ctx.ruleset?.items?.native === false
+            ? [
+                `  This ruleset has no untyped items: an add must name one of its items${ctx.ruleset.items.propose !== false ? " or invent one of its items as below" : ""}, and any other name is refused as not-ruleset-item. More of something already held can still be added.`,
+              ]
+            : []),
+          ...(ctx.ruleset?.items && ctx.ruleset.items.propose !== false
+            ? inventGrammarLines(
+                ctx.ruleset.items,
+                ctx.ruleset.sheet,
+                ctx.ruleset.combat
+                  ? {
+                      defense: rulesetDefenseLabel(ctx.ruleset),
+                      // Only a stat the Game Master is shown is named.
+                      counted: rulesetItemStatsRead(ctx.ruleset, ctx.ruleset.combat.defense).filter(
+                        (id) => ctx.ruleset!.items?.stats?.find((stat) => stat.id === id)?.promptVisible !== false,
+                      ),
+                    }
+                  : undefined,
+              )
+            : []),
+          ...(ctx.ruleset?.items?.carry
+            ? [
+                `  Everyone carries only so much: an add with who left out goes to whoever can carry it (the player first), and the answer says who got it; what nobody can carry is refused as too-heavy and stays behind.`,
+              ]
+            : []),
+          ...(ctx.ruleset?.items?.slots?.length || ctx.ruleset?.items?.binding
+            ? [wearGrammarLine(Boolean(ctx.ruleset.items.slots?.length), ctx.ruleset.items.binding?.label)]
+            : []),
+          ...(ctx.ruleset?.catalogs?.some((catalog) => catalog.holds === "items")
+            ? [
+                `- [inventory: action="use" item="Name" who="Name"] - when a character uses one of the ruleset's items whose [brackets] say "use (...)". The Engine rolls what it does to whoever uses it, writes that on their sheet and spends the item, and the answer says what happened: narrate that, and what it does to anybody else. A player's message may end with an [item_used] block: the Engine already used that item the same way, so narrate it and never use or remove it again.`,
+              ]
+            : []),
+          ...(coins.length
+            ? [
+                `- [inventory: action="pay" amount="5 ${coins[0]!.units.at(-1)!.label}" who="Name"] and [inventory: action="earn" amount="12 ${coins[0]!.units[0]!.label}" who="Name"] - when a character pays for something or is paid, in the ruleset's coins (${promptCoins(coins)}). Coins are items in each character's purse: a payment comes out of that character's purse (the player's with who left out), inside the coin's own family, with change in its smaller coins, and one they cannot afford is refused; an earning goes into the bags as an add does. The answer says what was paid and what is left: narrate exactly that. ${ctx.ruleset?.items?.market ? "Buying is a buy (below)" : "Buying is a payment and then an add"}; never add or remove coins any other way.`,
+              ]
+            : []),
+          ...(ctx.ruleset?.items?.market
+            ? [
+                `- [place: name="Name" size="${ctx.ruleset.items.market.places.at(-1)!.label}"] - whenever the scene moves to a new place, with its size, one of: ${ctx.ruleset.items.market.places.map((place) => place.label).join(", ")} (smallest first). Leave size out for somewhere with no market (a road, the wilds). The Engine keeps the last place said until you say another, and the MARKET block below shows what it sells.`,
+                `- [inventory: action="buy" item="Name" count="1" level="${ctx.ruleset.items.market.prices.find((level) => level.default)!.label}" seller="Seller" who="Name"] - when a character buys something, instead of paying and adding it yourself. Levels: ${ctx.ruleset.items.market.prices.map((level) => `${level.label} ×${level.times}${level.default ? " (the default)" : ""}`).join(", ")}; haggling or a seller's mood moves the level, never the price. The Engine checks the place and the seller sell it, prices it, takes the price from the buyer's purse (the player's with who left out) and puts it in their bag (a service only pays), and the answer says what it cost or why not: narrate exactly that.`,
+              ]
+            : []),
+          ...(ctx.ruleset?.items?.lootTables?.length
+            ? [
+                `- [loot: table="id" who="Name"] - when the party finds a hoard, searches the fallen or is rewarded, instead of adding the items yourself. The Engine rolls the ruleset's table and puts what it drops into the bags as an add would (who="..." for one character's), and the answer says what dropped: narrate exactly that. Tables: ${promptLootTables(ctx.ruleset.items.lootTables)}. A won fight already dropped its own loot, which the combat result lists: never roll a table for it again.`,
+              ]
+            : []),
         ]),
     `- [Note: contents] or [Book: contents] - when a new readable note or book is acquired and should be tracked in the journal.`,
     `- [state: exploration|dialogue|combat|travel_rest] - only on actual mode transitions. If you're planning to use [state: combat], this one ALWAYS has to be at the end of the turn, as it initiates a new combat generation and UI.`,
@@ -894,7 +1556,7 @@ export function buildGmFormatReminder(
       ``,
       sightedPool
         ? `- ONLY IF THE NUMBER ITSELF HAS TO DECIDE BETWEEN THREE OR MORE DIFFERENT OUTCOMES, spend a pool value instead: write the value shown below into the check's rolls= and name its slot with pool=, then narrate what it meant in this same turn.`
-        : `- ONLY IF THE NUMBER ITSELF HAS TO DECIDE BETWEEN THREE OR MORE DIFFERENT OUTCOMES, ask for the value instead: write [skill_check: skill="Skill Name" dc="1-20"] or [dice: 3d8+2] and stop at the attempt. The engine rolls it and records it. Narrate what it meant at the start of your next turn.`,
+        : `- ONLY IF THE NUMBER ITSELF HAS TO DECIDE BETWEEN THREE OR MORE DIFFERENT OUTCOMES, ask for the value instead: write [skill_check: skill="Skill Name" dc="${ctx.ruleset ? "N" : "1-20"}"] or [dice: 3d8+2] and stop at the attempt. The engine rolls it and records it. Narrate what it meant at the start of your next turn.`,
       ``,
       `- A check you write in none of these forms is rolled by the engine and recorded, and this turn ends without its outcome; narrate what the number meant at the start of your next turn.`,
       ``,
@@ -914,13 +1576,20 @@ export function buildGmFormatReminder(
       `DICE:`,
       `- roll_dice is a real die you can throw. Call it the moment you need an actual number before you can keep writing - an attack, a save, damage, a random outcome the scene then reacts to - passing the notation (for example "1d20+3") and a short reason.`,
       `- Never invent a die result. Wait for the number the tool gives you, then narrate what it means, once, in this same turn.`,
-      `- If roll_dice has already returned a skill check's roll, override the sparse-check instructions above: write a complete [skill_check: skill="Skill Name" dc="chosen DC" rolls="actual tool rolls joined with |" modifier="tool modifier" total="tool total" result="critical_success|success|failure|critical_failure" resolution="sum" dice="tool notation"] record using that result. Do not request another engine roll or stop at the attempt; narrate its consequence in this same turn. Use the sparse form only when no roll result is available.`,
-      ctx.playerDiceRollSubmitted
+      // A ruleset game's checks come from the character sheet, so a tool-made modifier is never
+      // the record: the engine would roll such a tag again and contradict the narration.
+      ctx.ruleset
+        ? `- Do not use roll_dice for an ability check, skill check or saving throw. Write the [skill_check: ...] tag above without numbers and the engine rolls it from the character sheet.`
+        : `- If roll_dice has already returned a skill check's roll, override the sparse-check instructions above: write a complete [skill_check: skill="Skill Name" dc="chosen DC" rolls="actual tool rolls joined with |" modifier="tool modifier" total="tool total" result="critical_success|success|failure|critical_failure" resolution="sum" dice="tool notation"] record using that result. Do not request another engine roll or stop at the attempt; narrate its consequence in this same turn. Use the sparse form only when no roll result is available.`,
+      // A player's d20 only stands in for a check where a single d20 is what the rules roll.
+      ctx.playerDiceRollSubmitted && (!rulesetResolution || rulesetRollsOneD20)
         ? `- The player already threw for this turn. Use their roll rather than calling the tool again for the same action.`
         : `- A skill check is still written down with the [skill_check: ...] tag above. roll_dice is how you get a number your narration needs in hand; it does not replace that record.`,
       `- If the tool is not available to you on this connection, work from the tag alone and say nothing about tools.`,
     );
   }
+
+  if (ctx.ruleset) lines.push(...renderRulesetSheetSection(ctx.ruleset, ctx.rulesetSheetBlocks ?? []));
 
   // The installed experience's own verbs, last in the block so the built-ins keep their order. Each
   // line already arrives fully rendered from the verb runtime; nothing here inspects or reformats it.
@@ -969,9 +1638,22 @@ export function buildGmFormatReminder(
 
   // Inventory context. Skipped when an experience owns items: an older save can still carry a stale
   // built-in list, which would contradict the inventory the player has on screen.
-  if (!experienceOwnsInventory && playerInventory.length > 0) {
-    lines.push(``, `PLAYER INVENTORY: ${buildCompactInventoryLine(playerInventory)}`);
+  if (!experienceOwnsInventory && carriedByOthers) {
+    const playerLabel = normalizePromptText(ctx.playerName) || "Player";
+    lines.push(
+      ``,
+      `PARTY INVENTORY:`,
+      ...partyBags.map(
+        (bag) =>
+          `- ${bag.holder || playerLabel}${bag.note ? ` (${bag.note})` : ""}: ${buildCompactInventoryLine(bag.items)}`,
+      ),
+    );
+  } else if (!experienceOwnsInventory && playerInventory.length > 0) {
+    const note = bearerFor(undefined);
+    lines.push(``, `PLAYER INVENTORY${note ? ` (${note})` : ""}: ${buildCompactInventoryLine(playerInventory)}`);
   }
+
+  if (ctx.market) lines.push(``, ctx.market);
 
   const specialInstructions = normalizePromptText(ctx.gameSpecialInstructions);
   if (specialInstructions) {
@@ -1002,6 +1684,10 @@ export interface SetupPromptContext {
   customHudWidgets?: HudWidget[];
   /** Selected constant lorebook canon to bake into world generation */
   lorebookContext?: string | null;
+  /** `gm.worldGuidance` from the game's pinned ruleset, with its active layers appended. The only
+   *  ruleset text world generation reads: everything else a ruleset says reaches the per-turn
+   *  reminder instead, because the world is designed once and the sheets change every turn. */
+  rulesetWorldGuidance?: string | null;
   /** Language for natural-language JSON values */
   language?: string;
   /** User-overridable GM instruction body that will be used after setup. */
@@ -1071,6 +1757,15 @@ export function buildSetupPrompt(ctx: SetupPromptContext = {}): string {
       `Selected constant lorebook canon that MUST be treated as true for this world:`,
       ctx.lorebookContext.trim(),
       `</lorebook_context>`,
+    );
+  }
+  const rulesetWorldGuidance = normalizePromptText(ctx.rulesetWorldGuidance);
+  if (rulesetWorldGuidance) {
+    contextSections.push(
+      `<ruleset_world>`,
+      `This game runs on a rules system its author wrote. Design the world so it fits these rules:`,
+      rulesetWorldGuidance,
+      `</ruleset_world>`,
     );
   }
   if (ctx.customHudWidgets?.length) {

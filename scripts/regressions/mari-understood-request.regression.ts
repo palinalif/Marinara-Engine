@@ -230,12 +230,16 @@ assert.doesNotMatch(
   "the report may only state observed outcomes - never assert an execution the server never saw",
 );
 const settingsPanel = readSource("packages/client/src/components/panels/SettingsPanel.tsx");
-assert.match(settingsPanel, /\.catch\(\(\) => undefined\);/u);
+assert.match(
+  settingsPanel,
+  /mariStatus\.isError \? undefined/u,
+  "a failed status request reads as unavailable instead of blocking the copy",
+);
 assert.match(settingsPanel, /mariActingOn,/u, "the diagnostics copy must include the triage line");
 assert.match(
   settingsPanel,
-  /workspace\/status", \{ signal: requestTimeoutSignal\(5_000\) \}/u,
-  "the status fetch carries a deadline - a frozen host must not turn the copy button into a silent no-op (#5657)",
+  /workspace\/status", \{ signal: requestTimeoutSignal\(5_000, signal\) \}/u,
+  "the status fetch carries a deadline - a frozen host must not leave the copy button disabled (#5657)",
 );
 
 console.log("Mari understood-request regression passed.");

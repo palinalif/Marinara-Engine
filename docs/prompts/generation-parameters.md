@@ -15,7 +15,7 @@ Change these settings only when you want to fix a specific problem. This guide l
 Edit base values under **Presets > Parameters**, connection values under **Connections > Default Parameters**, and chat overrides under **Chat Settings > Advanced Parameters**.
 
 1. Open the chat you want to change.
-2. Open **Chat Settings** (the gear icon for the active chat).
+2. Open **Chat Settings** (the **Chat Settings** button in the chat, at the top right unless you moved it).
 3. Find the **Advanced Parameters** section and click it to expand it.
 
 You should see a help note that reads: "Override generation parameters for this chat. Only change these if you know what you're doing." Every setting below sits inside **Advanced Parameters**.
@@ -60,12 +60,12 @@ In a chat's **Advanced Parameters**, only **Max Output Tokens** and **Reasoning 
 
 ## Default values
 
-The table shows fallback values displayed by the parameter editor and the default Send switches. These are not necessarily the values sent to the model: without a preset, generation starts at `4096` output tokens before connection and chat overrides. Mode rules can then set `8192` for an active scene or `16384` for Game. The **Effective** line shows the resolved value.
+The table shows fallback values displayed by the parameter editor and the default Send switches. These are not necessarily the values sent to the model: without a preset, generation starts at `4096` output tokens before connection and chat overrides. An active scene can use `8192`. Game uses saved connection and chat parameters, with task defaults only for unconfigured values. The **Effective** line shows the resolved value.
 
 | Parameter | Starting value | Sent by default |
 |---|---|---|
 | Temperature | 1 | No |
-| Max Output Tokens | 4096 in Conversation, 8192 in Roleplay and Game | Yes |
+| Max Output Tokens | 4096 in Conversation, 8192 in Roleplay; no Game override | Yes |
 | Top P | 1 | No |
 | Top K | 0 (off) | No |
 | Frequency | 0 | No |
@@ -125,6 +125,10 @@ Leave it on unless you have a clear reason to feed old reasoning back into the m
 
 Use this for models that cannot see images. When you turn it on, pick a connection in the **Captioning Connection** dropdown. A text-only endpoint may fail if you point it at the wrong connection. This setting is off by default.
 
+The **Captioning Prompt** box below the dropdown holds the instructions sent with each image. Edit it to change the descriptions, for example to ask for more detail. The reset button next to the label brings back the default prompt, and so does clearing the box. The prompt is saved for this chat only, and **Save as Connection Default** does not copy it.
+
+If captioning fails, for example because the captioning connection is broken, deleted, or sends back nothing, the reply stops with an **Image captioning failed** error. Marinara does not send the image itself instead. Fix or change the captioning connection, or turn Image Captioning off.
+
 ## Save as Connection Default
 
 At the bottom of **Advanced Parameters**, the **Save as Connection Default** button writes your current parameter values onto the connection itself. After that, new chats using that same connection start from these values.
@@ -140,7 +144,7 @@ Parameters are resolved one field at a time, in this order:
 1. The selected preset's **Parameters**, or built-in generation defaults when no preset is used (temperature `1`, maximum output `4096`). In Roleplay, a connection's preset override takes precedence over the chat's selected preset.
 2. The connection's **Default Parameters**.
 3. This chat's **Advanced Parameters**.
-4. Mode rules: an active scene chat sets output to `8192`, reasoning to **Maximum**, and verbosity to **High**. Game sets output to `16384` and reasoning to **Maximum**, with temperature/top-p at `1` and top-k, min-p, and repetition penalties at `0`. Gemma Game connections keep their sampling settings and use an output budget of at least `16384`.
+4. Mode rules: an active scene chat sets output to `8192`, reasoning to **Maximum**, and verbosity to **High**. Game uses the saved connection and chat parameters without forcing sampling, reasoning, or a minimum output size. Its helper calls also honor saved parameters; task defaults apply only when a value is not configured.
 5. Output limits: Game applies the model's known output limit, and the connection's **Max Output Tokens override** caps requests in every mode. Available context can reduce the output budget further.
 
 The **Effective** line beside a parameter shows the saved value and its winning layer, including mode rules and output caps. In the connection editor it uses the currently open chat with that connection, or a Roleplay baseline when no chat is open. Save edits to refresh it. A disabled Send switch is shown as **not sent**; providers can still impose required parameters or normalize unsupported values. Custom Parameters and context fitting may further change the final request.

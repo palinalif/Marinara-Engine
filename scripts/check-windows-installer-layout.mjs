@@ -95,6 +95,19 @@ try {
       message: "Every Windows installer pnpm runner must capture, trim, and compare its reported version exactly.",
     });
   }
+  // #6984: ExecToStack keeps git's trailing newline. An untrimmed HEAD never equaled the trimmed
+  // release commit, so every update of an existing install stopped with "did not land on the expected commit".
+  const commitReads = code.match(/nsExec::ExecToStack '[^'\n]*git rev-parse[^'\n]*'/g) ?? [];
+  const trimmedCommitReads =
+    code.match(
+      /nsExec::ExecToStack '[^'\n]*git rev-parse[^'\n]*'\s+Pop \$\w+\s+Pop (\$\w+)\s+\$\{StrTrimNewLines\} \1 "\1"/g,
+    ) ?? [];
+  if (commitReads.length === 0 || trimmedCommitReads.length !== commitReads.length) {
+    failures.push({
+      message:
+        "Every commit the Windows installer reads with nsExec::ExecToStack must be trimmed before it is compared.",
+    });
+  }
 
   const uninstallStart = code.indexOf('Section "Uninstall"');
   const packageRemoval = code.indexOf('RMDir /r "$INSTDIR\\packages"', uninstallStart);

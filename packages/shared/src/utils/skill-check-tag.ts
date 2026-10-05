@@ -16,7 +16,31 @@ import { isWithinDiceLimits, parseDiceNotation } from "./dice-notation.js";
 
 export interface SkillCheckTag {
   skill: string;
-  dc: number;
+  /**
+   * `dc=` as written. Absent only on a tag that names its difficulty by `difficulty=` instead, which
+   * only a ruleset game can turn into a number; every other reader treats such a tag as a check it
+   * cannot roll.
+   */
+  dc?: number;
+  /**
+   * `difficulty="Label"` as the GM wrote it: a step of the ruleset's difficulty ladder, picked by
+   * name. Carried, never judged: whether the ladder has such a step is the resolver's business.
+   */
+  difficulty?: string;
+  /**
+   * `explode=` and `double=` as whole numbers, when the GM wrote readable ones: the face a pool
+   * ruleset's moving rule fires on for this one check. Carried, never judged, like `threshold=`.
+   */
+  explode?: number;
+  double?: number;
+  /** `reroll="id"` as the GM wrote it: one of the ruleset's standing re-throws, by its id. Carried,
+   *  never judged: whether the ruleset has one by that name is the resolver's business. */
+  reroll?: string;
+  /** `reason="untrained"`: the Engine did not roll this check, because the ruleset does not let
+   *  the character attempt it untrained. Settled, not owed: the client's fallback and the roll
+   *  endpoint's record never roll it later. Only the Engine writes it, but the Game Master could
+   *  copy it, so a turn's own pass ignores it and decides again from the sheet. */
+  reason?: "untrained";
   advantage?: boolean;
   disadvantage?: boolean;
   resolvedResult?: SkillCheckResult;
@@ -57,6 +81,41 @@ export interface SkillCheckTag {
    * rule cannot see. An unreadable name costs the tag a `slot` mismatch instead.
    */
   poolDeclared?: boolean;
+  /**
+   * `who=` as the GM wrote it: the party member a ruleset game rolls the check for. Absent means
+   * the player. Carried, never judged: only a game with a pinned ruleset reads it, and whether
+   * the name matches a sheet is the resolver's business.
+   */
+  who?: string;
+  /**
+   * `with=` as the GM wrote it: roll this skill or save with another ability than its own. Carried,
+   * never judged — whether the ruleset has such an ability is the resolver's business, and a name
+   * no ability answers to is ignored there rather than refused here.
+   */
+  withAbility?: string;
+  /**
+   * `bonus=` as a whole number, when the GM wrote a readable one: dice a pool ruleset adds or
+   * takes for this one check. Read like `threshold=` and held to the same rule — `Number` rather
+   * than `parseInt`, so "1.5" stays unusable instead of becoming 1, and whether the ruleset allows
+   * situational dice at all is decided by the resolver.
+   */
+  bonusDice?: number;
+  /**
+   * `spend="willpower:1"` as the GM wrote it, read into a pool name and a whole number of points.
+   *
+   * What the player said they were spending on THIS check, so one resolution both rolls the dice
+   * and pays for what changed them. Carried, never judged: whether the ruleset offers such a spend,
+   * whether the pool covers it and what it buys are all the resolver's business.
+   */
+  spend?: { pool: string; amount: number };
+  /**
+   * `use="Potence"` as the GM wrote it: the catalog entry the player is using ON this check.
+   *
+   * Carried, never judged. Whether the character actually has that entry, what it costs and what
+   * it does to the roll are all the resolver's business, and it needs the ruleset's catalogs to
+   * answer any of them.
+   */
+  useEntry?: string;
   /** `pool=` exactly as written, for the mismatch log. Present whenever `poolDeclared` is. */
   poolRaw?: string;
   /**
@@ -276,9 +335,12 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
 
   const skill = values.get("skill")?.trim() ?? "";
   const dc = Number.parseInt(values.get("dc") ?? "", 10);
-  if (!skill || Number.isNaN(dc)) return null;
+  // A difficulty named by its ladder step stands in for `dc=`, which only a ruleset game can read.
+  // Cut at the schema's own label limit, so any step's label can be named.
+  const difficulty = values.get("difficulty")?.trim().slice(0, 80);
+  if (!skill || (Number.isNaN(dc) && !difficulty)) return null;
 
-  const tag: SkillCheckTag = { skill, dc };
+  const tag: SkillCheckTag = { skill, ...(Number.isNaN(dc) ? {} : { dc }), ...(difficulty ? { difficulty } : {}) };
   const modeValue = values.get("mode")?.trim().toLowerCase();
 
   // Advantage is a declaration, so it is read where declarations live: `mode=`,
@@ -320,6 +382,42 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     const threshold = Number(values.get("threshold"));
     if (Number.isFinite(threshold)) tag.threshold = threshold;
   }
+  // A whole number of dice, or nothing. `Number` rather than `parseInt`, so "1.5" stays unusable
+  // instead of becoming 1, and the emptiness test comes first because `Number("")` is 0 and an
+  // attribute written with no value has declared nothing.
+  const bonusValue = values.get("bonus")?.trim();
+  if (bonusValue) {
+    const bonus = Number(bonusValue);
+    if (Number.isInteger(bonus)) tag.bonusDice = bonus;
+  }
+  const rerollName = values.get("reroll")?.trim();
+  if (rerollName) tag.reroll = rerollName.slice(0, 40);
+  if (values.get("reason")?.trim().toLowerCase() === "untrained") tag.reason = "untrained";
+  // A face, so a whole number or nothing, on the same terms as `bonus=`.
+  for (const key of ["explode", "double"] as const) {
+    const written = values.get(key)?.trim();
+    const face = written ? Number(written) : Number.NaN;
+    if (Number.isInteger(face)) tag[key] = face;
+  }
+  // `spend="<pool>:<points>"`. Read on the same terms as `threshold=` and `bonus=`: written at all,
+  // not necessarily usable. A body with no colon, an empty pool name or a number that is not a
+  // whole positive one has declared nothing the Engine could act on.
+  const spendValue = values.get("spend")?.trim();
+  if (spendValue) {
+    const at = spendValue.lastIndexOf(":");
+    const pool = at > 0 ? spendValue.slice(0, at).trim() : "";
+    const amount = at > 0 ? Number(spendValue.slice(at + 1).trim()) : Number.NaN;
+    if (pool && Number.isInteger(amount) && amount > 0) tag.spend = { pool: pool.slice(0, 100), amount };
+  }
+  const useEntry = values.get("use")?.trim();
+  // A catalog entry's label may be 120 characters, and this is the name that has to match one, so
+  // the cut is the schema's own limit rather than the 100 the rest of these use: a shorter one
+  // would make an entry with a long label impossible to name.
+  if (useEntry) tag.useEntry = useEntry.slice(0, 120);
+  const who = values.get("who")?.trim();
+  if (who) tag.who = who.slice(0, 100);
+  const withAbility = values.get("with")?.trim();
+  if (withAbility) tag.withAbility = withAbility.slice(0, 100);
   if (values.has("pool")) {
     tag.poolDeclared = true;
     tag.poolRaw = values.get("pool")!;
@@ -327,13 +425,78 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     if (poolSlots) tag.poolSlots = poolSlots;
   }
 
+  // A record always has the number it was rolled against, so a tag that names only a difficulty is
+  // read as an ask whatever else it carries.
+  const recordDc = tag.dc;
+
+  const penaltyValue = Number(values.get("penalty"));
+  const penalty = Number.isFinite(penaltyValue) && penaltyValue < 0 ? { penalty: penaltyValue } : {};
+  // Said by the Engine's own record only, and read back so a reloaded card still says it.
+  const complication = values.get("complication")?.trim().toLowerCase() === "true" ? { complication: true } : {};
+  const adjustValue = Number(values.get("adjust"));
+  const adjust = Number.isInteger(adjustValue) && adjustValue !== 0 ? { adjust: adjustValue } : {};
+  // The standing re-throw the record says was thrown, read back with the rest of what it applied.
+  const thrownAgain = tag.reroll ? { reroll: tag.reroll } : {};
+  // And what the character's conditions and items did, said by the Engine's own record only.
+  const effectsValue = Number(values.get("effects"));
+  const fromNames = (values.get("from") ?? "")
+    .split(";")
+    .map((name) => name.trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 24);
+  const automatic = values.get("automatic")?.trim().toLowerCase() === "true";
+  const effected = {
+    ...(Number.isInteger(effectsValue) && effectsValue !== 0 ? { effects: effectsValue } : {}),
+    ...(fromNames.length > 0 ? { from: fromNames } : {}),
+    ...(automatic ? { automatic: true } : {}),
+  };
   const rollsValue = values.get("rolls");
   const modifier = Number.parseInt(values.get("modifier") ?? "", 10);
   const total = Number.parseInt(values.get("total") ?? "", 10);
   const resultValue = values.get("result")?.trim().toLowerCase();
   const resolution: SkillCheckResult["resolution"] = declaredResolution === "successes" ? "successes" : "sum";
 
-  if (!rollsValue || Number.isNaN(modifier) || Number.isNaN(total) || !resultValue) {
+  // An EMPTY pool is a real result with no dice in it: a ruleset whose pool may be 0 fails the check
+  // without a roll and records `dice="0dN" rolls=""`. Read it back as the failure it was, so the
+  // record survives a reload instead of looking like a check nobody rolled. Nothing else may have
+  // an empty `rolls=`, and the shape is never Engine-rollable, so this cannot adopt a model's claim
+  // as a roll: it can only ever say "no dice, no successes". A save something made fail without a
+  // roll (`automatic="true"`) has the same shape on a summed check too.
+  const emptyPool =
+    recordDc !== undefined &&
+    values.has("rolls") &&
+    (rollsValue ?? "").trim() === "" &&
+    (resolution === "successes" || automatic) &&
+    // The written strings, not the parsed numbers: `parseInt` reads "0 or so" as 0, and only the
+    // Engine's own exact record may be read back this way.
+    values.get("total")?.trim() === "0" &&
+    values.get("modifier")?.trim() === "0" &&
+    /^0d[1-9]\d{0,3}$/.test(declaredDice ?? "") &&
+    (resultValue === "failure" || resultValue === "critical_failure" || resultValue === "critical failure");
+  if (emptyPool) {
+    tag.resolvedResult = {
+      skill,
+      dc: recordDc!,
+      rolls: [],
+      usedRoll: 0,
+      modifier: 0,
+      total: 0,
+      success: false,
+      criticalSuccess: false,
+      criticalFailure: resultValue !== "failure",
+      rollMode: "normal",
+      resolution,
+      dice: declaredDice,
+      ...penalty,
+      ...complication,
+      ...adjust,
+      ...thrownAgain,
+      ...effected,
+    };
+    return tag;
+  }
+
+  if (!rollsValue || Number.isNaN(modifier) || Number.isNaN(total) || !resultValue || recordDc === undefined) {
     // Sparse tag — the resolver will roll + apply modifier, unless the tag names
     // a system the engine does not roll. If the GM echoed a single integer in
     // rolls="...", treat it as a player-submitted d20 — but only on a tag the
@@ -422,13 +585,13 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     const rollIsD20 = actualRoll >= 1 && actualRoll <= 20;
     const usedRollHolds = usedRoll === actualRoll;
     const arithmeticHolds = actualRoll + modifier === total;
-    const outcomeHolds = criticalSuccess || criticalFailure || success === total >= dc;
+    const outcomeHolds = criticalSuccess || criticalFailure || success === total >= recordDc;
     if (!rollIsD20 || !usedRollHolds || !arithmeticHolds || !outcomeHolds) return tag;
   }
 
   tag.resolvedResult = {
     skill,
-    dc,
+    dc: recordDc,
     rolls,
     usedRoll,
     modifier,
@@ -439,6 +602,11 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     rollMode: normalizedMode,
     resolution,
     dice,
+    ...penalty,
+    ...complication,
+    ...adjust,
+    ...thrownAgain,
+    ...effected,
   };
 
   return tag;

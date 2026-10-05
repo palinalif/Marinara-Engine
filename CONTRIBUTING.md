@@ -39,6 +39,7 @@ Useful entry points:
 - `pnpm dev:server` builds the shared package, then starts only the API server. If shared source changes while it is running, rerun `pnpm build:shared` and restart the server; the server watcher intentionally ignores shared build output.
 - `pnpm dev:client` starts only the Vite frontend.
 - `start.bat`, `start.sh`, and `start-termux.sh` run the launcher flow, including git-based auto-update and optional browser auto-open.
+- `tools/dev-mcp/` is an optional MCP server for coding agents working on the engine: it reads prompts, cache statistics and logs from a local engine, runs typechecks and regressions, and restarts the engine without using the launchers. It is not a workspace package. See [tools/dev-mcp/README.md](tools/dev-mcp/README.md).
 - Platform launchers and `pnpm start` supervise explicit in-app restarts in the same console; exit code 75 requests a replacement after the server exits. Development watchers should be restarted from their terminal, not Advanced Settings.
 
 Copy `.env.example` to `.env` when you need to change ports, HTTPS settings, or launcher behavior such as `AUTO_OPEN_BROWSER=false`.
@@ -84,6 +85,8 @@ The Engine update channel also selects the official Agent channel. Stable Engine
 
 **Why this is safe.** Marinara is a local, single-user tool. The person who authors or imports a card is the same person any "injection" in that card would target — so the worst realistic outcome of an unescaped tag is the model role-playing something odd, which the user sees in their own chat and fixes by editing their own card. That is a rare, self-inflicted, self-correcting annoyance, not a security boundary. An LLM also does not parse the prompt as an XML document, so a stray `<` cannot "break out" of a section the way it would in a real parser — escaping it only corrupts text. Escaping traded that non-threat for a constant, real harm (mangled cards, broken roleplay HTML, wasted tokens).
 
+**Optional multiplayer changes the boundary.** The local-only rationale above applies to ordinary single-player use. Multiplayer peers and model output remain untrusted even after password authentication. Keep prompt leaves verbatim, review the shared persona/card text at admission, and enforce the room policy at rendering, storage, command and tool dispatch. Peer traffic uses a separate restricted listener; never proxy it into ordinary Engine routes or load the host's web client. See [multiplayer architecture and proof](docs/development/multiplayer.md).
+
 **Structure is separate from content.** The framework's own section wrappers (`<description>…</description>`, `<last_message>…`, etc.) are emitted by `wrapContent` *around* leaf content, from fixed section names. Verbatim content therefore cannot alter structural tags; it only changes what sits inside them.
 
 **What stays escaped (do not "harmonize" these back into the leaf path).** The agent value/attribute escapers — `escapeXml` / `escapeXmlAttribute` in `agent-executor.ts` and the local escaper in `knowledge-router.ts` — escape dynamic values into XML *attributes* and into strict, machine-parsed agent output (world-state documents, entry catalogs). Those are genuinely parsed downstream, where a stray `"` or `<` breaks an attribute or element, so they must stay escaped. Note that `agent-executor.ts` also escapes some of the same card fields into element *content* of that parsed document — a different consumer with different rules. It is **not** a reason to re-escape the main prompt path.
@@ -125,18 +128,40 @@ Useful follow-up checks:
 pnpm version:check
 pnpm regression
 pnpm regression:prompt
+pnpm smoke:ui
+pnpm smoke:production
 pnpm regression:ui
 ```
 
+`pnpm smoke:production` opens the compiled frontend with the compiled server in isolated test data,
+using desktop Chromium, mobile Chromium, and mobile WebKit. Run `pnpm check` first to build it. The
+required PR check runs its Chromium case; this catches startup failures that the Vite development
+server and HTTP-only container health checks cannot detect.
+
 Regression guards:
 
-- `pnpm regression` (or `pnpm regression:node`) builds the shared package once, discovers the complete Node regression set from the filesystem, and runs it serially. Pull requests and staging pushes run this complete lane on a hosted runner.
+- `pnpm regression` (or `pnpm regression:node`) builds the shared package once, discovers the complete Node regression set from the filesystem, and runs it serially. Pull requests and staging pushes retain this complete lane on a hosted runner.
 - `pnpm regression:prompt` runs fast deterministic checks for prompt assembly, lorebook keyword matching, macros, summaries, and mode-specific generation gates.
-- `pnpm regression:ui` runs the Playwright browser suite across desktop Chromium, Android-sized Chromium, and iPhone-sized WebKit; `pnpm smoke:ui` remains a compatibility alias for the same full UI lane. Pull requests and staging pushes run the same projects independently on hosted runners.
-  Each run clears `.tmp/playwright-data` and starts separate desktop and mobile app servers so their mutable fixtures cannot overlap. Stop any process already using the configured Playwright ports before running it; existing fixture state is disposable and the suite does not reuse a running development server.
+- `pnpm smoke:ui` runs only the `@smoke` tests on desktop Chromium, with one worker. This small suite covers the Home shell, settings persistence, chat-mode navigation, generation stop/refusal, Conversation and Roleplay reasoning, and Game narration. Development PRs into `staging` run it inside the existing required `pnpm-validate` check, so a smoke failure blocks merging. Staging pushes run it as `browser-smoke`. Both replace the full browser matrix at those development boundaries. Keep the smoke selection small; feature-specific regressions belong in focused local runs and the full matrix.
+- `pnpm regression:ui` still runs the full Playwright suite across desktop Chromium, Android-sized Chromium, and iPhone-sized WebKit. GitHub runs the full matrix nightly at 02:17 UTC against `staging`, on manual dispatch, and on PRs into `main` (including promotion and hotfix candidates). Every test job uses the same immutable commit from its triggering event; the `regression-revision` job records that SHA in its summary. Full-matrix checks retain the `desktop-chromium`, `mobile-chromium`, and `mobile-webkit` verdicts; ordinary development runs skip those full lanes.
+  Browser runs clear `.tmp/playwright-data` and use disposable app-server fixtures. Local runs start separate desktop and mobile servers; hosted jobs start only the pair their selected project needs. Stop any process already using the configured Playwright ports before running tests; the suite does not reuse a running development server.
+- `node scripts/run-regressions.mjs` (what `pnpm regression` runs) gives each regression file its own throwaway `DATA_DIR`, `FILE_STORAGE_DIR` and `.env` (through `MARINARA_ENV_FILE`) and removes them when the file finishes. A regression that sets these variables itself keeps its own values. Use `--filter <text>` to run a subset.
 - `pnpm test` checks the Windows installer layout, then runs the Node regression lane. It does not run the UI lane; invoke `pnpm regression:ui` explicitly for browser validation.
 
-These checks are intentionally small and do not replace manual verification. When you change behavior, include the manual verification you performed and add or update a regression guard for the bug class when practical.
+Before pushing, run `pnpm check` and the regressions covering the behavior you changed. For browser-affecting work, run `pnpm smoke:ui` plus the relevant spec files or named cases. Include mobile Chromium and WebKit when changing responsive layout, touch/keyboard behavior, media playback, or browser-specific APIs. Shared shell, styling, storage, or routing changes warrant broader coverage. Running the entire browser matrix before every push is not required.
+
+For example, select a focused desktop regression or a mobile case without running every spec:
+
+```bash
+pnpm regression:ui e2e/game-verb-only-turn.e2e.ts --project=desktop-chromium --workers=1
+pnpm regression:ui e2e/core-flows.e2e.ts --project=mobile-webkit --grep "chat mode tabs" --workers=1
+```
+
+Record the commands, results, and tested revision in the PR. Rerun affected checks after later edits; do not present results from an earlier revision as validation of changed code. Explain any unavailable browser or skipped coverage. These automated checks do not replace manual verification of the changed behavior.
+
+To run the full hosted matrix on the current staging candidate, use `gh workflow run playwright.yml --ref staging`. Select another existing branch or tag with `--ref`, and add `-f expected_sha=<full-commit-sha>` to reject the run if that branch/tag has moved off the intended candidate. Every checkout uses the triggering SHA; the input never selects code from another branch inside the run. Wait for all three browser verdicts and the Node lane before treating that candidate as validated.
+
+**Rollout:** GitHub schedules workflows from the default branch, so the nightly trigger becomes active only after this workflow reaches `main`. Its scheduler only dispatches a full run on `staging`; test code and cache writes stay in the selected branch's own context. Until then, use manual dispatch from `staging` for full coverage. Promotion PRs into `main` run the full matrix from their proposed workflow. A nightly green result on an older staging commit does not validate a later release candidate.
 
 ## Logging
 
@@ -187,6 +212,17 @@ All server-side logging goes through a shared [Pino](https://getpino.io/) logger
 - **Client-side code (`packages/client/`) should keep using `console.*`** — the browser has no Pino. Production builds automatically strip `console.log` via the Vite esbuild `pure` option; only `console.warn` and `console.error` survive.
 
 - **Route handlers** that already have access to `app.log` or `req.log` may use those instead of the shared logger — they are child loggers of the same Pino instance and inherit the same level.
+
+### Request ids, failures and prompt text
+
+[docs/development/logging.md](docs/development/logging.md) covers the details. `app.ts` builds Fastify on the shared logger (`loggerInstance: logger`), so `req.log` lines and shared-logger lines share one format. In short:
+
+- **Every line in a request carries `requestId`.** This includes lines from the shared `logger` inside services. The id is returned to the client as the `x-request-id` header, so you never pass it around by hand.
+- **One line per failure.** Either log an error or rethrow it, not both. Cancellations (user stops, closed clients) belong at `info`: use `logger[failureLevel(err)](err, "...")` from `lib/log-context.ts`.
+- **Keep causes.** Wrap errors with `new Error("...", { cause: err })` so the cause chain reaches the log.
+- **Rate-limit repeating failures** from pollers, health checks and per-turn hooks with `logRateLimited` from `lib/log-rate-limit.ts`.
+- **Prompt, model and provider text stays at `debug`.** At `warn` and `error`, log its length and the reason, not the text.
+- **Time new boot steps** in `buildApp` with `startup.phase("name", () => ...)` from `lib/startup-timeline.ts`.
 
 ## Before You Open a Pull Request
 
@@ -303,11 +339,18 @@ Release-related behavior already in the repo:
 
 Standard release flow:
 
+For the next main release after v2.4.6, also complete the coordinated
+[Quartermaster and Relationship Tracker catalog promotion](https://github.com/Pasta-Devs/Marinara-Agents/issues/1091).
+In Marinara-Agents, remove these two IDs from `STAGING_ONLY_PACKAGE_IDS`, rebuild their packages,
+and update the published catalog counts and documentation before promoting Agents `staging` to `main`
+alongside this Engine release. Copying the preview catalog to `main` alone keeps both packages hidden
+from stable Engine users. Leave other staging-only packages at their existing release tier.
+
 1. Bump the canonical version in root `package.json`.
 2. Run `pnpm version:sync -- --android-version-code <next-code>` to sync all derived version fields.
 3. Run `pnpm credits:check`; if it reports stale contributor credits, run `pnpm credits:sync` and include the Credits modal update in the release PR.
 4. Update `CHANGELOG.md`; when publishing a stable release, update README's current-stable-release link to the matching tag.
-5. Merge the release-ready `staging` change to `main`.
+5. Open the promotion PR from `staging` to `main` and wait for its full browser matrix and required checks to pass before merging. If the candidate changes, validate the updated candidate. For a release without a promotion PR, manually run the full matrix against its exact candidate commit before tagging.
 6. Create and push the tag `vX.Y.Z` from the `main` commit that contains that exact version bump.
 7. Let the release workflows publish or update the GitHub Release, named source ZIP, Windows installer, Android WebView shell APK, and GHCR container images (`X.Y.Z`, `X.Y`, `X`, `latest`, plus `X.Y.Z-lite` / `lite`) from the matching changelog entry.
 

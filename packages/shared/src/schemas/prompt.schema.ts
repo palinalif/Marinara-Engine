@@ -237,6 +237,7 @@ export const createPromptSectionSchema = z.object({
   injectionDepth: z.number().int().min(0).default(0),
   injectionOrder: z.number().int().default(100),
   forbidOverrides: z.boolean().default(false),
+  skipWrap: z.boolean().default(false),
 });
 
 export const updatePromptSectionSchema = createPromptSectionSchema

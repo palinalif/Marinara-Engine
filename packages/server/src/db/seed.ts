@@ -197,6 +197,8 @@ function buildPresetSnapshot(args: {
         injectionDepth: numberField(section.injectionDepth, 0),
         injectionOrder: numberField(section.injectionOrder, 100),
         forbidOverrides: booleanField(section.forbidOverrides, false),
+        // Emitted only when set so snapshot hashes stored before this field existed still match.
+        ...(booleanField(section.skipWrap, false) ? { skipWrap: true } : {}),
       }))
       .sort((a, b) => a.key.localeCompare(b.key)),
     choiceBlocks: choiceBlocks
@@ -322,6 +324,7 @@ async function applyBundledPresetToExisting(
       injectionDepth: numberField(section.injectionDepth, 0),
       injectionOrder: numberField(section.injectionOrder, 100),
       forbidOverrides: section.forbidOverrides === true || section.forbidOverrides === "true",
+      skipWrap: section.skipWrap === true || section.skipWrap === "true",
     });
     if (newSection) sectionMap.set(String(section.id), newSection.id);
   }

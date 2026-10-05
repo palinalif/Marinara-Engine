@@ -7,6 +7,7 @@ import type { BuiltInAgentManifest } from "../features/agents/agent-manifest.typ
 import type { AgentToolConfig, ToolDefinition } from "../features/function-calls/tool-definitions.js";
 import type { ChatMode } from "./chat.js";
 import type { WrapFormat } from "./prompt.js";
+import type { MacroDecisionAnswers } from "../utils/macro-engine.js";
 
 /** When in the generation pipeline an agent runs. */
 export type AgentPhase =
@@ -349,6 +350,11 @@ export interface AgentContext {
   /** Serialize model calls for Game chats sharing limited GPU memory. */
   sequentialExecution?: boolean;
   /**
+   * This turn's answers for `decision:` and `decision_choice:` conditions in the
+   * agent's prompt template (#6569). Absent means none were asked, which reads as no.
+   */
+  decisions?: MacroDecisionAnswers;
+  /**
    * Prose to read instead of the recent messages.
    *
    * Set when the operator types a correction directly — "her sword is broken" — rather
@@ -367,6 +373,8 @@ export interface AgentContext {
     role: string;
     content: string;
     characterId?: string;
+    /** Speaker label for agent history; set only when the message has exactly one speaker. */
+    speakerName?: string;
     /** Tracker state snapshot for this message (if any). */
     gameState?: import("./game-state.js").GameState | null;
   }>;
@@ -640,6 +648,26 @@ export function normalizeCustomAgentContextSources(settings: unknown): CustomAge
     if (typeof stored[source] === "boolean") normalized[source] = stored[source];
   }
   return normalized;
+}
+
+/** Built-in agents retain their existing context unless the user explicitly configures sources. */
+export function getAgentContextSources(config: {
+  isCustomAgent?: boolean;
+  settings: unknown;
+}): CustomAgentContextSources {
+  const settings = parseAgentSettingsRecord(config.settings);
+  if (config.isCustomAgent || isRecord(settings.contextSources)) return normalizeCustomAgentContextSources(settings);
+  return {
+    chatHistory: true,
+    characters: true,
+    persona: true,
+    activatedLorebookEntries: true,
+    chatSummary: true,
+    authorNotes: true,
+    trackerData: true,
+    recalledMemories: true,
+    previousOutput: false,
+  };
 }
 
 export interface CustomAgentImportPolicy {

@@ -16,6 +16,7 @@ type AvatarGenerationModalProps = {
   entityName: string;
   defaultAppearance?: string;
   defaultAvatarUrl?: string | null;
+  neutralFullBodyReferenceUrl?: string | null;
   onClose: () => void;
   onUseAvatar: (avatarDataUrl: string) => Promise<void> | void;
 };
@@ -37,18 +38,18 @@ function isDefaultImageConnection(connection: ImageConnectionOption): boolean {
   return connection.defaultForAgents === true || connection.defaultForAgents === "true";
 }
 
-async function imageUrlToDataUrl(src: string): Promise<string> {
+async function imageUrlToDataUrl(src: string, errorMessage: string): Promise<string> {
   if (src.startsWith("data:")) return src;
   const response = await fetch(src);
-  if (!response.ok) throw new Error("Failed to read the current avatar reference.");
+  if (!response.ok) throw new Error(errorMessage);
   const blob = await response.blob();
   return await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
       if (typeof reader.result === "string") resolve(reader.result);
-      else reject(new Error("Failed to convert the current avatar reference."));
+      else reject(new Error(errorMessage));
     };
-    reader.onerror = () => reject(reader.error ?? new Error("Failed to convert the current avatar reference."));
+    reader.onerror = () => reject(new Error(errorMessage));
     reader.readAsDataURL(blob);
   });
 }
@@ -60,6 +61,7 @@ export function AvatarGenerationModal({
   entityName,
   defaultAppearance,
   defaultAvatarUrl,
+  neutralFullBodyReferenceUrl,
   onClose,
   onUseAvatar,
 }: AvatarGenerationModalProps) {
@@ -74,6 +76,7 @@ export function AvatarGenerationModal({
   const [appearance, setAppearance] = useState(defaultAppearance ?? "");
   const [connectionId, setConnectionId] = useState<string | null>(null);
   const [useCurrentAvatarReference, setUseCurrentAvatarReference] = useState(false);
+  const [useNeutralFullBodyReference, setUseNeutralFullBodyReference] = useState(false);
   const [generatedAvatar, setGeneratedAvatar] = useState<string | null>(null);
   const [generatedPrompt, setGeneratedPrompt] = useState("");
   const [generating, setGenerating] = useState(false);
@@ -98,6 +101,7 @@ export function AvatarGenerationModal({
     if (!open) return;
     setAppearance(defaultAppearance ?? "");
     setUseCurrentAvatarReference(!!defaultAvatarUrl);
+    setUseNeutralFullBodyReference(false);
     setGeneratedAvatar(null);
     setGeneratedPrompt("");
     setReviewItems([]);
@@ -148,8 +152,17 @@ export function AvatarGenerationModal({
     setGenerating(true);
     try {
       let promptOverrides: ImagePromptOverride[] | undefined;
-      const referenceImages =
-        useCurrentAvatarReference && defaultAvatarUrl ? [await imageUrlToDataUrl(defaultAvatarUrl)] : undefined;
+      const referenceUrls = [
+        isCharacterSheet && useNeutralFullBodyReference && neutralFullBodyReferenceUrl,
+        useCurrentAvatarReference && defaultAvatarUrl,
+      ].filter((url): url is string => typeof url === "string" && url.length > 0);
+      const referenceImages = referenceUrls.length
+        ? await Promise.all(
+            referenceUrls.map((url) =>
+              imageUrlToDataUrl(url, localizeUi("ui.ui.avatargenerationmodal.referenceImageReadFailed")),
+            ),
+          )
+        : undefined;
       const payload = buildPayload(referenceImages);
       if (reviewImagePromptsBeforeSend) {
         const preview = await api.post<{ items: ImagePromptReviewItem[] }>(
@@ -260,6 +273,26 @@ export function AvatarGenerationModal({
                   )}
                 />
               </label>
+
+              {isCharacterSheet && neutralFullBodyReferenceUrl && (
+                <label className="flex items-center gap-3 rounded-lg bg-[var(--secondary)]/60 p-2.5 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]/60">
+                  <input
+                    type="checkbox"
+                    checked={useNeutralFullBodyReference}
+                    onChange={(event) => setUseNeutralFullBodyReference(event.target.checked)}
+                    disabled={generating || saving}
+                    className="accent-[var(--primary)]"
+                  />
+                  <img
+                    src={neutralFullBodyReferenceUrl}
+                    alt=""
+                    className="h-14 w-10 rounded-lg object-contain ring-1 ring-[var(--border)]"
+                  />
+                  <span className="min-w-0 flex-1">
+                    {localizeUi("ui.ui.avatargenerationmodal.useNeutralFullBodyAsReference")}
+                  </span>
+                </label>
+              )}
 
               {defaultAvatarUrl && (
                 <label className="flex items-center gap-3 rounded-lg bg-[var(--secondary)]/60 p-2.5 text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]/60">
