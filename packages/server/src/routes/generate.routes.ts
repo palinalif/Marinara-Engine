@@ -293,8 +293,12 @@ import {
 import { persistGeneratedImageToEntityGalleries } from "../services/image/generated-image-entity-gallery.js";
 import { resolveImageConnectionFallback } from "../services/generation/media-connection-fallback.js";
 import {
+  buildIllustratorImageAppearanceOverrides,
   buildUncaptionedCharacterAppearanceBlock,
+  IMAGE_APPEARANCE_OVERRIDES_MEMORY_KEY,
+  personaEntityId,
   readCharacterPrompts,
+  readIllustratorImageAppearanceOverride,
   resolveNovelAiCharacterPromptLimit,
   supportsNovelAiCharacterPrompts,
 } from "../services/image/character-prompts.js";
@@ -372,9 +376,11 @@ import {
 import {
   buildAutonomousDailyBudgetPatch,
   clearGenerationInProgress,
+  isAutonomousDailyBudgetExhausted,
   markGenerationInProgress,
   recordAssistantActivity,
   recordUserActivity,
+  sharesAutonomousDailyBudget,
 } from "../services/conversation/autonomous.service.js";
 import { buildIntentCooldownPatch, isMessageIntent } from "../services/conversation/intent.service.js";
 import { buildImpersonateInstruction } from "../services/conversation/impersonate-prompt.js";
@@ -739,6 +745,7 @@ import {
   filterPromptMessagesForCharacterAudience,
   filterPromptHistoryByMessageIds,
   scopeIndividualGroupMessagesForTarget,
+  selectHistoryMessagesForRecall,
   type GenerationPromptMessage,
 } from "../services/generation/prompt-message-scope.js";
 import {
@@ -2599,6 +2606,7 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
         let advancedMemoryPlacements: AdvancedMemoryPlacement[] = [];
         let longTermMemoryRecallReceipt: LongTermMemoryRecallReceipt | undefined;
         let longTermMemoryPromptRecorded = false;
+        let conversationRecallHistory: GenerationPromptMessage[] | undefined;
         const ownerSpatialProjection = await ownerSpatialProjectionPromise;
         let conversationCommandsReminder: string | null = null;
         let conversationContextMacroSlots: ConversationContextMacroSlots = {
@@ -3543,8 +3551,11 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
               signal: generationSignal,
             },
             summaryVectorizerAvailable: memoryRecallVectorizerAvailable,
+            includeRecallHistory:
+              chatEnableAgents && chatActiveAgentIds.includes("long-term-memory") && !input.regenerateMessageId,
           });
           finalMessages = preparedHistory.finalMessages;
+          conversationRecallHistory = preparedHistory.recallHistoryMessages;
 
           // ── Conversation-mode profiles (Convo ONLY): display name, about-me, behavior ──
           // Built entirely inside this branch, so none of these fields can reach
@@ -5310,6 +5321,12 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
 
         if (personaId) {
           agentContext.memory._personaId = personaId;
+          // #7053: the persona's image-prompt override, read once from the
+          // resolved identity so every image path keys it consistently. Set
+          // unconditionally: the retry path reads this key without a guard, so
+          // leaving it unset when the override is cleared would let a stale
+          // value survive on a reused memory object.
+          agentContext.memory._personaImageAppearanceOverride = identity?.imageAppearanceOverride ?? "";
         }
         if (userIdentityId) {
           agentContext.memory._userIdentityId = userIdentityId;
@@ -5395,6 +5412,16 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
             messages: allChatMessages,
             countUpcomingAssistantMessage: createsAssistantMessage,
           }));
+
+        // Keep image-only appearances available to custom image agents and native
+        // caption fallbacks, even when no built-in Illustrator instruction exists.
+        const imageAppearanceOverrides = buildIllustratorImageAppearanceOverrides(charInfo, {
+          id: userIdentityId,
+          imageAppearanceOverride: identity?.imageAppearanceOverride || undefined,
+        });
+        if (imageAppearanceOverrides) {
+          agentContext.memory[IMAGE_APPEARANCE_OVERRIDES_MEMORY_KEY] = imageAppearanceOverrides;
+        }
 
         const illustratorPromptAgent = resolvedAgents.find((agent) => agent.type === "illustrator");
         if (illustratorPromptAgent) {
@@ -6768,7 +6795,7 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
             chatId: input.chatId,
             chatMode,
             characterIds: promptCharacterIds,
-            messages: sharedPromptForAgents(finalMessages).map(({ role, content }) => ({ role, content })),
+            messages: selectHistoryMessagesForRecall(sharedPromptForAgents(conversationRecallHistory ?? finalMessages)),
             signal: agentSignal,
             debugMode: requestDebug || isDebug,
           });
@@ -10724,13 +10751,37 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
             if (routeCharacterMentions) {
               // Reuse this turn's queue: prioritize mentions, but never revisit a speaker.
               const visited = new Set(respondingCharIds.slice(0, ci + 1));
-              const mentioned = getExplicitlyMentionedCharacterIds(genResult.response).filter((id) => !visited.has(id));
-              if (mentioned.length > 0) {
+              let mentioned = getExplicitlyMentionedCharacterIds(genResult.response).filter((id) => !visited.has(id));
+              let remaining = respondingCharIds.slice(ci + 1).filter((id) => !mentioned.includes(id!));
+              let queueChanged = false;
+              if (shouldAccountAutonomousGeneration && mentioned.length > 0) {
+                // Every autonomous reply counts, so handoffs must fit the daily
+                // limit together with the replies already queued (#7055).
+                const { schedules } = await chats.resolveConversationPresenceState(input.chatId);
+                let projectedMeta = chatMeta;
+                const reserve = (id: string) => {
+                  // Like /autonomous/check, a character without a schedule uses its card talkativeness.
+                  const capSchedule = schedules[id] ?? {
+                    talkativeness: Math.round((charInfo.find((c) => c.id === id)?.talkativeness ?? 0.5) * 100),
+                  };
+                  const next = { ...projectedMeta, ...buildAutonomousDailyBudgetPatch(projectedMeta, id) };
+                  // Like /autonomous/exchange, a handoff never takes a shared limit's last check-in.
+                  const capMeta = sharesAutonomousDailyBudget(projectedMeta) ? next : projectedMeta;
+                  if (isAutonomousDailyBudgetExhausted(id, capSchedule, capMeta)) return false;
+                  projectedMeta = next;
+                  return true;
+                };
+                // Queued replies keep their place first; any that no longer fit the limit leave the queue.
+                const kept = remaining.filter((id) => !id || reserve(id));
+                queueChanged = kept.length !== remaining.length;
+                remaining = kept;
+                mentioned = mentioned.filter(reserve);
+              }
+              if (mentioned.length > 0 || queueChanged) {
                 for (const id of mentioned) {
                   const delay = conversationMentionResponderDelays.get(id);
                   if (delay && !conversationResponderDelays.has(id)) conversationResponderDelays.set(id, delay);
                 }
-                const remaining = respondingCharIds.slice(ci + 1).filter((id) => !mentioned.includes(id!));
                 respondingCharIds.splice(ci + 1, respondingCharIds.length, ...mentioned, ...remaining);
                 const pending = respondingCharIds.slice(ci + 1);
                 sendSseEvent(reply, {
@@ -13126,6 +13177,7 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                             name: character.name,
                             avatarPath: character.avatarPath,
                             appearance: character.appearance,
+                            appearanceOverride: character.imageAppearanceOverride ?? null,
                           })),
                           ...(identity?.source === "character" &&
                           !charInfo.some((character) => character.id === identity.id)
@@ -13135,6 +13187,10 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                                   name: identity.name,
                                   avatarPath: identity.avatarPath,
                                   appearance: identity.appearance,
+                                  // #7053: mirror the charInfo entries above so a
+                                  // character used as the user identity keeps its
+                                  // image-prompt override.
+                                  appearanceOverride: identity.imageAppearanceOverride || null,
                                 },
                               ]
                             : []),
@@ -13146,6 +13202,9 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                                 name: personaName,
                                 avatarPath: persona.avatarPath as string | null,
                                 appearance: personaFields.appearance,
+                                // #7053: identity-source persona, so the override
+                                // is already resolved as a string.
+                                appearanceOverride: persona.imageAppearanceOverride || null,
                                 characterSheetImageId:
                                   typeof persona.characterSheetImageId === "string"
                                     ? persona.characterSheetImageId
@@ -13171,8 +13230,29 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                           illustratorCharacterPrompts.length > 0
                             ? buildUncaptionedCharacterAppearanceBlock(
                                 [
-                                  ...agentContext.characters,
-                                  ...(agentContext.persona ? [agentContext.persona] : []),
+                                  ...agentContext.characters.map((character) => ({
+                                    name: character.name,
+                                    // #7053: image-only override; the shared
+                                    // `appearance` stays untouched for lore.
+                                    appearance:
+                                      readIllustratorImageAppearanceOverride(agentContext.memory, character.id) ??
+                                      character.appearance ??
+                                      "",
+                                  })),
+                                  ...(agentContext.persona
+                                    ? [
+                                        {
+                                          name: agentContext.persona.name,
+                                          appearance:
+                                            readIllustratorImageAppearanceOverride(
+                                              agentContext.memory,
+                                              personaEntityId(agentContext.memory),
+                                            ) ??
+                                            agentContext.persona.appearance ??
+                                            "",
+                                        },
+                                      ]
+                                    : []),
                                   ...referenceResolution.appearanceSources,
                                 ],
                                 illCharacters.filter((name): name is string => typeof name === "string"),
@@ -13651,6 +13731,11 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                           name: personaName,
                           avatarPath: persona.avatarPath as string | null,
                           appearance: personaFields.appearance,
+                          // #7053: image prompts prefer the card override. The
+                          // resolved identity already exposes it as a ready
+                          // string (separate from `appearance`, which stays the
+                          // narrator's text).
+                          appearanceOverride: persona.imageAppearanceOverride || null,
                         }
                       : null,
                   promptConnection: conn,

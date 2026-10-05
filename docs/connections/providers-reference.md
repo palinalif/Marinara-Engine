@@ -128,7 +128,7 @@ Install and login steps are in [Claude, ChatGPT, and Grok Subscription Connectio
 
 - API key: none. You sign in to a local tool instead.
 
-**OpenAI (ChatGPT)** uses your ChatGPT account through the Codex tool. The tool runs on the computer that hosts the Marinara server, and you sign in once. The **API Key** and **Base URL** fields are hidden for this provider. It does not offer embeddings (see the Embeddings section below).
+**OpenAI (ChatGPT)** uses your ChatGPT account through the Codex tool. The tool runs on the computer that hosts the Marinara server, and you sign in once. The **API Key** and **Base URL** fields are hidden for this provider. It does not offer embeddings (see the Embeddings section below). Its thinking level is the **Reasoning Effort** in the connection's or the chat's parameters; until you pick one, Codex uses its own default for the model.
 
 Install and login steps are in [Claude, ChatGPT, and Grok Subscription Connections](subscription-clis.md).
 

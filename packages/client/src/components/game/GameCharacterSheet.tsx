@@ -345,12 +345,17 @@ export function GameCharacterSheet({
   const [isAvatarUploading, setIsAvatarUploading] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const [draft, setDraft] = useState<GameCardDraft>(() => createDraft(card.gameCard));
+  const savedGameCardRef = useRef(JSON.stringify(card.gameCard));
 
   useEffect(() => {
+    // Layout and other metadata saves rebuild the card without changing its saved sheet.
+    const savedGameCard = JSON.stringify(card.gameCard);
+    if (savedGameCardRef.current === savedGameCard) return;
+    savedGameCardRef.current = savedGameCard;
     setIsEditing(false);
     setIsSaving(false);
     setDraft(createDraft(card.gameCard));
-  }, [card]);
+  }, [card.gameCard]);
 
   const previewGameCard = isEditing ? normalizeDraft(draft) : normalizeDraft(createDraft(card.gameCard));
   const hasRpgAttributes =

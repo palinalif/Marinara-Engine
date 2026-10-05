@@ -253,10 +253,7 @@ const REGRESSION_AGENT_IDS = [
 const regressionAgentDefinitions = REGRESSION_AGENT_IDS.map((id) => ({
   id,
   name: id === "html" ? "Immersive HTML" : id === "illustrator" ? "Illustrator" : id,
-  description:
-    id === "html"
-      ? "Adds HTML/CSS/JS visual effects to AI messages."
-      : `Regression fixture for ${id}`,
+  description: id === "html" ? "Adds HTML/CSS/JS visual effects to AI messages." : `Regression fixture for ${id}`,
   phase: "post_processing" as const,
   enabledByDefault: false,
   category: "misc" as const,
@@ -319,6 +316,7 @@ import {
 import {
   filterPromptHistoryByMessageIds,
   filterPromptMessagesForCharacterAudience,
+  selectHistoryMessagesForRecall,
 } from "../../packages/server/src/services/generation/prompt-message-scope.js";
 import {
   mergeAdjacentMessages,
@@ -677,7 +675,10 @@ import {
   resolveConversationMembershipHistoryEvent,
   selectConversationSummariesForPrompt,
 } from "../../packages/server/src/routes/generate/conversation-history-runtime.js";
-import { formatConversationGroupOutputFormat } from "../../packages/server/src/routes/generate/conversation-prompt-formatting.js";
+import {
+  formatConversationDateHistoryMessages,
+  formatConversationGroupOutputFormat,
+} from "../../packages/server/src/routes/generate/conversation-prompt-formatting.js";
 import {
   buildConversationCurrentContextBlock,
   replaceConversationContextBlockForTarget,
@@ -713,7 +714,10 @@ import {
   resolveLorebookTokenBudget,
 } from "../../packages/server/src/services/generation/lorebook-generation-runtime.js";
 import { createAgentLorebookTriggerResolver } from "../../packages/server/src/services/generation/agent-lorebook-triggers.js";
+import { readImageAppearanceOverride } from "../../packages/shared/src/utils/image-appearance.js";
 import {
+  addChatPersonaIllustrationAssets,
+  addPersonaIllustrationAssets,
   buildGameIllustratorAppearanceContextBlock,
   buildDynamicGameImagePromptMessages,
   buildIllustrationNarrationSummaryMessages,
@@ -5018,6 +5022,122 @@ const cases: RegressionCase[] = [
       assert.match(appearanceContextBlock, new RegExp(appearance, "u"));
       assert.doesNotMatch(appearanceContextBlock, new RegExp(description, "u"));
 
+      // #7053: a persona with the image override enabled must contribute its
+      // override text to the Game illustration appearance context, exactly like a
+      // character. The /game/generate-assets illustration path previously loaded
+      // only character rows, so the persona produced no line at all — with or
+      // without an override.
+      const personaOverrideTags = "1boy, caucasian, tall male, muscular, black hair, green eyes";
+      const personaProse = "Lean-muscular build with a velvety voice and forest-toned wardrobe.";
+      const personaOverrideLine = readImageAppearanceOverride(
+        { imageAppearanceEnabled: true, imageAppearance: personaOverrideTags },
+        personaProse,
+      );
+      assert.equal(personaOverrideLine, personaOverrideTags, "the persona override wins for the game context");
+      const personaContextBlock = buildGameIllustratorAppearanceContextBlock([
+        `Fel Lockheart's Appearance: ${personaOverrideLine}`,
+        `Jessica's Appearance: ${appearance}`,
+      ]);
+      assert.match(personaContextBlock, /Fel Lockheart's Appearance: 1boy, caucasian/u);
+      assert.doesNotMatch(personaContextBlock, /velvety voice/u, "persona prose must not reach the game context");
+
+      // The helper call above would still pass if the route stopped loading the
+      // persona, which is the actual defect. Exercise the shared loader the Game
+      // illustration routes call, so removing that wiring fails this regression.
+      const gamePersonaGallery = { kind: "persona-gallery" } as never;
+      const gamePersonaMaps = () => ({
+        charReferenceByName: new Map<string, string>(),
+        charReferenceSourceByName: new Map<string, string>(),
+        charAvatarByName: new Map<string, string>(),
+        charDescriptionByName: new Map<string, string>(),
+      });
+      const enabledPersonaRow = {
+        id: "persona-fel",
+        name: "Fel Lockheart",
+        appearance: personaProse,
+        imageAppearanceEnabled: "true",
+        imageAppearance: personaOverrideTags,
+      };
+      const disabledPersonaRow = { ...enabledPersonaRow, imageAppearanceEnabled: "false" };
+
+      const enabledMaps = gamePersonaMaps();
+      const enabledName = await addChatPersonaIllustrationAssets({
+        maps: enabledMaps,
+        characters: { getPersona: async () => enabledPersonaRow } as never,
+        personaGallery: gamePersonaGallery,
+        chat: { personaId: "persona-fel" },
+        setupConfig: null,
+      });
+      assert.equal(enabledName, "Fel Lockheart", "the selected persona must resolve by name");
+      // `addNameLookupEntry` keys by normalized aliases (lowercase, per word), not
+      // by the display name, so assert on the stored text rather than the raw key.
+      assert.ok(
+        [...enabledMaps.charDescriptionByName.values()].includes(personaOverrideTags),
+        "the persona's enabled override must reach the Game illustration appearance maps",
+      );
+
+      const disabledMaps = gamePersonaMaps();
+      await addChatPersonaIllustrationAssets({
+        maps: disabledMaps,
+        characters: { getPersona: async () => disabledPersonaRow } as never,
+        personaGallery: gamePersonaGallery,
+        chat: { personaId: "persona-fel" },
+        setupConfig: null,
+      });
+      assert.ok(
+        [...disabledMaps.charDescriptionByName.values()].includes(personaProse),
+        "a disabled persona override must fall back to the persona appearance",
+      );
+      assert.ok(
+        ![...disabledMaps.charDescriptionByName.values()].includes(personaOverrideTags),
+        "a disabled persona override must not leak into the Game illustration maps",
+      );
+
+      // No persona selected -> nothing added, and no throw.
+      const nothingMaps = gamePersonaMaps();
+      assert.equal(
+        await addChatPersonaIllustrationAssets({
+          maps: nothingMaps,
+          characters: { getPersona: async () => enabledPersonaRow } as never,
+          personaGallery: gamePersonaGallery,
+          chat: { personaId: null },
+          setupConfig: null,
+        }),
+        null,
+      );
+      assert.equal(nothingMaps.charDescriptionByName.size, 0, "no persona means no appearance entry");
+
+      // Both Game illustration routes must share the loader, so a fix in one
+      // cannot leave the other behind.
+      const gameRoutesSource = readFileSync(
+        new URL("../../packages/server/src/routes/game.routes.ts", import.meta.url),
+        "utf8",
+      );
+      const listenerCalls = gameRoutesSource.match(/await addChatPersonaIllustrationAssets\(\{/gu) ?? [];
+      assert.equal(
+        listenerCalls.length,
+        2,
+        "both /generate-assets and /generate-assets/preview must load the chat persona",
+      );
+      assert.equal(
+        (gameRoutesSource.match(/addPersonaIllustrationAssets\(/gu) ?? []).length,
+        3,
+        "the persona asset helper should have exactly one definition and two shared-loader call sites",
+      );
+
+      // Disabled or empty persona override falls back to the persona prose.
+      assert.equal(
+        readImageAppearanceOverride(
+          { imageAppearanceEnabled: false, imageAppearance: personaOverrideTags },
+          personaProse,
+        ),
+        personaProse,
+      );
+      assert.equal(
+        readImageAppearanceOverride({ imageAppearanceEnabled: true, imageAppearance: "   " }, personaProse),
+        personaProse,
+      );
+
       assert.deepEqual(
         selectStoryboardAppearanceCharacterNames({
           sourceNarration: "You raise your hand beside 2B- as the shrine begins to glow.",
@@ -9173,6 +9293,46 @@ Use HTML sparingly and diegetically. Do not replace normal prose/dialogue unless
     },
   },
   {
+    name: "long-term memory recall input is history only and composes with Advanced Memory filtering",
+    run() {
+      const history = [
+        { id: "h1", role: "user" as const, contextKind: "history" as const, content: "OBSERVATORY_ONE" },
+        { id: "h2", role: "assistant" as const, contextKind: "history" as const, content: "OBSERVATORY_TWO" },
+        { id: "h3", role: "system" as const, contextKind: "history" as const, content: "OBSERVATORY_NARRATOR" },
+        { id: "h4", role: "user" as const, contextKind: "history" as const, content: "OBSERVATORY_LATEST" },
+      ];
+      const nonHistory = [
+        { role: "system" as const, contextKind: "prompt" as const, content: "PINEAPPLE_PROMPT" },
+        { role: "user" as const, contextKind: "injection" as const, content: "PINEAPPLE_INJECTION" },
+        { role: "system" as const, content: "PINEAPPLE_UNTYPED_SYSTEM" },
+        { role: "user" as const, content: "PINEAPPLE_UNTYPED_USER" },
+      ];
+      const expected = history.map(({ role, content }) => ({ role, content }));
+
+      // Prompt text and injections may sit before, after or between history; only history reaches recall.
+      for (const messages of [
+        [...nonHistory, ...history],
+        [...history, ...nonHistory],
+        [...history.slice(0, 2), ...nonHistory, ...history.slice(2)],
+      ]) {
+        const snapshot = structuredClone(messages);
+        assert.deepEqual(selectHistoryMessagesForRecall(messages), expected);
+        assert.deepEqual(messages, snapshot, "recall selection leaves other prompt consumers' input unchanged");
+      }
+
+      // Advanced Memory filtering runs first; excluded history and non-history text stay out.
+      const advancedFiltered = filterPromptHistoryByMessageIds(
+        resolveAdvancedMemoryPrompt([...history, ...nonHistory], [], {}),
+        new Set(["h2", "h3", "h4"]),
+        new Set(history.map((message) => message.id)),
+      );
+      assert.deepEqual(
+        selectHistoryMessagesForRecall(advancedFiltered).map((message) => message.content),
+        ["OBSERVATORY_TWO", "OBSERVATORY_NARRATOR", "OBSERVATORY_LATEST"],
+      );
+    },
+  },
+  {
     name: "advanced memory markers preserve scoped placement, formatting, fallback and empty groups",
     async run() {
       const parts: AdvancedMemoryPromptParts = {
@@ -10850,6 +11010,7 @@ Use HTML sparingly and diegetically. Do not replace normal prose/dialogue unless
         connection: { provider: "openai", apiKey: "", model: "regression-model" },
         connectionId: "regression-connection",
         baseUrl: "https://example.invalid/v1",
+        includeRecallHistory: true,
       });
       const promptText = prepared.finalMessages.map((message) => message.content).join("\n");
 
@@ -10860,6 +11021,22 @@ Use HTML sparingly and diegetically. Do not replace normal prose/dialogue unless
       assert.match(promptText, new RegExp(authoredSystemInstruction, "u"));
       assert.equal(promptText.includes(legacySetupMembership), false, promptText);
       assert.match(promptText, new RegExp(currentMembership, "u"));
+
+      const recallText = selectHistoryMessagesForRecall(prepared.recallHistoryMessages!)
+        .map((message) => message.content)
+        .join("\n");
+      assert.equal(
+        recallText.includes("Compact day summary."),
+        false,
+        "synthesized day summaries are not recall history",
+      );
+      assert.equal(
+        recallText.includes("COMPACT_WEEK_SUMMARY"),
+        false,
+        "synthesized week summaries are not recall history",
+      );
+      assert.match(recallText, new RegExp(currentSceneSummary, "u"));
+      assert.match(recallText, new RegExp(currentMembership, "u"));
     },
   },
   {
@@ -10878,7 +11055,7 @@ Use HTML sparingly and diegetically. Do not replace normal prose/dialogue unless
         createdAt: "2026-07-15T12:00:00.000Z",
       };
       const chatMessages = [...olderMessages, currentMessage];
-      const prepared = await prepareConversationPromptHistory({
+      const historyInput: Parameters<typeof prepareConversationPromptHistory>[0] = {
         finalMessages: chatMessages.map((message) => ({
           id: message.id,
           role: message.role,
@@ -10916,12 +11093,73 @@ Use HTML sparingly and diegetically. Do not replace normal prose/dialogue unless
         connection: { provider: "openai", apiKey: "", model: "regression-model" },
         connectionId: "regression-connection",
         baseUrl: "https://example.invalid/v1",
-      });
+      };
+      const prepared = await prepareConversationPromptHistory(historyInput);
       const promptText = prepared.finalMessages.map((message) => message.content).join("\n");
 
       assert.match(promptText, /UNCAPPED_TAIL_MESSAGE_0/u);
       assert.match(promptText, /UNCAPPED_TAIL_MESSAGE_54/u);
       assert.match(promptText, /CURRENT_CONVERSATION_MESSAGE/u);
+
+      // The recall copy keeps the raw tail and excludes synthesized summaries without touching the main prompt.
+      assert.equal(prepared.recallHistoryMessages, undefined, "disabled LTM does not prepare a recall copy");
+      const withRecall = await prepareConversationPromptHistory({ ...historyInput, includeRecallHistory: true });
+      assert.deepEqual(withRecall.finalMessages, prepared.finalMessages, "LTM does not change the main prompt");
+      assert.ok(withRecall.recallHistoryMessages);
+      const recallText = selectHistoryMessagesForRecall(withRecall.recallHistoryMessages)
+        .map((message) => message.content)
+        .join("\n");
+      assert.equal(
+        recallText.includes("Compact prior-day summary."),
+        false,
+        "synthesized summaries are not recall history",
+      );
+      for (const marker of ["UNCAPPED_TAIL_MESSAGE_0", "UNCAPPED_TAIL_MESSAGE_54", "CURRENT_CONVERSATION_MESSAGE"]) {
+        assert.match(recallText, new RegExp(marker, "u"));
+      }
+      assert.ok(
+        prepared.finalMessages
+          .filter((message) => message.content.includes("UNCAPPED_TAIL_MESSAGE_"))
+          .every((message) => message.contextKind === undefined),
+        "recall tagging does not leak into the main prompt",
+      );
+
+      // Unsummarized date history keeps its wrap format on the recall copy only.
+      for (const wrapFormat of ["xml", "markdown", "none"] as const) {
+        const pastMessages = [
+          {
+            id: "past-narrator",
+            role: "narrator",
+            content: "PAST_DAY_NARRATOR",
+            createdAt: "2026-07-14T10:00:00.000Z",
+          },
+          { id: "past-user", role: "user", content: "PAST_DAY_USER", createdAt: "2026-07-14T11:00:00.000Z" },
+        ];
+        const dateInput = {
+          ...historyInput,
+          chatMeta: { summaryTailMessages: 0 },
+          scopedMessages: [], // Keep this formatting fixture from requesting provider summaries.
+          chatMessages: pastMessages,
+          finalMessages: pastMessages.map((message) => ({
+            id: message.id,
+            role: message.role === "narrator" ? ("system" as const) : ("user" as const),
+            content: message.content,
+            contextKind: "history" as const,
+          })),
+          wrapFormat,
+        };
+        const withRecall = await prepareConversationPromptHistory({ ...dateInput, includeRecallHistory: true });
+        const expected = formatConversationDateHistoryMessages(
+          [
+            { role: "system", author: "Narrator", content: "PAST_DAY_NARRATOR" },
+            { role: "user", author: "User", content: "PAST_DAY_USER" },
+          ],
+          "14.07.2026",
+          wrapFormat,
+        );
+        assert.deepEqual(withRecall.finalMessages, expected, "normal date-history formatting stays unchanged");
+        assert.deepEqual(selectHistoryMessagesForRecall(withRecall.recallHistoryMessages!), expected);
+      }
     },
   },
   {

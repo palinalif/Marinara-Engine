@@ -4,13 +4,13 @@ This guide covers the people in your Game Mode campaign: your party members and 
 
 Game Mode is one of Marinara Engine's chat modes. It runs a single-player RPG (role-playing game) with an AI Game Master, often shortened to GM. For setup and the basics, see [Game Mode: Getting Started](getting-started.md).
 
-## The party bar
+## Character Profiles
 
-The party bar shows the characters traveling with you. It sits near the top of the game screen.
+Click or tap the **Character Profiles** avatar button to see the characters traveling with you. With several party members, the button cycles through their portraits and shows a count badge.
 
-On a desktop screen, it is a horizontal row of small character portraits. On a phone, the bar collapses into a single avatar. When you have more than one party member, that avatar shows a count badge. Tap it to open the list of party members. With only one member, tapping the avatar opens that character's sheet directly.
+You can drag this button around the chat on a computer or phone. Open it and use **Lock window** to keep it in place. On a computer, you can also move and resize the window. **Close** returns it to its button. Its position is saved with the chat, and it follows your chat widget style from **Settings → Appearance → App**. On phones, it stays separate from the three-dot **Chat tools** menu.
 
-Here is what you can do with the party bar:
+Here is what you can do inside **Character Profiles**:
 
 1. Click or tap a portrait to open that character's character sheet.
 2. Hover over a portrait (on desktop) to reveal a small **X** button.
@@ -22,7 +22,7 @@ You can remove any companion the Game Master recruited, whether it joined during
 
 A character sheet is a game-specific summary of one party member. It is separate from the character card. The Game Master writes it from your character and the current story.
 
-Open a sheet by clicking that character's portrait in the party bar. The sheet shows any of these sections that have content:
+Open **Character Profiles**, then click or tap that character's portrait. The sheet shows any of these sections that have content:
 
 - **Attributes**: tabletop-style scores such as STR, DEX, and CON, each with a modifier.
 - **Stats**: resource bars such as HP or MP.
@@ -125,13 +125,13 @@ A ruleset can also have markets, so what you can buy depends on where you are. T
 
 The Game Master controls who is in your party as the story unfolds. There is no manual "add companion" button. Instead, the GM adds or removes party members through the narration, based on what happens in the scene.
 
-To drop a companion yourself, use the **X** button on the party bar, as described above. You cannot remove your own persona this way.
+To drop a companion yourself, use the **X** beside their portrait in **Character Profiles**, as described above. You cannot remove your own persona this way.
 
 ## The Adventure Journal
 
 The Adventure Journal is a running record of your campaign. It is built from saved game events, not written by the AI, so it stays factual.
 
-Click the **Session** button in the top toolbar, then choose the **Journal** tab. A Journal panel opens with these tabs:
+Open **Session** (see [Opening Session](sessions-and-saves.md#opening-session)), then choose the **Journal** tab. The Journal has these tabs:
 
 - **Timeline**: a list of what has happened, such as locations found, NPC meetings, combat results, quests, and item events.
 - **NPCs**: the NPCs you have met, with portraits and reputation labels (see below).

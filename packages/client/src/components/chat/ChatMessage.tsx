@@ -1964,7 +1964,7 @@ export const ChatMessage = memo(function ChatMessage({
     () => ({
       fontSize: chatFontSize,
       lineHeight: 1.5,
-      ...(chatFontColor ? { color: chatFontColor } : {}),
+      ...(chatFontColor ? { color: `var(--mari-chat-resolved-text, ${chatFontColor})` } : {}),
       ...textStrokeStyle,
     }),
     [chatFontSize, chatFontColor, textStrokeStyle],
@@ -3675,7 +3675,7 @@ export const ChatMessage = memo(function ChatMessage({
                   </button>
                 </div>
               )}
-              <div className="mari-message-bubble relative flex-1 rounded-xl border border-amber-500/10 bg-black/40 px-5 py-4">
+              <div className="mari-message-bubble mari-chat-style-surface relative flex-1 rounded-xl border border-amber-500/10 bg-black/40 px-5 py-4">
                 {/* Delete button */}
                 {!multiSelectMode && onDelete && (
                   <button
@@ -3927,7 +3927,7 @@ export const ChatMessage = memo(function ChatMessage({
             <div
               data-roleplay-bubble-transparent={roleplayBubbleBg === "transparent" ? "true" : undefined}
               className={cn(
-                "mari-message-bubble mari-rp-bubble relative overflow-hidden rounded-2xl shadow-lg shadow-black/20",
+                "mari-message-bubble mari-rp-bubble mari-chat-style-surface relative overflow-hidden rounded-2xl shadow-lg shadow-black/20",
                 roleplayAvatarsScrollable && showRoleplayAvatarPanel && "mari-rp-bubble--scrollable-avatar-panel",
                 isUser
                   ? "rounded-tr-sm text-neutral-100 ring-1 ring-white/10"

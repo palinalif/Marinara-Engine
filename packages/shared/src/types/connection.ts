@@ -39,7 +39,12 @@ export const DECISION_SOURCE_BASE_URLS = {
   openai_compatible: "",
 } as const;
 
-/** Sources whose base URL the user enters, rather than a fixed hosted one. */
+/**
+ * Sources that run on a server the user names: the base URL is required, the key is
+ * optional and may be borrowed from a same-origin custom chat connection, and the state
+ * budget defaults to 3,500 tokens. TypeSafe may also be given a base URL (#7084) but keeps
+ * the hosted rules.
+ */
 export function decisionSourceTakesUrl(source: string | null | undefined): boolean {
   return source === "custom" || source === "openai_compatible";
 }

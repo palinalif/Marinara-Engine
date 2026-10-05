@@ -23,6 +23,7 @@ import { resetProfessorMariNavigator } from "../lib/professor-mari-navigation";
 import { DEFAULT_APP_LANGUAGE, type AppLanguage } from "../localization/locale-types";
 import { deferEditorLeave } from "../lib/editor-leave";
 import { UI_PERSISTENCE } from "../lib/ui-persistence";
+import { normalizeChatWidgetFont } from "../lib/font-family";
 import type { ChatWizardDefaults, ChatWizardMode } from "../lib/chat-wizard-defaults";
 
 export type Panel =
@@ -67,6 +68,25 @@ function normalizeConnectionPanelSort(value: unknown): ConnectionPanelSort {
 }
 type FontSize = 12 | 14 | 16 | 17 | 19 | 22 | 26 | 30 | 34;
 export type VisualTheme = "default" | "sillytavern";
+export type ChatWidgetPreset = "default" | "dottore" | "mari";
+export type ChatWidgetShape = "preset" | "rounded" | "square" | "cut-corner" | "arched";
+
+export function normalizeChatWidgetPreset(value: unknown): ChatWidgetPreset {
+  return value === "dottore" || value === "mari" ? value : "default";
+}
+
+export function normalizeChatWidgetShape(value: unknown): ChatWidgetShape {
+  return value === "rounded" || value === "square" || value === "cut-corner" || value === "arched" ? value : "preset";
+}
+
+/** No override preserves the existing desktop, phone and custom-theme sizes. */
+export function normalizeChatWidgetButtonSize(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(32, Math.min(96, Math.round(value))) : null;
+}
+
+export function normalizeChatWidgetColor(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 export type ConversationMessageStyle = "classic" | "bubble";
 export type ConversationAvatarShape = "circle" | "square";
 export type TrackerPanelSide = "left" | "right";
@@ -187,6 +207,8 @@ function normalizeEchoChamberSides(value: unknown): Record<string, EchoChamberSi
 
 interface ImmediateUiStorageSnapshot {
   customCursorEnabled: boolean | undefined;
+  chatSettingsMoveTipDismissed: boolean | undefined;
+  chatWindowIntroDismissed: boolean | undefined;
   echoChamberSides: string;
   echoChamberSizes: string;
 }
@@ -195,6 +217,8 @@ function readImmediateUiStorageSnapshot(value: string | null): ImmediateUiStorag
   if (!value) {
     return {
       customCursorEnabled: undefined,
+      chatSettingsMoveTipDismissed: undefined,
+      chatWindowIntroDismissed: undefined,
       echoChamberSides: "{}",
       echoChamberSizes: "{}",
     };
@@ -204,6 +228,8 @@ function readImmediateUiStorageSnapshot(value: string | null): ImmediateUiStorag
     const parsed = JSON.parse(value) as {
       state?: {
         customCursorEnabled?: unknown;
+        chatSettingsMoveTipDismissed?: unknown;
+        chatWindowIntroDismissed?: unknown;
         echoChamberSideByChatId?: unknown;
         echoChamberSizeByChatId?: unknown;
       };
@@ -211,12 +237,20 @@ function readImmediateUiStorageSnapshot(value: string | null): ImmediateUiStorag
     return {
       customCursorEnabled:
         typeof parsed.state?.customCursorEnabled === "boolean" ? parsed.state.customCursorEnabled : undefined,
+      chatSettingsMoveTipDismissed:
+        typeof parsed.state?.chatSettingsMoveTipDismissed === "boolean"
+          ? parsed.state.chatSettingsMoveTipDismissed
+          : undefined,
+      chatWindowIntroDismissed:
+        typeof parsed.state?.chatWindowIntroDismissed === "boolean" ? parsed.state.chatWindowIntroDismissed : undefined,
       echoChamberSides: JSON.stringify(normalizeEchoChamberSides(parsed.state?.echoChamberSideByChatId)),
       echoChamberSizes: JSON.stringify(normalizeEchoChamberSizes(parsed.state?.echoChamberSizeByChatId)),
     };
   } catch {
     return {
       customCursorEnabled: undefined,
+      chatSettingsMoveTipDismissed: undefined,
+      chatWindowIntroDismissed: undefined,
       echoChamberSides: "{}",
       echoChamberSizes: "{}",
     };
@@ -228,6 +262,8 @@ function shouldFlushUiStorageImmediately(previousValue: string | null, nextValue
   const next = readImmediateUiStorageSnapshot(nextValue);
   return (
     previous.customCursorEnabled !== next.customCursorEnabled ||
+    previous.chatSettingsMoveTipDismissed !== next.chatSettingsMoveTipDismissed ||
+    previous.chatWindowIntroDismissed !== next.chatWindowIntroDismissed ||
     previous.echoChamberSides !== next.echoChamberSides ||
     previous.echoChamberSizes !== next.echoChamberSizes
   );
@@ -673,8 +709,6 @@ interface UIState {
   noodleNavigation: NoodleNavigationState;
   /** When true, the main area shows the full-page character library */
   characterLibraryOpen: boolean;
-  /** Runtime-only flag to restore duplicate review after closing a character detail editor. */
-  characterDuplicatesOpen: boolean;
   /** Which resource collection the shared full-page card library displays */
   cardLibraryKind: CardLibraryKind;
   /** When true, the main area shows the full-page downloadable agent catalog */
@@ -737,6 +771,16 @@ interface UIState {
   chatFontSize: number;
   /** Custom font family name (empty = default Inter) */
   fontFamily: string;
+  chatWidgetPreset: ChatWidgetPreset;
+  chatWidgetFont: string;
+  chatWidgetShape: ChatWidgetShape;
+  chatWidgetButtonSize: number | null;
+  chatWidgetBorderColor: string;
+  chatWidgetBackgroundColor: string;
+  chatWidgetTextColor: string;
+  chatWidgetApplyFont: boolean;
+  chatWidgetApplyShape: boolean;
+  chatWidgetApplyColors: boolean;
   enableStreaming: boolean;
   debugMode: boolean;
   /** When true, warn when an agent uses the configured default connection. */
@@ -801,6 +845,8 @@ interface UIState {
   /** When true, character cards are available in Persona pickers. */
   showCharactersInPersonaPickers: boolean;
   guideGenerations: boolean;
+  /** When true, guided regeneration leaves its guidance in the composer instead of clearing it. */
+  keepGuidanceAfterRegenerate: boolean;
   showQuickRepliesMenu: boolean;
   showQuickReplyPostOnly: boolean;
   showQuickReplyGuide: boolean;
@@ -974,6 +1020,10 @@ interface UIState {
 
   // ── Dismissals ──
   linkApiBannerDismissed: boolean;
+  /** The Chat Settings "drag to place it" tip was dismissed on this device. */
+  chatSettingsMoveTipDismissed: boolean;
+  /** The once-only chat window introduction was dismissed across chats and devices. */
+  chatWindowIntroDismissed: boolean;
 
   // ── EchoChamber ──
   echoChamberOpen: boolean;
@@ -1105,7 +1155,6 @@ interface UIState {
   openCharacterLibrary: (characterId?: string) => void;
   openPersonaLibrary: () => void;
   closeCharacterLibrary: () => void;
-  setCharacterDuplicatesOpen: (open: boolean) => void;
   openAgentCatalog: (packageId?: string) => void;
   closeAgentCatalog: () => void;
   openBotBrowser: () => void;
@@ -1129,6 +1178,16 @@ interface UIState {
   setLanguage: (language: AppLanguage) => void;
   setChatFontSize: (size: number) => void;
   setFontFamily: (family: string) => void;
+  setChatWidgetPreset: (preset: ChatWidgetPreset) => void;
+  setChatWidgetFont: (font: string) => void;
+  setChatWidgetShape: (shape: ChatWidgetShape) => void;
+  setChatWidgetButtonSize: (size: number | null) => void;
+  setChatWidgetBorderColor: (color: string) => void;
+  setChatWidgetBackgroundColor: (color: string) => void;
+  setChatWidgetTextColor: (color: string) => void;
+  setChatWidgetApplyFont: (enabled: boolean) => void;
+  setChatWidgetApplyShape: (enabled: boolean) => void;
+  setChatWidgetApplyColors: (enabled: boolean) => void;
   setEnableStreaming: (v: boolean) => void;
   setDebugMode: (v: boolean) => void;
   setShowPaidAgentConnectionWarning: (v: boolean) => void;
@@ -1162,6 +1221,7 @@ interface UIState {
   setShowMessageNumbers: (v: boolean) => void;
   setShowCharactersInPersonaPickers: (v: boolean) => void;
   setGuideGenerations: (v: boolean) => void;
+  setKeepGuidanceAfterRegenerate: (v: boolean) => void;
   setShowQuickRepliesMenu: (v: boolean) => void;
   setShowQuickReplyPostOnly: (v: boolean) => void;
   setShowQuickReplyGuide: (v: boolean) => void;
@@ -1267,6 +1327,8 @@ interface UIState {
   markChatHelpSeen: (mode: ChatModeShortcut) => void;
   setChatHelpButtonHidden: (v: boolean) => void;
   dismissLinkApiBanner: () => void;
+  dismissChatSettingsMoveTip: () => void;
+  dismissChatWindowIntro: () => void;
   toggleEchoChamber: () => void;
   setEchoChamberSide: (side: EchoChamberSide) => void;
   setEchoChamberSideForChat: (chatId: string, side: EchoChamberSide) => void;
@@ -1363,6 +1425,16 @@ export function pickSyncedSettings(state: UIState) {
     conversationBackgroundImageOpacity: state.conversationBackgroundImageOpacity,
     language: state.language,
     fontFamily: state.fontFamily,
+    chatWidgetPreset: state.chatWidgetPreset,
+    chatWidgetFont: state.chatWidgetFont,
+    chatWidgetShape: state.chatWidgetShape,
+    chatWidgetButtonSize: state.chatWidgetButtonSize,
+    chatWidgetBorderColor: state.chatWidgetBorderColor,
+    chatWidgetBackgroundColor: state.chatWidgetBackgroundColor,
+    chatWidgetTextColor: state.chatWidgetTextColor,
+    chatWidgetApplyFont: state.chatWidgetApplyFont,
+    chatWidgetApplyShape: state.chatWidgetApplyShape,
+    chatWidgetApplyColors: state.chatWidgetApplyColors,
     enableStreaming: state.enableStreaming,
     streamingSpeed: state.streamingSpeed,
     showPaidAgentConnectionWarning: state.showPaidAgentConnectionWarning,
@@ -1401,6 +1473,7 @@ export function pickSyncedSettings(state: UIState) {
     showMessageNumbers: state.showMessageNumbers,
     showCharactersInPersonaPickers: state.showCharactersInPersonaPickers,
     guideGenerations: state.guideGenerations,
+    keepGuidanceAfterRegenerate: state.keepGuidanceAfterRegenerate,
     showQuickRepliesMenu: state.showQuickRepliesMenu,
     showQuickReplyPostOnly: state.showQuickReplyPostOnly,
     showQuickReplyGuide: state.showQuickReplyGuide,
@@ -1470,6 +1543,8 @@ export function pickSyncedSettings(state: UIState) {
     chatHelpSeenModes: state.chatHelpSeenModes,
     chatHelpButtonHidden: state.chatHelpButtonHidden,
     linkApiBannerDismissed: state.linkApiBannerDismissed,
+    chatSettingsMoveTipDismissed: state.chatSettingsMoveTipDismissed,
+    chatWindowIntroDismissed: state.chatWindowIntroDismissed,
     echoChamberOpen: state.echoChamberOpen,
     echoChamberSide: state.echoChamberSide,
     userStatusManual: state.userStatusManual,
@@ -1571,6 +1646,16 @@ export function pickPersistedUIState(state: UIState) {
     language: state.language,
     chatFontSize: state.chatFontSize,
     fontFamily: state.fontFamily,
+    chatWidgetPreset: state.chatWidgetPreset,
+    chatWidgetFont: state.chatWidgetFont,
+    chatWidgetShape: state.chatWidgetShape,
+    chatWidgetButtonSize: state.chatWidgetButtonSize,
+    chatWidgetBorderColor: state.chatWidgetBorderColor,
+    chatWidgetBackgroundColor: state.chatWidgetBackgroundColor,
+    chatWidgetTextColor: state.chatWidgetTextColor,
+    chatWidgetApplyFont: state.chatWidgetApplyFont,
+    chatWidgetApplyShape: state.chatWidgetApplyShape,
+    chatWidgetApplyColors: state.chatWidgetApplyColors,
     enableStreaming: state.enableStreaming,
     debugMode: state.debugMode,
     showPaidAgentConnectionWarning: state.showPaidAgentConnectionWarning,
@@ -1610,6 +1695,7 @@ export function pickPersistedUIState(state: UIState) {
     showMessageNumbers: state.showMessageNumbers,
     showCharactersInPersonaPickers: state.showCharactersInPersonaPickers,
     guideGenerations: state.guideGenerations,
+    keepGuidanceAfterRegenerate: state.keepGuidanceAfterRegenerate,
     showQuickRepliesMenu: state.showQuickRepliesMenu,
     showQuickReplyPostOnly: state.showQuickReplyPostOnly,
     showQuickReplyGuide: state.showQuickReplyGuide,
@@ -1683,6 +1769,8 @@ export function pickPersistedUIState(state: UIState) {
     chatHelpSeenModes: state.chatHelpSeenModes,
     chatHelpButtonHidden: state.chatHelpButtonHidden,
     linkApiBannerDismissed: state.linkApiBannerDismissed,
+    chatSettingsMoveTipDismissed: state.chatSettingsMoveTipDismissed,
+    chatWindowIntroDismissed: state.chatWindowIntroDismissed,
     echoChamberOpen: state.echoChamberOpen,
     echoChamberSide: state.echoChamberSide,
     echoChamberSideByChatId: state.echoChamberSideByChatId,
@@ -1789,7 +1877,6 @@ export const useUIStore = create<UIState>()(
         noodleSelectedPersonaId: null,
         noodleNavigation: { mode: "public", view: "home" },
         characterLibraryOpen: false,
-        characterDuplicatesOpen: false,
         cardLibraryKind: "characters" as CardLibraryKind,
         agentCatalogOpen: false,
         agentCatalogInitialPackageId: null,
@@ -1823,6 +1910,16 @@ export const useUIStore = create<UIState>()(
         language: DEFAULT_APP_LANGUAGE as AppLanguage,
         chatFontSize: 16,
         fontFamily: "",
+        chatWidgetPreset: "default" as ChatWidgetPreset,
+        chatWidgetFont: "",
+        chatWidgetShape: "preset" as ChatWidgetShape,
+        chatWidgetButtonSize: null,
+        chatWidgetBorderColor: "",
+        chatWidgetBackgroundColor: "",
+        chatWidgetTextColor: "",
+        chatWidgetApplyFont: false,
+        chatWidgetApplyShape: false,
+        chatWidgetApplyColors: false,
         enableStreaming: true,
         debugMode: false,
         showPaidAgentConnectionWarning: true,
@@ -1862,6 +1959,7 @@ export const useUIStore = create<UIState>()(
         showMessageNumbers: false,
         showCharactersInPersonaPickers: false,
         guideGenerations: false,
+        keepGuidanceAfterRegenerate: true,
         showQuickRepliesMenu: false,
         showQuickReplyPostOnly: true,
         showQuickReplyGuide: true,
@@ -1953,6 +2051,8 @@ export const useUIStore = create<UIState>()(
         chatHelpSeenModes: [],
         chatHelpButtonHidden: false,
         linkApiBannerDismissed: false,
+        chatSettingsMoveTipDismissed: false,
+        chatWindowIntroDismissed: false,
         echoChamberOpen: true,
         echoChamberSide: "bottom-right" as EchoChamberSide,
         echoChamberSideByChatId: {},
@@ -2444,7 +2544,6 @@ export const useUIStore = create<UIState>()(
             rightPanelOpen: isMobileShellViewport() ? false : state.rightPanelOpen,
           })),
         closeCharacterLibrary: () => set({ characterLibraryOpen: false, characterLibraryInitialId: null }),
-        setCharacterDuplicatesOpen: (open) => set({ characterDuplicatesOpen: open }),
         openAgentCatalog: (packageId) =>
           set((state) => ({
             agentCatalogOpen: true,
@@ -2602,6 +2701,24 @@ export const useUIStore = create<UIState>()(
         setLanguage: (language) => set({ language }),
         setChatFontSize: (size) => set({ chatFontSize: size }),
         setFontFamily: (family) => set({ fontFamily: family }),
+        setChatWidgetPreset: (preset) =>
+          set({
+            chatWidgetPreset: normalizeChatWidgetPreset(preset),
+            chatWidgetFont: "",
+            chatWidgetShape: "preset",
+            chatWidgetBorderColor: "",
+            chatWidgetBackgroundColor: "",
+            chatWidgetTextColor: "",
+          }),
+        setChatWidgetFont: (font) => set({ chatWidgetFont: normalizeChatWidgetFont(font) }),
+        setChatWidgetShape: (shape) => set({ chatWidgetShape: normalizeChatWidgetShape(shape) }),
+        setChatWidgetButtonSize: (size) => set({ chatWidgetButtonSize: normalizeChatWidgetButtonSize(size) }),
+        setChatWidgetBorderColor: (color) => set({ chatWidgetBorderColor: normalizeChatWidgetColor(color) }),
+        setChatWidgetBackgroundColor: (color) => set({ chatWidgetBackgroundColor: normalizeChatWidgetColor(color) }),
+        setChatWidgetTextColor: (color) => set({ chatWidgetTextColor: normalizeChatWidgetColor(color) }),
+        setChatWidgetApplyFont: (enabled) => set({ chatWidgetApplyFont: enabled }),
+        setChatWidgetApplyShape: (enabled) => set({ chatWidgetApplyShape: enabled }),
+        setChatWidgetApplyColors: (enabled) => set({ chatWidgetApplyColors: enabled }),
         setEnableStreaming: (v) => set({ enableStreaming: v }),
         setDebugMode: (v) => set({ debugMode: v }),
         setShowPaidAgentConnectionWarning: (v) => set({ showPaidAgentConnectionWarning: v }),
@@ -2659,6 +2776,7 @@ export const useUIStore = create<UIState>()(
         setShowMessageNumbers: (v) => set({ showMessageNumbers: v }),
         setShowCharactersInPersonaPickers: (v) => set({ showCharactersInPersonaPickers: v }),
         setGuideGenerations: (v) => set({ guideGenerations: v }),
+        setKeepGuidanceAfterRegenerate: (v) => set({ keepGuidanceAfterRegenerate: v }),
         setShowQuickRepliesMenu: (v) => set({ showQuickRepliesMenu: v }),
         setShowQuickReplyPostOnly: (v) => set({ showQuickReplyPostOnly: v }),
         setShowQuickReplyGuide: (v) => set({ showQuickReplyGuide: v }),
@@ -2825,6 +2943,16 @@ export const useUIStore = create<UIState>()(
             fontSize: 17 as FontSize,
             chatFontSize: 16,
             fontFamily: "",
+            chatWidgetPreset: "default" as ChatWidgetPreset,
+            chatWidgetFont: "",
+            chatWidgetShape: "preset" as ChatWidgetShape,
+            chatWidgetButtonSize: null,
+            chatWidgetBorderColor: "",
+            chatWidgetBackgroundColor: "",
+            chatWidgetTextColor: "",
+            chatWidgetApplyFont: false,
+            chatWidgetApplyShape: false,
+            chatWidgetApplyColors: false,
             conversationMessageStyle: "classic" as ConversationMessageStyle,
             conversationAvatarShape: "circle" as ConversationAvatarShape,
             chatFontColor: "",
@@ -2945,6 +3073,8 @@ export const useUIStore = create<UIState>()(
             chatHelpSeenModes: v ? ["conversation", "roleplay", "game"] : state.chatHelpSeenModes,
           })),
         dismissLinkApiBanner: () => set({ linkApiBannerDismissed: true }),
+        dismissChatSettingsMoveTip: () => set({ chatSettingsMoveTipDismissed: true }),
+        dismissChatWindowIntro: () => set({ chatWindowIntroDismissed: true }),
         toggleEchoChamber: () => set((s) => ({ echoChamberOpen: !s.echoChamberOpen })),
         setEchoChamberSide: (side) => set({ echoChamberSide: side }),
         setEchoChamberSideForChat: (chatId, side) => {
@@ -3631,6 +3761,16 @@ export const useUIStore = create<UIState>()(
           conversationBackgroundImageOpacity: normalizeConversationBackgroundImageOpacity(
             persisted.conversationBackgroundImageOpacity,
           ),
+          chatWidgetPreset: normalizeChatWidgetPreset(persisted.chatWidgetPreset),
+          chatWidgetFont: normalizeChatWidgetFont(persisted.chatWidgetFont),
+          chatWidgetShape: normalizeChatWidgetShape(persisted.chatWidgetShape),
+          chatWidgetButtonSize: normalizeChatWidgetButtonSize(persisted.chatWidgetButtonSize),
+          chatWidgetBorderColor: normalizeChatWidgetColor(persisted.chatWidgetBorderColor),
+          chatWidgetBackgroundColor: normalizeChatWidgetColor(persisted.chatWidgetBackgroundColor),
+          chatWidgetTextColor: normalizeChatWidgetColor(persisted.chatWidgetTextColor),
+          chatWidgetApplyFont: persisted.chatWidgetApplyFont === true,
+          chatWidgetApplyShape: persisted.chatWidgetApplyShape === true,
+          chatWidgetApplyColors: persisted.chatWidgetApplyColors === true,
         };
       },
       partialize: pickPersistedUIState,

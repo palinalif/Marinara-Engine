@@ -145,11 +145,13 @@ export function QuickConnectionSwitcher({
               }
             }}
             className={cn(
-              "fixed z-[9999] flex min-w-[280px] max-w-[340px] flex-col overflow-hidden rounded-xl border border-foreground/10 shadow-2xl",
+              "mari-chat-style-surface fixed z-[9999] flex min-w-[280px] max-w-[340px] flex-col overflow-hidden rounded-xl border border-foreground/10 shadow-2xl",
               // The quota meter adds height above the list, so let the menu grow
               // rather than clip the list a second time.
               usageConnection ? "max-h-[440px]" : "max-h-[360px]",
-              chatMode === "roleplay" ? "bg-[var(--card)]" : "bg-[var(--background)]",
+              chatMode === "roleplay"
+                ? "bg-[var(--card)] [--mari-chat-existing-bg:var(--card)]"
+                : "bg-[var(--background)] [--mari-chat-existing-bg:var(--background)]",
             )}
             style={pos ? { left: pos.left, top: pos.top } : { visibility: "hidden" as const }}
           >

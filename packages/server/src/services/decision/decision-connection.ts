@@ -4,6 +4,7 @@ import {
   defaultDecisionStateTokens,
   resolveDecisionConnectionTimeoutMs,
 } from "@marinara-engine/shared";
+import { isLocalAddressHostname } from "../../utils/security.js";
 
 export interface DecisionConnectionRow {
   id: string;
@@ -33,7 +34,7 @@ export interface DecisionConnection {
 }
 
 export type DecisionConnectionError =
-  "invalid_source" | "invalid_url" | "needs_relinking" | "missing_key" | "missing_model";
+  "invalid_source" | "invalid_url" | "needs_https" | "needs_relinking" | "missing_key" | "missing_model";
 
 /**
  * The chat completions URL for a chat-model Decision connection.
@@ -61,9 +62,12 @@ export async function resolveDecisionConnection(
   }
   let endpoint: URL;
   try {
+    // TypeSafe may be sent to another address that serves its API (#7084). It keeps
+    // TypeSafe's key rules and defaults; a blank address is TypeSafe's own.
     const base = decisionSourceTakesUrl(source)
       ? row.baseUrl
-      : DECISION_SOURCE_BASE_URLS[source as "typesafe" | "openrouter"];
+      : (source === "typesafe" && row.baseUrl?.trim()) ||
+        DECISION_SOURCE_BASE_URLS[source as "typesafe" | "openrouter"];
     endpoint = new URL(
       source === "openai_compatible" ? decisionChatCompletionsUrl(base) : `${base.replace(/\/+$/, "")}/v1/systemone`,
     );
@@ -75,6 +79,10 @@ export async function resolveDecisionConnection(
       endpoint.hash
     ) {
       return { connection: null, error: "invalid_url" };
+    }
+    // A TypeSafe key is a hosted, billed key: send it unencrypted only to a local address.
+    if (source === "typesafe" && endpoint.protocol === "http:" && !isLocalAddressHostname(endpoint.hostname)) {
+      return { connection: null, error: "needs_https" };
     }
   } catch {
     return { connection: null, error: "invalid_url" };

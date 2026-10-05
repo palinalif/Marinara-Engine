@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { basename, extname, relative, resolve, sep, win32 } from "node:path";
 import { brotliDecompressSync, gunzipSync, zstdDecompressSync } from "node:zlib";
 import { Agent } from "undici";
-import { isLoopbackIp, isPrivateNetworkIp } from "../middleware/ip-allowlist.js";
+import { isLoopbackIp, isNonRoutableNetworkIp, isPrivateNetworkIp } from "../middleware/ip-allowlist.js";
 import { logger } from "../lib/logger.js";
 import { CSRF_HEADER, CSRF_HEADER_VALUE } from "@marinara-engine/shared";
 import { requestHeadersWithOpenRouterAttribution } from "./openrouter-attribution.js";
@@ -239,6 +239,15 @@ function isLoopbackHostname(hostname: string): boolean {
 
 function isMdnsHostname(hostname: string): boolean {
   return normalizeHostnameForAddress(hostname).replace(/\.$/, "").toLowerCase().endsWith(".local");
+}
+
+/**
+ * `localhost`, or a loopback or private-network IP literal. Other local-looking names
+ * (`.local`, `.internal`) are excluded: DNS decides where they go, and it could be public.
+ */
+export function isLocalAddressHostname(hostname: string): boolean {
+  const address = normalizeHostnameForAddress(hostname).replace(/\.$/, "").toLowerCase();
+  return LOCALHOST_NAMES.has(address) || isLoopbackIp(address) || isNonRoutableNetworkIp(address);
 }
 
 export function normalizeLoopbackUrl(url: string | URL): string {

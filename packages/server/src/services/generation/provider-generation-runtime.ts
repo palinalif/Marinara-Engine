@@ -19,7 +19,11 @@ import {
   resolveProviderTopK,
 } from "../../routes/generate/generate-route-utils.js";
 import { mergeModelContextLimit, resolveStoredModelContextLimit } from "./model-access-policy.js";
-import { normalizeChatTopP, supportsAssistantReasoningPrefill } from "./generation-parameters.js";
+import {
+  keepsCodexDefaultEffort,
+  normalizeChatTopP,
+  supportsAssistantReasoningPrefill,
+} from "./generation-parameters.js";
 import { clampGenerationMaxOutputTokens } from "./output-token-limits.js";
 import {
   isFallbackConnectionUsable,
@@ -174,6 +178,10 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
 
   const modelLower = (args.connection.model ?? "").toLowerCase();
   const providerLower = (args.connection.provider ?? "").toLowerCase();
+  const isCodex = providerLower === "openai_chatgpt";
+  if (runtime.reasoningEffort !== null && keepsCodexDefaultEffort(providerLower, connectionParams, chatParams)) {
+    forceParameters("defaults", { reasoningEffort: null });
+  }
   let resolvedEffort = resolveProviderReasoningEffort({
     provider: providerLower,
     model: modelLower,
@@ -189,7 +197,9 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     runtime.enabledParameters?.reasoningEffort === false
       ? undefined
       : runtime.reasoningEffort === null
-        ? "none"
+        ? isCodex
+          ? undefined
+          : "none"
         : (resolvedEffort ?? undefined);
   const isClaudeNoSampling = isClaudeAdaptiveOnlyNoSamplingModel(modelLower);
   if (isClaudeNoSampling) {
